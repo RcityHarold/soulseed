@@ -1,0 +1,32 @@
+[package]
+name = "soulseed-agi-tools"
+version = "0.1.0"
+edition = "2021"
+authors = ["Soulseed Team"]
+description = "SoulseedAGI Tool Orchestration contracts"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["uuidv7", "strict-privacy"]
+uuidv7 = ["soulseed-agi-core-models/uuidv7"]
+strict-privacy = ["soulseed-agi-core-models/strict-privacy"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+time = { version = "0.3", features = ["serde"] }
+thiserror = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rand = { version = "0.8", features = ["std", "small_rng"] }
+arc-swap = "1"
+soulseed-agi-core-models = { path = "../soulseed-agi-core-models", default-features = false }
+reqwest = { version = "0.11", features = ["json", "blocking"] }
+
+[dev-dependencies]
+once_cell = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+httpmock = "0.7"

@@ -1,0 +1,30 @@
+[package]
+name = "soulseed-agi-envctx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Soulseed Team"]
+description = "Environment context assembly contracts for SoulseedAGI"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = ["uuidv7", "strict-privacy"]
+uuidv7 = []
+strict-privacy = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+thiserror = "1"
+sha2 = "0.10"
+blake3 = "1"
+hex = "0.4"
+
+soulseed-agi-core-models = { path = "../soulseed-agi-core-models", default-features = false }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }

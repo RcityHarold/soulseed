@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rainbow-hub.example.com/schemas/awareness/awareness_event.v1.schema.json",
+  "title": "AwarenessEvent v1",
+  "description": "Append-only record schema for Awareness layer events (ACE/DFR/CA/HITL).",
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "envelope_id",
+    "config_snapshot_hash",
+    "config_snapshot_version",
+    "access_class",
+    "schema_v",
+    "event_id",
+    "event_type",
+    "occurred_at_ms",
+    "awareness_cycle_id",
+    "inference_cycle_sequence",
+    "payload"
+  ],
+  "properties": {
+    "tenant_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "envelope_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F-]{36}$"
+    },
+    "config_snapshot_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "config_snapshot_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "session_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "sequence_number": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "access_class": {
+      "type": "string",
+      "enum": [
+        "public",
+        "internal",
+        "restricted"
+      ]
+    },
+    "provenance": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "source",
+        "method"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content_digest_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "schema_v": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "ac_started",
+        "ic_started",
+        "ic_ended",
+        "assessment_produced",
+        "decision_routed",
+        "route_reconsidered",
+        "route_switched",
+        "tool_called",
+        "tool_responded",
+        "tool_failed",
+        "collab_requested",
+        "collab_resolved",
+        "clarification_issued",
+        "clarification_answered",
+        "human_injection_received",
+        "injection_applied",
+        "injection_deferred",
+        "injection_ignored",
+        "delta_patch_generated",
+        "sync_point_reported",
+        "finalized",
+        "rejected",
+        "late_receipt_observed",
+        "environment_snapshot_recorded"
+      ]
+    },
+    "occurred_at_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "awareness_cycle_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "parent_cycle_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "collab_scope_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "barrier_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "env_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "inference_cycle_sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "degradation_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "budget_tokens",
+        "budget_walltime",
+        "budget_external_cost",
+        "empty_catalog",
+        "privacy_blocked",
+        "invalid_plan",
+        "clarify_exhausted",
+        "graph_degraded",
+        "envctx_degraded"
+      ]
+    },
+    "payload": {
+      "description": "Event-specific payload. Refer to documentation for per-type structure.",
+      "type": "object",
+      "default": {}
+    }
+  },
+  "additionalProperties": false,
+  "required_indices": [
+    {
+      "name": "ix_awareness_cycle_time",
+      "fields": [
+        "tenant_id",
+        "awareness_cycle_id",
+        "occurred_at_ms"
+      ]
+    },
+    {
+      "name": "ix_awareness_parent_cycle",
+      "fields": [
+        "tenant_id",
+        "parent_cycle_id",
+        "occurred_at_ms"
+      ],
+      "where": "parent_cycle_id IS NOT NULL"
+    },
+    {
+      "name": "ix_awareness_collab_scope",
+      "fields": [
+        "tenant_id",
+        "collab_scope_id",
+        "occurred_at_ms"
+      ],
+      "where": "collab_scope_id IS NOT NULL"
+    },
+    {
+      "name": "ix_awareness_barrier",
+      "fields": [
+        "tenant_id",
+        "barrier_id",
+        "occurred_at_ms"
+      ],
+      "where": "barrier_id IS NOT NULL"
+    },
+    {
+      "name": "ix_awareness_env_mode",
+      "fields": [
+        "tenant_id",
+        "env_mode",
+        "occurred_at_ms"
+      ],
+      "where": "env_mode IS NOT NULL"
+    }
+  ]
+}
