@@ -84,7 +84,10 @@ fn mk_awareness_anchor() -> AwarenessAnchor {
     }
 }
 
-fn mk_awareness_event(event_type: AwarenessEventType, payload: serde_json::Value) -> AwarenessEvent {
+fn mk_awareness_event(
+    event_type: AwarenessEventType,
+    payload: serde_json::Value,
+) -> AwarenessEvent {
     AwarenessEvent {
         anchor: mk_awareness_anchor(),
         event_id: EventId::new(700 + event_type as u64),
@@ -198,5 +201,8 @@ fn awareness_event_parent_cycle_must_differ() {
     let mut evt = mk_awareness_event(AwarenessEventType::AcStarted, json!({}));
     evt.parent_cycle_id = Some(evt.awareness_cycle_id);
     let err = evt.validate().unwrap_err();
-    assert!(matches!(err, ModelError::Invariant("parent_cycle_id cannot equal awareness_cycle_id")));
+    assert!(matches!(
+        err,
+        ModelError::Invariant("parent_cycle_id cannot equal awareness_cycle_id")
+    ));
 }
