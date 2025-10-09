@@ -129,6 +129,8 @@ fn convert_anchor(anchor: &AwarenessAnchor) -> Anchor {
         provenance: anchor.provenance.clone(),
         schema_v: anchor.schema_v,
         scenario: None,
+        supersedes: None,
+        superseded_by: None,
     }
 }
 

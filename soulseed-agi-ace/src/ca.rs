@@ -1,16 +1,18 @@
+use blake3::Hasher;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use soulseed_agi_core_models::{
     CycleId,
-    awareness::{AwarenessAnchor, AwarenessEvent, DeltaPatch, SyncPointKind},
+    awareness::{AwarenessAnchor, AwarenessEvent, AwarenessEventType, DeltaPatch, SyncPointKind},
 };
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 use crate::errors::AceError;
 use crate::hitl::HitlInjection;
 use crate::types::{BudgetSnapshot, SyncPointInput};
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InjectionAction {
     Applied,
@@ -72,24 +74,120 @@ pub trait CaService: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct CaServiceNoop;
+pub struct CaServiceDefault;
 
-impl CaService for CaServiceNoop {
+impl CaService for CaServiceDefault {
     fn merge_delta(&self, request: MergeDeltaRequest) -> Result<MergeDeltaResponse, AceError> {
-        Ok(MergeDeltaResponse {
-            delta_patch: None,
-            awareness_events: Vec::new(),
-            injections: request
-                .pending_injections
-                .into_iter()
-                .map(|inj| InjectionDecision {
+        let mut added: Vec<String> = Vec::new();
+        let mut pointers = Vec::new();
+        for event in &request.events {
+            added.push(format!("event:{}", event.event_id.0));
+            if let Some(ptr) = event.evidence_pointer.as_ref() {
+                pointers.push(json!({
+                    "event_id": event.event_id.0,
+                    "evidence": ptr,
+                }));
+            }
+        }
+
+        let mut hasher = Hasher::new();
+        hasher.update(&request.cycle_id.0.to_le_bytes());
+        hasher.update(format!("{:?}", request.kind).as_bytes());
+        hasher.update(
+            request
+                .anchor
+                .tenant_id
+                .into_inner()
+                .to_le_bytes()
+                .as_slice(),
+        );
+        for id in &added {
+            hasher.update(id.as_bytes());
+        }
+        let patch_digest = format!("blake3:{}", hasher.finalize().to_hex());
+
+        let delta_patch = if added.is_empty() {
+            None
+        } else {
+            Some(DeltaPatch {
+                patch_id: format!("ace-patch-{}-{}", request.cycle_id.0, request.kind as u32),
+                added,
+                updated: Vec::new(),
+                removed: Vec::new(),
+                score_stats: HashMap::new(),
+                why_included: None,
+                pointers: if pointers.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(pointers))
+                },
+                patch_digest,
+            })
+        };
+
+        let mut awareness_events: Vec<AwarenessEvent> = Vec::new();
+        let base_event_id = request.cycle_id.0 + 1;
+        if let Some(patch) = delta_patch.as_ref() {
+            awareness_events.push(AwarenessEvent {
+                anchor: request.anchor.clone(),
+                event_id: soulseed_agi_core_models::EventId(base_event_id),
+                event_type: map_syncpoint_event(&request.kind),
+                occurred_at_ms: request.timeframe.1.unix_timestamp() * 1000,
+                awareness_cycle_id: request.cycle_id,
+                parent_cycle_id: None,
+                collab_scope_id: None,
+                barrier_id: None,
+                env_mode: None,
+                inference_cycle_sequence: 1,
+                degradation_reason: None,
+                payload: json!({
+                    "patch_id": patch.patch_id,
+                    "digest": patch.patch_digest,
+                }),
+            });
+        }
+
+        let injections: Vec<InjectionDecision> = request
+            .pending_injections
+            .into_iter()
+            .enumerate()
+            .map(|(idx, inj)| {
+                let action = match inj.priority {
+                    crate::hitl::HitlPriority::P0Critical => InjectionAction::Applied,
+                    crate::hitl::HitlPriority::P1High if idx == 0 => InjectionAction::Applied,
+                    crate::hitl::HitlPriority::P1High => InjectionAction::Deferred,
+                    crate::hitl::HitlPriority::P2Medium => InjectionAction::Deferred,
+                    crate::hitl::HitlPriority::P3Low => InjectionAction::Ignored,
+                };
+                InjectionDecision {
                     injection_id: inj.injection_id,
-                    action: InjectionAction::Ignored,
-                    reason: Some("noop_ca_service".into()),
-                    fingerprint: None,
-                })
-                .collect(),
+                    action,
+                    reason: Some(match action {
+                        InjectionAction::Applied => "hitl_applied".into(),
+                        InjectionAction::Deferred => "hitl_deferred".into(),
+                        InjectionAction::Ignored => "hitl_ignored".into(),
+                    }),
+                    fingerprint: Some(format!("fp:{}", inj.injection_id)),
+                }
+            })
+            .collect();
+
+        Ok(MergeDeltaResponse {
+            delta_patch,
+            awareness_events,
+            injections,
         })
+    }
+}
+
+fn map_syncpoint_event(kind: &SyncPointKind) -> AwarenessEventType {
+    match kind {
+        SyncPointKind::IcEnd => AwarenessEventType::IcEnded,
+        SyncPointKind::ToolBarrier => AwarenessEventType::ToolCalled,
+        SyncPointKind::ToolChainNext => AwarenessEventType::RouteSwitched,
+        SyncPointKind::CollabTurnEnd => AwarenessEventType::CollabResolved,
+        SyncPointKind::ClarifyAnswered => AwarenessEventType::ClarificationAnswered,
+        SyncPointKind::HitlAbsorb => AwarenessEventType::HumanInjectionReceived,
     }
 }
 
@@ -97,6 +195,8 @@ impl CaService for CaServiceNoop {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(feature = "vectors-extra")]
+    use soulseed_agi_core_models::ExtraVectors;
     use soulseed_agi_core_models::{
         AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
         EnvelopeHead, EventId, HumanId, MessageId, MessagePointer, SessionId, Snapshot, Subject,
@@ -149,6 +249,7 @@ mod tests {
             sequence_number: 1,
             trigger_event_id: None,
             temporal_pattern_id: None,
+            causal_links: vec![],
             reasoning_trace: None,
             reasoning_confidence: None,
             reasoning_strategy: None,
@@ -163,6 +264,10 @@ mod tests {
             real_time_priority: None,
             notification_targets: None,
             live_stream_id: None,
+            growth_stage: None,
+            processing_latency_ms: None,
+            influence_score: None,
+            community_impact: None,
             evidence_pointer: None,
             content_digest_sha256: None,
             blob_ref: None,
@@ -175,11 +280,13 @@ mod tests {
             tool_result: None,
             self_reflection: None,
             metadata: json!({}),
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
         }
     }
 
     #[test]
-    fn noop_service_marks_injections_ignored() {
+    fn default_service_applies_high_priority() {
         let request = MergeDeltaRequest {
             cycle_id: CycleId(1),
             anchor: dummy_anchor(),
@@ -197,19 +304,21 @@ mod tests {
                 tokens_spent: 10,
                 walltime_ms_allowed: 1000,
                 walltime_ms_used: 100,
+                external_cost_allowed: 2.0,
+                external_cost_spent: 0.5,
             },
             context_manifest: Value::Null,
         };
 
-        let service = CaServiceNoop::default();
+        let service = CaServiceDefault::default();
         let response = service.merge_delta(request).expect("merge");
-        assert!(response.delta_patch.is_none());
-        assert!(response.awareness_events.is_empty());
+        assert!(response.delta_patch.is_some());
+        assert_eq!(response.awareness_events.len(), 1);
         assert_eq!(response.injections.len(), 1);
-        assert_eq!(response.injections[0].action, InjectionAction::Ignored);
+        assert_eq!(response.injections[0].action, InjectionAction::Applied);
         assert_eq!(
             response.injections[0].reason.as_deref(),
-            Some("noop_ca_service")
+            Some("hitl_applied")
         );
     }
 }

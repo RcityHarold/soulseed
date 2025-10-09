@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use crate::{
     api::{AuthzRequest, AuthzResponse},
-    cache::PolicyStore,
+    cache::{resource_scope_specificity, PolicyStore},
     errors::AuthzError,
-    policy::Policy,
+    policy::{Policy, PredicateEvaluation},
     quota::{QuotaClient, QuotaRequest},
     types::{Action, Decision, Effect, Explain, ExplainStep},
     validate::validate_anchor,
@@ -39,7 +39,11 @@ impl Evaluator {
             .policies_for_tenant(request.anchor.tenant_id)
             .into_iter()
             .collect::<Vec<_>>();
-        policies.sort_by(|a, b| b.priority.cmp(&a.priority));
+        policies.sort_by(|a, b| {
+            let pa = (a.priority, resource_scope_specificity(&a.resource_urn));
+            let pb = (b.priority, resource_scope_specificity(&b.resource_urn));
+            pb.cmp(&pa)
+        });
 
         let mut explain = Explain::default();
         let mut matched_policies = Vec::new();
@@ -47,6 +51,9 @@ impl Evaluator {
         let mut chosen_policy: Option<Policy> = None;
         let mut obligations: Vec<String> = Vec::new();
         let mut chosen_priority = i32::MIN;
+        let mut chosen_specificity = 0usize;
+        let mut ask_consent_reasons: Vec<String> = Vec::new();
+        let mut quota_hints: Vec<String> = Vec::new();
 
         for policy in policies.into_iter() {
             let mut step = ExplainStep {
@@ -65,10 +72,24 @@ impl Evaluator {
                 continue;
             }
 
-            let (predicates, all_true) =
-                policy.evaluate_predicates(&request.anchor, &request.subject, &request.context);
-            step.predicates = predicates.clone();
+            let PredicateEvaluation {
+                results,
+                all_true,
+                missing_consent,
+                quota_hint,
+            } = policy.evaluate_predicates(&request.anchor, &request.subject, &request.context);
+            step.predicates = results.clone();
             step.matched = all_true;
+
+            if let Some(consent) = missing_consent {
+                let reason = format!("consent_required:{consent}");
+                explain.reasoning.push(reason.clone());
+                ask_consent_reasons.push(reason);
+            }
+            if let Some(hint) = quota_hint {
+                explain.reasoning.push(format!("quota_hint:{hint}"));
+                quota_hints.push(hint);
+            }
 
             if all_true {
                 matched_policies.push((
@@ -87,8 +108,12 @@ impl Evaluator {
                         .push("matched_policy_deny_short_circuit".into());
                     break;
                 }
-                if policy.priority > chosen_priority {
+                let specificity = resource_scope_specificity(&policy.resource_urn);
+                if policy.priority > chosen_priority
+                    || (policy.priority == chosen_priority && specificity > chosen_specificity)
+                {
                     chosen_priority = policy.priority;
+                    chosen_specificity = specificity;
                     chosen_effect = Some(policy.effect.clone());
                     obligations = policy.obligations.iter().map(|o| o.as_label()).collect();
                     chosen_policy = Some(policy.clone());
@@ -98,10 +123,32 @@ impl Evaluator {
         }
 
         if chosen_effect.is_none() {
+            if let Some(reason) = ask_consent_reasons.first() {
+                explain.reasoning.push(reason.clone());
+                let decision = Decision {
+                    decision_id: None,
+                    supersedes: None,
+                    superseded_by: None,
+                    effect: Effect::AskConsent,
+                    matched_policies,
+                    obligations: vec![reason.clone(), "summary_only".into()],
+                    explain,
+                    anchor: request.anchor,
+                    subject: request.subject,
+                    resource: request.resource,
+                    action: request.action,
+                    time_ms: now_ms,
+                    quota: None,
+                };
+                return Ok(AuthzResponse { decision });
+            }
             explain
                 .reasoning
                 .push("no_policy_matched_default_deny".into());
             let decision = Decision {
+                decision_id: None,
+                supersedes: None,
+                superseded_by: None,
                 effect: Effect::Deny,
                 matched_policies,
                 obligations,
@@ -177,6 +224,7 @@ impl Evaluator {
                     }
                     Effect::AskConsent => {
                         effect = Effect::AskConsent;
+                        obligations.push(format!("quota_consent:{}", quota_decision.reason));
                         explain.reasoning.push("quota_ask_consent".into());
                     }
                     Effect::Deny => {
@@ -196,7 +244,24 @@ impl Evaluator {
             }
         }
 
+        if effect == Effect::Allow && !ask_consent_reasons.is_empty() {
+            effect = Effect::AskConsent;
+            for reason in &ask_consent_reasons {
+                if !obligations.iter().any(|o| o == reason) {
+                    obligations.push(reason.clone());
+                }
+            }
+        }
+        if !quota_hints.is_empty() {
+            for hint in quota_hints {
+                obligations.push(format!("quota_hint:{hint}"));
+            }
+        }
+
         let decision = Decision {
+            decision_id: None,
+            supersedes: None,
+            superseded_by: None,
             effect,
             matched_policies,
             obligations,

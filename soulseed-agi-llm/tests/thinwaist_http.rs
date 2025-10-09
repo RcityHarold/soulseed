@@ -1,6 +1,7 @@
 use httpmock::prelude::*;
 use serde_json::json;
-use soulseed_agi_llm::dto::{LlmResult, PromptBundle, PromptSegment, TokenUsage};
+use soulseed_agi_core_models::common::EvidencePointer;
+use soulseed_agi_llm::dto::{LlmResult, PromptBundle, PromptSegment, ReasoningVisibility, TokenUsage};
 use soulseed_agi_llm::tw_client::{SoulbaseThinWaistClient, ThinWaistClient};
 use soulseed_agi_tools::dto::{AccessClass, Anchor, ConversationScenario, SessionId, TenantId};
 use uuid::Uuid;
@@ -17,6 +18,8 @@ fn anchor() -> Anchor {
         provenance: None,
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -44,11 +47,23 @@ fn soulbase_client_roundtrip() {
     let execute_result = json!({
         "result": {
             "completion": "ok",
+            "summary": "ok summary",
+            "evidence_pointer": {
+                "uri": "soulbase://llm/result/mock",
+                "digest_sha256": "sha256:mock",
+                "media_type": "text/plain"
+            },
             "reasoning": [],
+            "reasoning_visibility": "summary_only",
             "degradation_reason": null,
             "indices_used": ["idx"],
             "query_hash": "hash",
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_cost_usd": 0.0021,
+                "currency": "USD"
+            }
         }
     });
 
@@ -88,6 +103,15 @@ fn soulbase_client_roundtrip() {
         .execute(&anchor, &prompt, &model_profile)
         .expect("execute");
     assert_eq!(result.completion, "ok");
+    assert_eq!(result.summary.as_deref(), Some("ok summary"));
+    assert_eq!(
+        result
+            .evidence_pointer
+            .as_ref()
+            .expect("evidence pointer")
+            .uri,
+        "soulbase://llm/result/mock"
+    );
     execute_mock.assert();
 
     client
@@ -95,13 +119,24 @@ fn soulbase_client_roundtrip() {
             &anchor,
             &LlmResult {
                 completion: "ok".into(),
+                summary: Some("ok summary".into()),
+                evidence_pointer: Some(EvidencePointer {
+                    uri: "soulbase://llm/result/mock-local".into(),
+                    digest_sha256: Some("sha256:mock-local".into()),
+                    media_type: Some("text/plain".into()),
+                    blob_ref: None,
+                    span: None,
+                    access_policy: Some("summary_only".into()),
+                }),
                 reasoning: Vec::new(),
+                reasoning_visibility: ReasoningVisibility::SummaryOnly,
                 degradation_reason: None,
                 indices_used: None,
                 query_hash: None,
                 usage: TokenUsage {
                     prompt_tokens: 1,
                     completion_tokens: 1,
+                    ..Default::default()
                 },
             },
         )

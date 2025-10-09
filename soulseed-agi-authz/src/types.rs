@@ -226,6 +226,10 @@ pub struct Anchor {
     pub schema_v: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<ConversationScenario>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<EnvelopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<EnvelopeId>,
 }
 
 impl Anchor {
@@ -268,6 +272,12 @@ pub struct Explain {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Decision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     pub effect: Effect,
     pub matched_policies: Vec<(String, String, i32)>,
     pub obligations: Vec<String>,

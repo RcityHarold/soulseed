@@ -8,5 +8,10 @@ pub fn validate_anchor(anchor: &Anchor) -> Result<(), AuthzError> {
     if anchor.access_class == AccessClass::Restricted && anchor.provenance.is_none() {
         return Err(AuthzError::PrivacyRestricted);
     }
+    if let Some(supersedes) = anchor.supersedes.as_ref() {
+        if supersedes == &anchor.envelope_id {
+            return Err(AuthzError::InvalidRequest("anchor_supersedes_self".into()));
+        }
+    }
     Ok(())
 }

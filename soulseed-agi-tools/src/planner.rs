@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::ToolsConfig;
 use crate::dto::{
-    CandidateScore, ExplainPlan, OrchestrationMode, PlannerContext, ToolBarrier, ToolCallSpec,
-    ToolEdge, ToolEdgeKind, ToolGraph, ToolLane, ToolPlan,
+    CandidateScore, ExplainPlan, OrchestrationMode, PlanLineage, PlannerContext, ToolBarrier,
+    ToolCallSpec, ToolEdge, ToolEdgeKind, ToolGraph, ToolLane, ToolPlan,
 };
 use crate::errors::PlannerError;
 use crate::traits::Planner;
@@ -66,6 +66,8 @@ impl ToolPlanner {
             cacheable,
             stream,
             idem_key: format!("{}:{}", anchor.envelope_id, index),
+            supersedes: None,
+            superseded_by: None,
         }
     }
 
@@ -84,11 +86,29 @@ impl ToolPlanner {
         format!("plan-{:016x}", hash)
     }
 
-    fn build_explain(ranked: &[CandidateScore], policy_digest: &Option<String>) -> ExplainPlan {
+    fn build_explain(
+        ranked: &[CandidateScore],
+        excluded: &[(String, String)],
+        policy_digest: &Option<String>,
+        cfg: &ToolsConfig,
+        schema_v: u16,
+    ) -> ExplainPlan {
+        let weights = &cfg.router.weights;
+        let weights_json = json!({
+            "context_fit": weights.context_fit,
+            "success_rate": weights.success_rate,
+            "latency_p95": weights.latency_p95,
+            "cost_per_success": weights.cost_per_success,
+            "risk_level": weights.risk_level,
+            "auth_impact": weights.auth_impact,
+            "cacheability": weights.cacheability,
+            "degradation_acceptance": weights.degradation_acceptance,
+        });
         ExplainPlan {
+            schema_v,
             candidates: ranked.to_vec(),
-            excluded: Vec::new(),
-            weights: serde_json::Value::Null,
+            excluded: excluded.to_vec(),
+            weights: weights_json,
             policy_digest: policy_digest.clone(),
         }
     }
@@ -164,6 +184,7 @@ impl Planner for ToolPlanner {
             anchor,
             ranked,
             policy_digest,
+            excluded,
             scene,
             capability_hints: _,
             request_context,
@@ -185,7 +206,8 @@ impl Planner for ToolPlanner {
             .collect();
 
         let plan_id = Self::plan_hash(&anchor, &specs, cfg);
-        let explain_plan = Self::build_explain(&ranked, &policy_digest);
+        let explain_plan =
+            Self::build_explain(&ranked, &excluded, &policy_digest, cfg, anchor.schema_v);
         let lane = anchor.lane(&scene);
 
         let mut strategy = cfg.to_strategy();
@@ -237,9 +259,21 @@ impl Planner for ToolPlanner {
             });
         graph.assign_barrier_ids(&plan_id);
 
+        let plan_schema_v = anchor.schema_v;
+        let lineage = PlanLineage {
+            version: anchor
+                .sequence_number
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32,
+            supersedes: anchor.supersedes.as_ref().map(|id| id.to_string()),
+            superseded_by: anchor.superseded_by.as_ref().map(|id| id.to_string()),
+        };
+
         Ok(ToolPlan {
             plan_id,
             anchor,
+            schema_v: plan_schema_v,
+            lineage,
             subject,
             items: specs,
             strategy,

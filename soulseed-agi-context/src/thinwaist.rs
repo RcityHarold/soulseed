@@ -7,8 +7,8 @@ use crate::{
     obs::NoopObs,
     planner::DeterministicPlanner,
     pointer::PointerValidatorMock,
-    qgate::QualityGateMock,
-    score::ScoreAdapterSimple,
+    qgate::QualityGateStrict,
+    score::ScoreAdapterHalfLife,
     store::InMemoryStore,
     traits::Observability,
     types::{Anchor, ContextItem, GraphExplain, RunInput, RunOutput},
@@ -25,10 +25,10 @@ use soulseed_agi_envctx::{
 
 /// Thin-waist 适配器，将 ContextEngine 运行所需的 mocks 统一封装，方便替换为真实实现。
 pub struct ThinWaistContextAdapter {
-    scorer: ScoreAdapterSimple,
+    scorer: ScoreAdapterHalfLife,
     planner: DeterministicPlanner,
     compressor: CompressorMock,
-    qgate: QualityGateMock,
+    qgate: QualityGateStrict,
     pointer: PointerValidatorMock,
     store: InMemoryStore,
     obs: NoopObs,
@@ -59,7 +59,7 @@ impl ThinWaistContextAdapter {
         &mut self.store
     }
 
-    pub fn quality_gate_mut(&mut self) -> &mut QualityGateMock {
+    pub fn quality_gate_mut(&mut self) -> &mut QualityGateStrict {
         &mut self.qgate
     }
 }
@@ -67,10 +67,10 @@ impl ThinWaistContextAdapter {
 impl Default for ThinWaistContextAdapter {
     fn default() -> Self {
         Self {
-            scorer: ScoreAdapterSimple,
+            scorer: ScoreAdapterHalfLife,
             planner: DeterministicPlanner,
             compressor: CompressorMock,
-            qgate: QualityGateMock::default(),
+            qgate: QualityGateStrict::default(),
             pointer: PointerValidatorMock,
             store: InMemoryStore::default(),
             obs: NoopObs,
@@ -102,10 +102,10 @@ pub struct ContextRuntimeInput {
 
 pub struct ContextRuntime<G, Obs = NoopObs> {
     env_gateway: G,
-    scorer: ScoreAdapterSimple,
+    scorer: ScoreAdapterHalfLife,
     planner: DeterministicPlanner,
     compressor: CompressorMock,
-    qgate: QualityGateMock,
+    qgate: QualityGateStrict,
     pointer: PointerValidatorMock,
     store: InMemoryStore,
     obs: Obs,
@@ -119,10 +119,10 @@ where
     pub fn new(env_gateway: G, obs: Obs) -> Self {
         Self {
             env_gateway,
-            scorer: ScoreAdapterSimple,
+            scorer: ScoreAdapterHalfLife,
             planner: DeterministicPlanner,
             compressor: CompressorMock,
-            qgate: QualityGateMock::default(),
+            qgate: QualityGateStrict::default(),
             pointer: PointerValidatorMock,
             store: InMemoryStore::default(),
             obs,
@@ -151,6 +151,7 @@ where
             config: input.config,
             items: input.items,
             graph_explain: input.graph_explain,
+            previous_manifest: None,
         })
     }
 
@@ -162,7 +163,7 @@ where
         &mut self.store
     }
 
-    pub fn quality_gate_mut(&mut self) -> &mut QualityGateMock {
+    pub fn quality_gate_mut(&mut self) -> &mut QualityGateStrict {
         &mut self.qgate
     }
 }
@@ -208,10 +209,7 @@ impl EnvironmentDataProvider for LocalEnvProvider {
                 goal: "respond".into(),
                 constraints: vec!["tokens<=800".into()],
             },
-            latency_window: LatencyWindow {
-                p50_ms: 120,
-                p95_ms: 250,
-            },
+            latency_window: LatencyWindow::new(120, 250),
             risk_flag: RiskLevel::Low,
         })
     }
@@ -281,7 +279,17 @@ impl EnvironmentDataProvider for LocalEnvProvider {
                 digest: "policy:local".into(),
                 at: None,
             },
+            tool_catalog_snapshot: Some(VersionPointer {
+                digest: "tools:local".into(),
+                at: None,
+            }),
+            authz_snapshot: Some(VersionPointer {
+                digest: "authz:local".into(),
+                at: None,
+            }),
+            quota_snapshot: None,
             observe_watermark: None,
+            monitoring_snapshot: None,
         })
     }
 }
@@ -295,7 +303,7 @@ impl Default for LocalEnvGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ContextItem, FeatureVec, Partition};
+    use crate::types::{ContextItem, ContextItemDigests, ContextItemLinks, FeatureVec, Partition};
     use soulseed_agi_core_models::{
         AccessClass, EventId, MessageId, Provenance, SessionId, TenantId,
     };
@@ -303,6 +311,7 @@ mod tests {
         dto::{Anchor as EnvAnchor, ConversationSummary, InteractionObject, LifeJourney},
         ThinWaistError,
     };
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -323,10 +332,7 @@ mod tests {
                     goal: "respond".into(),
                     constraints: vec![],
                 },
-                latency_window: LatencyWindow {
-                    p50_ms: 80,
-                    p95_ms: 220,
-                },
+                latency_window: LatencyWindow::new(80, 220),
                 risk_flag: RiskLevel::Low,
             })
         }
@@ -396,7 +402,17 @@ mod tests {
                     digest: "policy:prod".into(),
                     at: None,
                 },
+                tool_catalog_snapshot: Some(VersionPointer {
+                    digest: "tools:prod".into(),
+                    at: None,
+                }),
+                authz_snapshot: Some(VersionPointer {
+                    digest: "authz:prod".into(),
+                    at: None,
+                }),
+                quota_snapshot: None,
                 observe_watermark: None,
+                monitoring_snapshot: None,
             })
         }
     }
@@ -468,6 +484,8 @@ mod tests {
             }),
             schema_v: 1,
             scenario: Some(crate::types::ConversationScenario::HumanToAi),
+            supersedes: None,
+            superseded_by: None,
         }
     }
 
@@ -475,9 +493,11 @@ mod tests {
         ContextItem {
             anchor: anchor.clone(),
             id: id.into(),
+            partition: Partition::P4Dialogue,
             partition_hint: Some(Partition::P4Dialogue),
             source_event_id: EventId(u64::from(tokens)),
             source_message_id: Some(MessageId(u64::from(tokens))),
+            observed_at: OffsetDateTime::UNIX_EPOCH,
             content: serde_json::json!({"text": id}),
             tokens,
             features: FeatureVec {
@@ -491,7 +511,15 @@ mod tests {
                 risk: 0.1,
             },
             policy_tags: serde_json::json!({}),
-            evidence: None,
+            typ: Some("dialogue".into()),
+            digests: ContextItemDigests {
+                content: Some(format!("sha256:{id}")),
+                ..Default::default()
+            },
+            links: ContextItemLinks {
+                evidence_ptrs: Vec::new(),
+                supersedes: None,
+            },
         }
     }
 
@@ -524,7 +552,7 @@ mod tests {
             .iter()
             .any(|r| r.contains("plan_applied")));
         assert!(result.env_snapshot.context_digest.starts_with("sha256:"));
-        assert!(result.env_snapshot.snapshot_digest.starts_with("blake3:"));
+        assert!(result.env_snapshot.snapshot_digest.starts_with("sha256:"));
         assert_eq!(
             result.env_snapshot.manifest_digest,
             result.manifest.manifest_digest
@@ -537,7 +565,7 @@ mod tests {
             result.env_snapshot.policy_digest.as_deref(),
             Some("policy:prod")
         );
-        assert!(result.env_snapshot.evidence_pointers.is_empty());
+        assert!(!result.env_snapshot.evidence_pointers.is_empty());
         assert!(result.manifest.manifest_digest.starts_with("man-"));
     }
 
@@ -561,15 +589,18 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.starts_with("envctx_degraded")));
-        assert_eq!(
-            output.bundle.explain.degradation_reason.as_deref(),
-            Some("envctx:envctx.external_systems")
-        );
+        assert!(output
+            .bundle
+            .explain
+            .degradation_reason
+            .as_deref()
+            .map(|reason| reason.contains("envctx.external_systems"))
+            .unwrap_or(false));
         assert_eq!(
             output.env_snapshot.degradation_reason.as_deref(),
             Some("envctx.external_systems")
         );
-        assert!(output.env_snapshot.snapshot_digest.starts_with("blake3:"));
+        assert!(output.env_snapshot.snapshot_digest.starts_with("sha256:"));
         assert_eq!(
             output.env_snapshot.policy_digest.as_deref(),
             Some("unknown")

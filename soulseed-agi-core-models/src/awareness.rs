@@ -1,6 +1,6 @@
 use crate::{
-    AccessClass, CycleId, EnvelopeId, EventId, ModelError, Provenance, SessionId, Snapshot,
-    Subject, TenantId,
+    AccessClass, CycleId, EnvelopeId, EventId, InferenceCycleId, ModelError, Provenance, SessionId,
+    Snapshot, Subject, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -421,6 +421,14 @@ pub struct AwarenessCycleRecord {
     pub resource_cost: Value,
     pub decision_path_taken: String,
     pub snapshot: Snapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_cycle_id: Option<InferenceCycleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_explain_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_snapshot_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_snapshot_version: Option<u32>,
 }
 
 impl AwarenessCycleRecord {
@@ -430,6 +438,13 @@ impl AwarenessCycleRecord {
         }
         if self.decision_path_taken.trim().is_empty() {
             return Err(ModelError::Missing("decision_path_taken"));
+        }
+        if let Some(inference_cycle_id) = self.inference_cycle_id {
+            if inference_cycle_id.into_inner() == 0 {
+                return Err(ModelError::Invariant(
+                    "inference_cycle_id must be >= 1 when provided",
+                ));
+            }
         }
         Ok(())
     }

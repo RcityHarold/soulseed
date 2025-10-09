@@ -2,13 +2,14 @@ use time::OffsetDateTime;
 
 use crate::canon::compute_digest;
 use crate::dto::{
-    AIView, Anchor, ConversationSummary, DegradationReason, EnvironmentContext, ExternalSystems,
-    FreshnessState, GroupView, InteractionObject, InternalScene, LatencyWindow, LifeJourney,
-    LifeMilestone, NetworkQuality, ServiceFreshness, SoulState, SourceVersions, TaskSummary,
-    ToolDefLite, ToolPermission, VersionPointer,
+    AIView, Anchor, ConversationSummary, DegradationReason, EnvironmentContext,
+    EnvironmentSnapshotEvent, ExternalSystems, FreshnessState, GroupView, InteractionObject,
+    InternalScene, LatencyWindow, LifeJourney, LifeMilestone, NetworkQuality, ServiceFreshness,
+    SoulState, SourceVersions, TaskSummary, ToolDefLite, ToolPermission, VersionPointer,
 };
 use crate::errors::{EnvCtxError, Result};
 use crate::facade::{DegradationReporter, EnvironmentDataProvider};
+use soulseed_agi_core_models::EvidencePointer;
 
 pub struct EnvironmentEngine<P, R> {
     provider: P,
@@ -87,6 +88,7 @@ where
             source_versions,
             context_digest: String::new(),
             degradation_reason: degradation.clone(),
+            lite_mode: degradation.is_some(),
         };
 
         context.context_digest = compute_digest(&context)?;
@@ -143,6 +145,41 @@ where
     }
 }
 
+fn pointer_for_context(ctx: &EnvironmentContext) -> EvidencePointer {
+    EvidencePointer {
+        uri: format!("env://snapshot/{}", ctx.anchor.envelope_id),
+        digest_sha256: Some(ctx.context_digest.clone()),
+        media_type: Some("application/json".into()),
+        blob_ref: None,
+        span: None,
+        access_policy: Some("internal".into()),
+    }
+}
+
+pub fn build_snapshot_event(ctx: &EnvironmentContext) -> EnvironmentSnapshotEvent {
+    let policy = ctx.external_systems.policy_digest.trim();
+    EnvironmentSnapshotEvent {
+        anchor: ctx.anchor.clone(),
+        schema_v: ctx.anchor.schema_v,
+        context_digest: ctx.context_digest.clone(),
+        snapshot_digest: ctx.context_digest.clone(),
+        lite_mode: ctx.lite_mode,
+        environment: ctx.external_systems.environment.clone(),
+        region: ctx.external_systems.region.clone(),
+        scene: Some(ctx.internal_scene.conversation.scene.clone()),
+        risk_flag: format!("{:?}", ctx.internal_scene.risk_flag),
+        policy_digest: if policy.is_empty() {
+            None
+        } else {
+            Some(ctx.external_systems.policy_digest.clone())
+        },
+        source_versions: ctx.source_versions.clone(),
+        evidence: vec![pointer_for_context(ctx)],
+        degradation_reason: ctx.degradation_reason.clone(),
+        generated_at: OffsetDateTime::now_utc(),
+    }
+}
+
 fn fallback_internal_scene() -> InternalScene {
     InternalScene {
         conversation: ConversationSummary {
@@ -154,10 +191,7 @@ fn fallback_internal_scene() -> InternalScene {
             goal: "undetermined".into(),
             constraints: Vec::new(),
         },
-        latency_window: LatencyWindow {
-            p50_ms: 0,
-            p95_ms: 0,
-        },
+        latency_window: LatencyWindow::new(0, 0),
         risk_flag: crate::dto::RiskLevel::Medium,
     }
 }
@@ -226,6 +260,16 @@ fn fallback_source_versions() -> SourceVersions {
             digest: "unknown".into(),
             at: None,
         },
+        tool_catalog_snapshot: Some(VersionPointer {
+            digest: "unknown".into(),
+            at: None,
+        }),
+        authz_snapshot: Some(VersionPointer {
+            digest: "unknown".into(),
+            at: None,
+        }),
+        quota_snapshot: None,
         observe_watermark: None,
+        monitoring_snapshot: None,
     }
 }

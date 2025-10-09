@@ -30,6 +30,8 @@ fn make_anchor() -> Anchor {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 

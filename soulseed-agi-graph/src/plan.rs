@@ -58,6 +58,10 @@ pub enum Plan {
     Live {
         filters: crate::LiveFilters,
         rate: u32,
+        heartbeat_ms: u32,
+        idle_timeout_ms: u32,
+        max_buffer: u32,
+        backpressure_mode: String,
     },
     Awareness {
         index: String,
@@ -87,6 +91,11 @@ pub struct PlannerConfig {
     pub max_limit: u32,
     pub live_default_rate: u32,
     pub live_max_rate: u32,
+    pub live_default_heartbeat_ms: u32,
+    pub live_min_heartbeat_ms: u32,
+    pub live_default_idle_timeout_ms: u32,
+    pub live_max_buffer: u32,
+    pub live_default_backpressure_mode: String,
 }
 
 impl Default for PlannerConfig {
@@ -98,6 +107,11 @@ impl Default for PlannerConfig {
             max_limit: 200,
             live_default_rate: 20,
             live_max_rate: 60,
+            live_default_heartbeat_ms: 3000,
+            live_min_heartbeat_ms: 500,
+            live_default_idle_timeout_ms: 10000,
+            live_max_buffer: 500,
+            live_default_backpressure_mode: "drop_tail".into(),
         }
     }
 }

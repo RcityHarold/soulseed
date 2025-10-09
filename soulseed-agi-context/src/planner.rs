@@ -3,8 +3,11 @@ use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::{
-    config::{ContextConfig, PartitionQuota},
-    types::{Anchor, ContextScore, Partition, PartitionUsage, PlanAction, PlanItem, ScoredItem},
+    config::ContextConfig,
+    types::{
+        Anchor, ContextScore, Partition, PartitionUsage, PlanAction, PlanDecisionTrace, PlanItem,
+        PlanLineage, ScoredItem,
+    },
 };
 
 pub struct DeterministicPlanner;
@@ -72,14 +75,19 @@ impl DeterministicPlanner {
         partitions
     }
 
-    fn quota_for(cfg: &ContextConfig, partition: &Partition) -> PartitionQuota {
+    fn quota_for(cfg: &ContextConfig, partition: &Partition) -> (u32, u32) {
         cfg.partition_quota
             .get(partition)
-            .copied()
-            .unwrap_or_else(|| PartitionQuota {
-                max_tokens: u32::MAX,
-                min_tokens: 0,
-            })
+            .map(|quota| quota.resolve(cfg.target_tokens))
+            .unwrap_or((u32::MAX, 0))
+    }
+
+    fn refresh_metrics(state: &mut PlanState) {
+        let saved = state.item.base_tokens as i32 - state.item.tokens_after as i32;
+        state.item.estimated_tokens_saved = saved;
+        let base_tokens = state.item.base_tokens.max(1);
+        let ratio = (saved.max(0) as f32) / (base_tokens as f32);
+        state.item.utility_delta = (state.score.final_score.max(0.0)) * ratio;
     }
 }
 
@@ -93,7 +101,12 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
         let mut states: Vec<PlanState> = items
             .iter()
             .map(|sc| {
-                let partition = sc.item.partition_hint.unwrap_or(Partition::P4Dialogue);
+                let partition = sc.score.partition_affinity;
+                let mut trace = PlanDecisionTrace::default();
+                trace.why_keep = Some(format!(
+                    "preserve_high_utility:density={:.4}",
+                    sc.score.utility_density
+                ));
                 PlanState {
                     item: PlanItem {
                         ci_id: sc.item.id.clone(),
@@ -101,12 +114,19 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
                         base_tokens: sc.item.tokens,
                         action: PlanAction::Keep,
                         tokens_after: sc.item.tokens,
+                        estimated_tokens_saved: 0,
+                        utility_delta: 0.0,
+                        trace,
                     },
                     score: sc.score.clone(),
                     allowed: cfg.allowed_actions(partition),
                 }
             })
             .collect();
+
+        for state in states.iter_mut() {
+            Self::refresh_metrics(state);
+        }
 
         let mut usage = Self::compute_partition_usage(&states);
         let mut total_tokens: u32 = states.iter().map(|s| s.item.tokens_after).sum();
@@ -116,9 +136,10 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
             let mut partitions_need_reduce: Vec<Partition> = Vec::new();
 
             for partition in Self::eviction_order().iter() {
+                let (max_tokens, _) = Self::quota_for(cfg, partition);
                 if usage
                     .get(partition)
-                    .map(|(_, after)| *after > Self::quota_for(cfg, partition).max_tokens)
+                    .map(|(_, after)| *after > max_tokens)
                     .unwrap_or(false)
                 {
                     partitions_need_reduce.push(*partition);
@@ -138,10 +159,10 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
             }
 
             for partition in partitions_need_reduce {
-                let quota = Self::quota_for(cfg, &partition);
+                let (max_tokens, min_tokens) = Self::quota_for(cfg, &partition);
                 let current_after = usage.get(&partition).map(|(_, after)| *after).unwrap_or(0);
                 let mut candidate: Option<usize> = None;
-                let mut candidate_score = f32::MAX;
+                let mut candidate_density = f32::MAX;
                 for (idx, state) in states.iter().enumerate() {
                     if state.item.partition != partition {
                         continue;
@@ -154,24 +175,69 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
                     if reduction == 0 {
                         continue;
                     }
-                    if current_after.saturating_sub(reduction) < quota.min_tokens {
+                    if current_after.saturating_sub(reduction) < min_tokens {
                         continue;
                     }
-                    if state.score.final_score < candidate_score {
+                    if state.score.utility_density < candidate_density {
                         candidate = Some(idx);
-                        candidate_score = state.score.final_score;
+                        candidate_density = state.score.utility_density;
                     }
                 }
 
                 if let Some(idx) = candidate {
                     let next =
                         Self::next_action(&states[idx].item.action, &states[idx].allowed).unwrap();
+                    let cause = if usage
+                        .get(&partition)
+                        .map(|(_, after)| *after > max_tokens)
+                        .unwrap_or(false)
+                    {
+                        format!(
+                            "partition_quota_exceeded:{:?}:{}>{}",
+                            partition, current_after, max_tokens
+                        )
+                    } else {
+                        format!("budget_exceeded:{}>{}", total_tokens, cfg.target_tokens)
+                    };
+
                     states[idx].item.action = next;
                     states[idx].item.tokens_after =
                         Self::tokens_after(states[idx].item.base_tokens, states[idx].item.action);
+                    match next {
+                        PlanAction::Evict => {
+                            states[idx].item.trace.why_keep = None;
+                            states[idx].item.trace.why_compress = None;
+                            states[idx].item.trace.why_drop = Some(format!(
+                                "{};density={:.4}",
+                                cause, states[idx].score.utility_density
+                            ));
+                        }
+                        PlanAction::L1 | PlanAction::L2 | PlanAction::L3 => {
+                            states[idx].item.trace.why_drop = None;
+                            states[idx].item.trace.why_keep = None;
+                            states[idx].item.trace.why_compress = Some(format!(
+                                "{};density={:.4}",
+                                cause, states[idx].score.utility_density
+                            ));
+                        }
+                        PlanAction::Keep => {}
+                    }
+                    Self::refresh_metrics(&mut states[idx]);
                     usage = Self::compute_partition_usage(&states);
                     total_tokens = states.iter().map(|s| s.item.tokens_after).sum();
-                    progress = true;
+                    if usage
+                        .get(&partition)
+                        .map(|(_, after)| *after > max_tokens)
+                        .unwrap_or(false)
+                    {
+                        progress = true;
+                    } else {
+                        progress = true;
+                        break;
+                    }
+                }
+
+                if progress {
                     break;
                 }
             }
@@ -191,6 +257,17 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
             .collect::<Vec<_>>();
         partitions_vec.sort_by_key(|u| Self::partition_priority(u.partition));
 
+        for state in states.iter_mut() {
+            Self::refresh_metrics(state);
+            if matches!(state.item.action, PlanAction::Keep) && state.item.trace.why_keep.is_none()
+            {
+                state.item.trace.why_keep = Some(format!(
+                    "retained_after_mcc:density={:.4}",
+                    state.score.utility_density
+                ));
+            }
+        }
+
         let mut items_vec = states.into_iter().map(|s| s.item).collect::<Vec<_>>();
         items_vec.sort_by(|a, b| a.ci_id.cmp(&b.ci_id));
 
@@ -206,9 +283,20 @@ impl crate::traits::MCCPlanner for DeterministicPlanner {
         }
         let plan_hash = xxh3_64_with_seed(&hasher_input, cfg.plan_seed);
 
+        let version = anchor.sequence_number.unwrap_or(0).min(u32::MAX as u64) as u32;
+
         crate::types::CompressionPlan {
             plan_id: format!("plan-{:016x}", plan_hash),
             anchor: anchor.clone(),
+            schema_v: anchor.schema_v,
+            lineage: PlanLineage {
+                version,
+                supersedes: anchor.supersedes.as_ref().map(|env_id| env_id.to_string()),
+                superseded_by: anchor
+                    .superseded_by
+                    .as_ref()
+                    .map(|env_id| env_id.to_string()),
+            },
             items: items_vec,
             partitions: partitions_vec,
             budget: crate::types::BudgetSummary {

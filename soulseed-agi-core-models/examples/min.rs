@@ -35,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sequence_number: 1,
         trigger_event_id: None,
         temporal_pattern_id: None,
+        causal_links: vec![],
         reasoning_trace: Some("internal reasoning redacted".into()),
         reasoning_confidence: Some(0.8),
         reasoning_strategy: Some("self-reflection".into()),
@@ -53,7 +54,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         real_time_priority: Some(RealTimePriority::Normal),
         notification_targets: None,
         live_stream_id: None,
-        evidence_pointer: Some("blob://evidence/ev-1".into()),
+        growth_stage: Some("ic:responding".into()),
+        processing_latency_ms: Some(42),
+        influence_score: Some(0.67),
+        community_impact: None,
+        evidence_pointer: Some(EvidencePointer {
+            uri: "blob://evidence/ev-1".into(),
+            digest_sha256: Some("sha256:payload".into()),
+            media_type: Some("application/json".into()),
+            blob_ref: None,
+            span: None,
+            access_policy: Some("internal".into()),
+        }),
         content_digest_sha256: Some("sha256:payload".into()),
         blob_ref: None,
         supersedes: None,
@@ -65,6 +77,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tool_result: None,
         self_reflection: None,
         metadata: serde_json::json!({"scenario": "Consultation"}),
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
     };
 
     event.validate()?;

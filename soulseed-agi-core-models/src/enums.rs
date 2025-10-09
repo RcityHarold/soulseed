@@ -38,3 +38,32 @@ pub enum SoulState {
     Active,
     Dormant,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MembershipLevel {
+    Free,
+    Pro,
+    Premium,
+    Ultimate,
+    Team,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    None,
+    Trialing,
+    Active,
+    Paused,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RelationshipStatus {
+    Stranger,
+    Acquaintance,
+    Friend,
+    CloseFriend,
+    Companion,
+    Blocked,
+}

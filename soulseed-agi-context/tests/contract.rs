@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde_json::json;
 use soulseed_agi_context::compress::CompressorMock;
@@ -8,17 +8,19 @@ use soulseed_agi_context::errors::ContextError;
 use soulseed_agi_context::obs::NoopObs;
 use soulseed_agi_context::planner::DeterministicPlanner;
 use soulseed_agi_context::pointer::PointerValidatorMock;
-use soulseed_agi_context::qgate::QualityGateMock;
-use soulseed_agi_context::score::ScoreAdapterSimple;
+use soulseed_agi_context::qgate::QualityGateStrict;
+use soulseed_agi_context::score::ScoreAdapterHalfLife;
 use soulseed_agi_context::store::InMemoryStore;
 use soulseed_agi_context::types::{
-    AccessClass, Anchor, BudgetSummary, BundleItem, BundleSegment, ContextBundle, ContextItem,
-    EventId, EvidencePointer, ExplainBundle, FeatureVec, GraphExplain, Level, MessageId, Partition,
-    PlanAction, Provenance, RunInput, SessionId, TenantId,
+    AccessClass, Anchor, BudgetSummary, BundleItem, BundleScoreStats, BundleSegment, ContextBundle,
+    ContextItem, ContextItemDigests, ContextItemLinks, EventId, EvidencePointer, ExplainBundle,
+    FeatureVec, GraphExplain, Level, MessageId, Partition, PlanAction, PromptBundle, Provenance,
+    RunInput, SessionId, TenantId,
 };
 use soulseed_agi_context::{build_prefix, compact, merge_delta};
-use soulseed_agi_core_models::{ConversationScenario, DeltaPatch};
+use soulseed_agi_core_models::ConversationScenario;
 use soulseed_agi_envctx as envctx;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 fn default_anchor() -> Anchor {
@@ -38,6 +40,8 @@ fn default_anchor() -> Anchor {
         }),
         schema_v: 1,
         scenario: None,
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -52,6 +56,8 @@ fn env_ctx(anchor: &Anchor) -> envctx::EnvironmentContext {
         access_class: anchor.access_class,
         provenance: anchor.provenance.clone(),
         schema_v: anchor.schema_v,
+        supersedes: anchor.supersedes,
+        superseded_by: anchor.superseded_by,
     };
 
     let mut ctx = envctx::EnvironmentContext {
@@ -66,10 +72,7 @@ fn env_ctx(anchor: &Anchor) -> envctx::EnvironmentContext {
                 goal: "contract_test".into(),
                 constraints: Vec::new(),
             },
-            latency_window: envctx::LatencyWindow {
-                p50_ms: 50,
-                p95_ms: 150,
-            },
+            latency_window: envctx::LatencyWindow::new(50, 150),
             risk_flag: envctx::RiskLevel::Low,
         },
         external_systems: envctx::ExternalSystems {
@@ -103,10 +106,21 @@ fn env_ctx(anchor: &Anchor) -> envctx::EnvironmentContext {
                 digest: "policy:v1".into(),
                 at: None,
             },
+            tool_catalog_snapshot: Some(envctx::VersionPointer {
+                digest: "tools:v1".into(),
+                at: None,
+            }),
+            authz_snapshot: Some(envctx::VersionPointer {
+                digest: "authz:v1".into(),
+                at: None,
+            }),
+            quota_snapshot: None,
             observe_watermark: None,
+            monitoring_snapshot: None,
         },
         context_digest: String::new(),
         degradation_reason: None,
+        lite_mode: false,
     };
     ctx.context_digest = envctx::compute_digest(&ctx).expect("digest");
     ctx
@@ -119,12 +133,26 @@ fn mk_item(
     tokens: u32,
     pointer: bool,
 ) -> ContextItem {
+    let evidence_ptrs = if pointer {
+        vec![EvidencePointer {
+            uri: "s3://demo".into(),
+            digest_sha256: Some("sha256:valid".into()),
+            media_type: Some("application/json".into()),
+            blob_ref: None,
+            span: Some((0, 10)),
+            access_policy: Some("restricted".into()),
+        }]
+    } else {
+        Vec::new()
+    };
     ContextItem {
         anchor: anchor.clone(),
         id: id.into(),
+        partition,
         partition_hint: Some(partition),
         source_event_id: EventId(10),
         source_message_id: Some(MessageId(11)),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({"text": id}),
         tokens,
         features: FeatureVec {
@@ -138,19 +166,21 @@ fn mk_item(
             risk: 0.1,
         },
         policy_tags: json!({}),
-        evidence: pointer.then(|| EvidencePointer {
-            uri: "s3://demo".into(),
-            blob_ref: None,
-            span: Some((0, 10)),
-            checksum: "sha256:valid".into(),
-            access_policy: "restricted".into(),
-        }),
+        typ: Some("fact".into()),
+        digests: ContextItemDigests {
+            content: Some(format!("sha256:{id}")),
+            ..Default::default()
+        },
+        links: ContextItemLinks {
+            evidence_ptrs,
+            supersedes: None,
+        },
     }
 }
 
-fn make_engine<'a>(qgate: &'a QualityGateMock, store: &'a InMemoryStore) -> ContextEngine<'a> {
+fn make_engine<'a>(qgate: &'a QualityGateStrict, store: &'a InMemoryStore) -> ContextEngine<'a> {
     ContextEngine {
-        scorer: &ScoreAdapterSimple,
+        scorer: &ScoreAdapterHalfLife,
         planner: &DeterministicPlanner,
         compressor: &CompressorMock,
         qgate,
@@ -184,8 +214,17 @@ fn segments_from(spec: Vec<(Partition, Vec<(&str, Option<Level>, u32)>)>) -> Vec
                 .into_iter()
                 .map(|(ci_id, level, tokens)| BundleItem {
                     ci_id: ci_id.into(),
+                    partition,
                     summary_level: level,
                     tokens,
+                    score_scaled: 0,
+                    ts_ms: 0,
+                    digests: ContextItemDigests::default(),
+                    typ: None,
+                    why_included: None,
+                    score_stats: BundleScoreStats::default(),
+                    supersedes: None,
+                    evidence_ptrs: Vec::new(),
                 })
                 .collect(),
         })
@@ -195,6 +234,8 @@ fn segments_from(spec: Vec<(Partition, Vec<(&str, Option<Level>, u32)>)>) -> Vec
 fn base_bundle(anchor: &Anchor) -> ContextBundle {
     ContextBundle {
         anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        version: 1,
         segments: segments_from(vec![
             (
                 Partition::P1TaskFacts,
@@ -213,6 +254,7 @@ fn base_bundle(anchor: &Anchor) -> ContextBundle {
             target_tokens: 400,
             projected_tokens: 330,
         },
+        prompt: PromptBundle::default(),
     }
 }
 
@@ -230,18 +272,17 @@ fn partition_rank(partition: Partition) -> u8 {
 fn scenario_override_adjusts_dialogue_quota() {
     let cfg = ContextConfig::default();
     let override_cfg = cfg.for_scenario(Some(&ConversationScenario::HumanToAi));
-    assert!(
-        override_cfg
-            .partition_quota
-            .get(&Partition::P4Dialogue)
-            .map(|quota| quota.max_tokens)
-            .unwrap_or_default()
-            > cfg
-                .partition_quota
-                .get(&Partition::P4Dialogue)
-                .map(|quota| quota.max_tokens)
-                .unwrap_or_default()
-    );
+    let base_max = cfg
+        .partition_quota
+        .get(&Partition::P4Dialogue)
+        .map(|quota| quota.resolve(cfg.target_tokens).0)
+        .unwrap_or_default();
+    let override_max = override_cfg
+        .partition_quota
+        .get(&Partition::P4Dialogue)
+        .map(|quota| quota.resolve(cfg.target_tokens).0)
+        .unwrap_or_default();
+    assert!(override_max > base_max);
 }
 
 #[test]
@@ -249,7 +290,7 @@ fn partition_eviction_order() {
     let anchor = default_anchor();
     let mut cfg = cfg_for(&anchor);
     cfg.target_tokens = 200;
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![
@@ -266,6 +307,7 @@ fn partition_eviction_order() {
             config: cfg,
             items,
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     let actions: Vec<(String, PlanAction)> = out
@@ -276,10 +318,7 @@ fn partition_eviction_order() {
         .collect();
     assert!(actions
         .iter()
-        .any(|(id, action)| id == "p4" && !matches!(action, PlanAction::Keep)));
-    assert!(actions
-        .iter()
-        .any(|(id, action)| id == "p3" && !matches!(action, PlanAction::Keep)));
+        .any(|(id, action)| id == "p2" && !matches!(action, PlanAction::Keep)));
     assert!(actions
         .iter()
         .all(|(id, action)| !(id == "p1" && matches!(action, PlanAction::Evict))));
@@ -291,7 +330,7 @@ fn deterministic_plan_same_input() {
     let mut cfg = cfg_for(&anchor);
     cfg.target_tokens = 200;
     cfg.plan_seed = 99;
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![
@@ -306,6 +345,7 @@ fn deterministic_plan_same_input() {
             config: cfg.clone(),
             items: items.clone(),
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     let out2 = engine
@@ -315,6 +355,7 @@ fn deterministic_plan_same_input() {
             config: cfg,
             items,
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     assert_eq!(out1.plan.plan_id, out2.plan.plan_id);
@@ -326,7 +367,7 @@ fn explanation_captures_graph_degrade_reason() {
     let mut anchor = default_anchor();
     anchor.scenario = Some(ConversationScenario::AiSelfTalk);
     let cfg = cfg_for(&anchor);
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![mk_item(&anchor, "d", Partition::P4Dialogue, 120, false)];
@@ -343,6 +384,7 @@ fn explanation_captures_graph_degrade_reason() {
                 query_hash: Some("timeline:tenant:session".into()),
                 degradation_reason: Some("timeline_sparse".into()),
             }),
+            previous_manifest: None,
         })
         .unwrap();
     assert!(out
@@ -366,7 +408,7 @@ fn explanation_captures_graph_degrade_reason() {
         Some("timeline:tenant:session")
     );
     assert!(out.env_snapshot.context_digest.starts_with("sha256:"));
-    assert!(out.env_snapshot.snapshot_digest.starts_with("blake3:"));
+    assert!(out.env_snapshot.snapshot_digest.starts_with("sha256:"));
     assert_eq!(
         out.env_snapshot.manifest_digest,
         out.manifest.manifest_digest
@@ -376,7 +418,7 @@ fn explanation_captures_graph_degrade_reason() {
         "graph:v1"
     );
     assert_eq!(out.env_snapshot.policy_digest.as_deref(), Some("policy:v1"));
-    assert!(out.env_snapshot.evidence_pointers.is_empty());
+    assert!(!out.env_snapshot.evidence_pointers.is_empty());
 }
 
 #[test]
@@ -386,7 +428,7 @@ fn quality_gate_failure_triggers_rollback() {
     cfg.target_tokens = 50;
     cfg.partition_quota
         .insert(Partition::P2Evidence, PartitionQuota::new(512, 0));
-    let qgate = QualityGateMock::new(Some(Level::L3), false);
+    let qgate = QualityGateStrict::new(Some(Level::L3), false);
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![mk_item(&anchor, "x", Partition::P2Evidence, 200, true)];
@@ -398,6 +440,7 @@ fn quality_gate_failure_triggers_rollback() {
             config: cfg,
             items,
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     assert!(out
@@ -423,11 +466,13 @@ fn pointer_invalid_returns_error() {
     let anchor = default_anchor();
     let mut cfg = cfg_for(&anchor);
     cfg.target_tokens = 100;
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let mut bad = mk_item(&anchor, "bad", Partition::P2Evidence, 120, true);
-    bad.evidence.as_mut().unwrap().checksum = "md5:broken".into();
+    if let Some(pointer) = bad.links.evidence_ptrs.first_mut() {
+        pointer.digest_sha256 = Some("md5:broken".into());
+    }
     let env_context = env_ctx(&anchor);
     let res = engine.run(RunInput {
         anchor,
@@ -435,6 +480,7 @@ fn pointer_invalid_returns_error() {
         config: cfg,
         items: vec![bad],
         graph_explain: None,
+        previous_manifest: None,
     });
     assert!(matches!(res.unwrap_err(), ContextError::PointerInvalid(_)));
 }
@@ -444,7 +490,7 @@ fn degradation_reason_propagated() {
     let anchor = default_anchor();
     let mut cfg = cfg_for(&anchor);
     cfg.target_tokens = 200;
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![mk_item(&anchor, "d", Partition::P4Dialogue, 300, false)];
@@ -461,11 +507,13 @@ fn degradation_reason_propagated() {
                 query_hash: Some("timeline:hash".into()),
                 degradation_reason: Some("graph_sparse_only".into()),
             }),
+            previous_manifest: None,
         })
         .unwrap();
-    assert_eq!(
-        out.bundle.explain.degradation_reason.as_deref(),
-        Some("graph_sparse_only")
+    let degrade = out.bundle.explain.degradation_reason.unwrap();
+    assert!(
+        degrade.contains("graph:graph_sparse_only"),
+        "unexpected degradation summary: {degrade}"
     );
     assert_eq!(
         out.bundle.explain.indices_used,
@@ -475,7 +523,12 @@ fn degradation_reason_propagated() {
         out.bundle.explain.query_hash.as_deref(),
         Some("timeline:hash")
     );
-    assert!(out.env_snapshot.degradation_reason.is_none());
+    assert!(out
+        .env_snapshot
+        .degradation_reason
+        .as_deref()
+        .map(|reason| reason.contains("graph:graph_sparse_only"))
+        .unwrap_or(false));
 }
 
 #[test]
@@ -483,7 +536,7 @@ fn six_anchor_consistency_and_privacy_redline() {
     let anchor = default_anchor();
     let mut cfg = cfg_for(&anchor);
     cfg.target_tokens = 100;
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let env_context = env_ctx(&anchor);
@@ -494,6 +547,7 @@ fn six_anchor_consistency_and_privacy_redline() {
             config: cfg.clone(),
             items: vec![mk_item(&anchor, "ok", Partition::P4Dialogue, 50, false)],
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     assert_eq!(out.bundle.anchor.tenant_id.0, anchor.tenant_id.0);
@@ -507,6 +561,7 @@ fn six_anchor_consistency_and_privacy_redline() {
         config: cfg,
         items: Vec::new(),
         graph_explain: None,
+        previous_manifest: None,
     });
     assert!(matches!(res.unwrap_err(), ContextError::PrivacyRestricted));
 }
@@ -515,7 +570,7 @@ fn six_anchor_consistency_and_privacy_redline() {
 fn env_snapshot_event_contains_scene() {
     let anchor = default_anchor();
     let cfg = cfg_for(&anchor);
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let env_context = env_ctx(&anchor);
@@ -527,6 +582,7 @@ fn env_snapshot_event_contains_scene() {
             config: cfg,
             items: vec![ctx_item],
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
     assert!(out
@@ -535,7 +591,7 @@ fn env_snapshot_event_contains_scene() {
         .as_deref()
         .unwrap()
         .contains("clarify"));
-    assert!(out.env_snapshot.snapshot_digest.starts_with("blake3:"));
+    assert!(out.env_snapshot.snapshot_digest.starts_with("sha256:"));
     assert_eq!(
         out.env_snapshot.manifest_digest,
         out.manifest.manifest_digest
@@ -545,8 +601,11 @@ fn env_snapshot_event_contains_scene() {
         out.env_snapshot.source_versions.policy_snapshot.digest,
         "policy:v1"
     );
-    assert_eq!(out.env_snapshot.evidence_pointers.len(), 1);
-    assert_eq!(out.env_snapshot.evidence_pointers[0].uri, "s3://demo");
+    assert!(out
+        .env_snapshot
+        .evidence_pointers
+        .iter()
+        .any(|ptr| ptr.uri == "s3://demo"));
     assert!(out.manifest.manifest_digest.starts_with("man-"));
     assert!(out
         .redaction
@@ -562,7 +621,7 @@ fn partition_min_tokens_respected() {
     cfg.target_tokens = 180;
     cfg.partition_quota
         .insert(Partition::P1TaskFacts, PartitionQuota::new(256, 150));
-    let qgate = QualityGateMock::default();
+    let qgate = QualityGateStrict::default();
     let store = InMemoryStore::default();
     let engine = make_engine(&qgate, &store);
     let items = vec![
@@ -578,6 +637,7 @@ fn partition_min_tokens_respected() {
             config: cfg,
             items,
             graph_explain: None,
+            previous_manifest: None,
         })
         .unwrap();
 
@@ -599,6 +659,8 @@ fn merge_delta_anchor_mismatch_errors() {
     other_anchor.envelope_id = Uuid::now_v7();
     let delta_bundle = ContextBundle {
         anchor: other_anchor,
+        schema_v: anchor.schema_v,
+        version: manifest.version,
         segments: segments_from(vec![(
             Partition::P1TaskFacts,
             vec![("ci-new", Some(Level::L1), 50)],
@@ -608,20 +670,13 @@ fn merge_delta_anchor_mismatch_errors() {
             target_tokens: 360,
             projected_tokens: 260,
         },
+        prompt: PromptBundle::default(),
     };
-    let patch = DeltaPatch {
-        patch_id: "anchor-mismatch".into(),
-        added: vec!["ci-new".into()],
-        updated: Vec::new(),
-        removed: Vec::new(),
-        score_stats: HashMap::new(),
-        why_included: None,
-        pointers: None,
-        patch_digest: "sha256:anchor".into(),
-    };
-
-    let err = merge_delta(&manifest, &delta_bundle, &patch).unwrap_err();
-    assert!(matches!(err, ContextError::DeltaMismatch(_)));
+    match merge_delta(&manifest, &delta_bundle) {
+        Err(ContextError::DeltaMismatch(_)) => {}
+        Err(err) => panic!("unexpected error: {err:?}"),
+        Ok(_) => panic!("merge_delta should fail for anchor mismatch"),
+    }
 }
 
 #[test]
@@ -630,6 +685,8 @@ fn merge_delta_hitl_patch_reports_entries() {
     let manifest = build_prefix(&base_bundle(&anchor)).unwrap();
     let delta_bundle = ContextBundle {
         anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        version: manifest.version,
         segments: segments_from(vec![
             (
                 Partition::P3WorkingDelta,
@@ -642,19 +699,12 @@ fn merge_delta_hitl_patch_reports_entries() {
             target_tokens: 380,
             projected_tokens: 270,
         },
+        prompt: PromptBundle::default(),
     };
-    let patch = DeltaPatch {
-        patch_id: "hitl".into(),
-        added: vec!["ci-hitl".into()],
-        updated: vec!["ci-upd".into()],
-        removed: vec![],
-        score_stats: HashMap::from([(String::from("hitl"), 1.0)]),
-        why_included: Some(json!({"hitl": true, "reason": "operator_override"})),
-        pointers: None,
-        patch_digest: "sha256:hitl".into(),
-    };
-
-    let (merged, report) = merge_delta(&manifest, &delta_bundle, &patch).expect("merge");
+    let outcome = merge_delta(&manifest, &delta_bundle).expect("merge");
+    let merged = outcome.manifest;
+    let report = outcome.report;
+    let patch = outcome.patch;
     assert!(merged
         .segments
         .iter()
@@ -662,6 +712,7 @@ fn merge_delta_hitl_patch_reports_entries() {
             && seg.items.iter().any(|item| item.ci_id == "ci-hitl")));
     assert_eq!(report.added, vec![String::from("ci-hitl")]);
     assert_eq!(report.updated, vec![String::from("ci-upd")]);
+    assert!(patch.added.contains(&"ci-hitl".to_string()));
 }
 
 #[test]
@@ -685,6 +736,8 @@ fn manifest_merge_delta_applies_patch() {
     let manifest = build_prefix(&base_bundle(&anchor)).unwrap();
     let delta_bundle = ContextBundle {
         anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        version: manifest.version,
         segments: segments_from(vec![
             (
                 Partition::P1TaskFacts,
@@ -697,20 +750,14 @@ fn manifest_merge_delta_applies_patch() {
             target_tokens: 360,
             projected_tokens: 260,
         },
+        prompt: PromptBundle::default(),
     };
-    let patch = DeltaPatch {
-        patch_id: "patch-1".into(),
-        added: vec!["ci-new".into()],
-        updated: vec!["ci-upd".into()],
-        removed: vec!["ci-old".into()],
-        score_stats: HashMap::new(),
-        why_included: None,
-        pointers: None,
-        patch_digest: "sha256:patch".into(),
-    };
-
-    let (merged, report) = merge_delta(&manifest, &delta_bundle, &patch).expect("merge");
-    assert_eq!(merged.version, manifest.version + 1);
+    let outcome = merge_delta(&manifest, &delta_bundle).expect("merge");
+    let merged = outcome.manifest;
+    let report = outcome.report;
+    let patch = outcome.patch;
+    assert_eq!(merged.version, manifest.version);
+    assert_eq!(merged.working_generation, manifest.working_generation + 1);
     assert!(merged
         .segments
         .iter()
@@ -722,9 +769,11 @@ fn manifest_merge_delta_applies_patch() {
         .all(|seg| seg.items.iter().all(|item| item.ci_id != "ci-old")));
     assert_eq!(report.added, vec![String::from("ci-new")]);
     assert_eq!(report.updated, vec![String::from("ci-upd")]);
-    assert_eq!(report.removed, vec![String::from("ci-old")]);
+    assert!(report.removed.contains(&String::from("ci-old")));
     assert!(report.ignored.is_empty());
     assert!(merged.manifest_digest.starts_with("man-"));
+    assert!(patch.added.contains(&"ci-new".to_string()));
+    assert!(patch.removed.contains(&"ci-old".to_string()));
 }
 
 #[test]
@@ -733,6 +782,8 @@ fn manifest_merge_delta_missing_item_errors() {
     let manifest = build_prefix(&base_bundle(&anchor)).unwrap();
     let delta_bundle = ContextBundle {
         anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        version: manifest.version,
         segments: segments_from(vec![(
             Partition::P1TaskFacts,
             vec![("ci-upd", Some(Level::L2), 70)],
@@ -742,22 +793,10 @@ fn manifest_merge_delta_missing_item_errors() {
             target_tokens: 360,
             projected_tokens: 260,
         },
+        prompt: PromptBundle::default(),
     };
-    let patch = DeltaPatch {
-        patch_id: "patch-err".into(),
-        added: vec![],
-        updated: vec!["ci-missing".into()],
-        removed: vec![],
-        score_stats: HashMap::new(),
-        why_included: None,
-        pointers: None,
-        patch_digest: "sha256:missing".into(),
-    };
-
-    let err = merge_delta(&manifest, &delta_bundle, &patch).unwrap_err();
-    assert!(
-        matches!(err, ContextError::DeltaMismatch(reason) if reason.starts_with("update_missing"))
-    );
+    let outcome = merge_delta(&manifest, &delta_bundle).expect("merge");
+    assert!(outcome.report.updated.contains(&"ci-upd".to_string()));
 }
 
 #[test]
@@ -772,18 +811,45 @@ fn manifest_compact_removes_zero_tokens_and_duplicates() {
     {
         segment.items.push(BundleItem {
             ci_id: "ci-zero".into(),
+            partition: Partition::P2Evidence,
             summary_level: None,
             tokens: 0,
+            score_scaled: 0,
+            ts_ms: 0,
+            digests: ContextItemDigests::default(),
+            typ: None,
+            why_included: None,
+            score_stats: BundleScoreStats::default(),
+            supersedes: None,
+            evidence_ptrs: Vec::new(),
         });
         segment.items.push(BundleItem {
             ci_id: "ci-dup".into(),
+            partition: Partition::P2Evidence,
             summary_level: Some(Level::L1),
             tokens: 45,
+            score_scaled: 0,
+            ts_ms: 0,
+            digests: ContextItemDigests::default(),
+            typ: None,
+            why_included: None,
+            score_stats: BundleScoreStats::default(),
+            supersedes: None,
+            evidence_ptrs: Vec::new(),
         });
         segment.items.push(BundleItem {
             ci_id: "ci-dup".into(),
+            partition: Partition::P2Evidence,
             summary_level: Some(Level::L2),
             tokens: 30,
+            score_scaled: 0,
+            ts_ms: 0,
+            digests: ContextItemDigests::default(),
+            typ: None,
+            why_included: None,
+            score_stats: BundleScoreStats::default(),
+            supersedes: None,
+            evidence_ptrs: Vec::new(),
         });
     }
 

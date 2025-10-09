@@ -46,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     };
 
     let request = AuthzRequest {

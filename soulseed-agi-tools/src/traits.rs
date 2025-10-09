@@ -19,7 +19,6 @@ pub trait Orchestrator: Send + Sync {
     fn execute_plan(
         &self,
         plan: &ToolPlan,
-        client: &dyn ThinWaistClient,
         obs: &dyn Observability,
     ) -> Result<OrchestratorResult, OrchestratorError>;
 }

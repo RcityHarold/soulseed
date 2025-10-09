@@ -20,7 +20,4 @@ pub use orchestrator::*;
 pub use planner::*;
 pub use router::*;
 pub use traits::*;
-pub use tw_client::Subject as TwSubject;
-pub use tw_client::{
-    PrechargeDecision, ThinWaistClient, ToolDef, TwClientMock, TwError, TwEvent, TwExecuteResult,
-};
+pub use tw_client::{ThinWaistClient, ToolDef, TwClientMock, TwError};

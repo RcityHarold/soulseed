@@ -1,9 +1,14 @@
+use blake3::Hasher;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use crate::ca::{CaService, CaServiceNoop, InjectionAction, MergeDeltaRequest, MergeDeltaResponse};
+use crate::ca::{
+    CaService, CaServiceDefault, InjectionAction, MergeDeltaRequest, MergeDeltaResponse,
+};
 use crate::errors::AceError;
 use crate::types::{AggregationOutcome, SyncPointInput, SyncPointReport};
+#[cfg(feature = "vectors-extra")]
+use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::awareness::{
     AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
 };
@@ -14,7 +19,7 @@ pub struct SyncPointAggregator {
 
 impl Default for SyncPointAggregator {
     fn default() -> Self {
-        let ca: Arc<dyn CaService> = Arc::new(CaServiceNoop::default());
+        let ca: Arc<dyn CaService> = Arc::new(CaServiceDefault::default());
         Self { ca }
     }
 }
@@ -93,6 +98,7 @@ mod tests {
             sequence_number: anchor.sequence_number.unwrap(),
             trigger_event_id: None,
             temporal_pattern_id: None,
+            causal_links: vec![],
             reasoning_trace: None,
             reasoning_confidence: None,
             reasoning_strategy: None,
@@ -107,6 +113,10 @@ mod tests {
             real_time_priority: None,
             notification_targets: None,
             live_stream_id: None,
+            growth_stage: None,
+            processing_latency_ms: None,
+            influence_score: None,
+            community_impact: None,
             evidence_pointer: None,
             content_digest_sha256: None,
             blob_ref: None,
@@ -119,6 +129,8 @@ mod tests {
             tool_result: None,
             self_reflection: None,
             metadata: json!({"degradation_reason": "clarify_concurrency"}),
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
         }
     }
 
@@ -156,6 +168,8 @@ mod tests {
             tokens_spent: 120,
             walltime_ms_allowed: 5_000,
             walltime_ms_used: 900,
+            external_cost_allowed: 2.4,
+            external_cost_spent: 0.6,
         };
 
         let injection = HitlInjection::new(
@@ -188,7 +202,7 @@ mod tests {
         );
         assert_eq!(outcome.delta_patch.unwrap().patch_digest, "digest-123");
         assert_eq!(outcome.injections.len(), 1);
-        assert_eq!(outcome.awareness_events.len(), 2);
+        assert_eq!(outcome.awareness_events.len(), 3);
         let injection_event = outcome
             .awareness_events
             .iter()
@@ -209,6 +223,24 @@ mod tests {
             outcome.report.degradation_reason.as_deref(),
             Some("clarify_concurrency")
         );
+        assert!(
+            outcome
+                .awareness_events
+                .iter()
+                .any(|event| event.event_type == AwarenessEventType::DeltaPatchGenerated)
+        );
+        assert_eq!(outcome.report.applied, 1);
+        assert_eq!(outcome.report.ignored, 0);
+        assert_eq!(outcome.report.missing, 0);
+        assert_eq!(
+            outcome.report.budget_snapshot.tokens_spent,
+            budget.tokens_spent
+        );
+        assert!(outcome.report.explain_fingerprint.is_some());
+        assert_eq!(
+            outcome.explain_fingerprint,
+            outcome.report.explain_fingerprint
+        );
     }
 }
 
@@ -224,7 +256,34 @@ impl SyncPointAggregator {
             ));
         }
 
-        let request = MergeDeltaRequest::from(&input);
+        let mut events = input.events.clone();
+        events.sort_by_key(|ev| (ev.timestamp_ms, ev.event_id.0));
+        let mut seen = std::collections::HashSet::new();
+        events.retain(|ev| seen.insert(ev.event_id.0));
+
+        let mut missing = 0u32;
+        let mut last_seq: Option<u64> = None;
+        for ev in &events {
+            let seq = ev.sequence_number;
+            if let Some(prev) = last_seq {
+                if seq > prev + 1 {
+                    missing = missing.saturating_add((seq - prev - 1) as u32);
+                }
+            }
+            last_seq = Some(seq);
+        }
+
+        let request = MergeDeltaRequest {
+            cycle_id: input.cycle_id,
+            anchor: input.anchor.clone(),
+            kind: input.kind,
+            timeframe: input.timeframe,
+            events: events.clone(),
+            pending_injections: input.pending_injections.clone(),
+            budget_snapshot: input.budget.clone(),
+            context_manifest: input.context_manifest.clone(),
+        };
+
         let response = self.ca.merge_delta(request)?;
         let MergeDeltaResponse {
             delta_patch,
@@ -235,7 +294,7 @@ impl SyncPointAggregator {
         let summary = format!(
             "syncpoint:{:?} events={} budget_spent={}",
             input.kind,
-            input.events.len(),
+            events.len(),
             input.budget.tokens_spent
         );
 
@@ -275,7 +334,7 @@ impl SyncPointAggregator {
 
         let window_ms = (input.timeframe.1 - input.timeframe.0).whole_milliseconds();
         let metrics = json!({
-            "events": input.events.len(),
+            "events": events.len(),
             "tokens_spent": input.budget.tokens_spent,
             "window_ms": window_ms,
             "pending_injections": input.pending_injections.len(),
@@ -283,6 +342,11 @@ impl SyncPointAggregator {
             "injections_deferred": deferred,
             "injections_ignored": ignored,
             "manifest_entries": manifest_entries,
+            "missing_events": missing,
+            "budget_tokens_allowed": input.budget.tokens_allowed,
+            "budget_walltime_allowed": input.budget.walltime_ms_allowed,
+            "budget_external_cost_allowed": input.budget.external_cost_allowed,
+            "budget_external_cost_spent": input.budget.external_cost_spent,
         });
 
         let mut awareness_events = awareness_events;
@@ -325,6 +389,29 @@ impl SyncPointAggregator {
             next_event_id += 1;
         }
 
+        if let Some(patch) = delta_patch.as_ref() {
+            awareness_events.push(AwarenessEvent {
+                anchor: input.anchor.clone(),
+                event_id: soulseed_agi_core_models::EventId(next_event_id),
+                event_type: AwarenessEventType::DeltaPatchGenerated,
+                occurred_at_ms,
+                awareness_cycle_id: input.cycle_id,
+                parent_cycle_id: None,
+                collab_scope_id: None,
+                barrier_id: None,
+                env_mode: None,
+                inference_cycle_sequence: 1,
+                degradation_reason: map_degradation(degradation_reason.as_deref()),
+                payload: json!({
+                    "patch_id": patch.patch_id,
+                    "digest": patch.patch_digest,
+                    "added": patch.added,
+                    "removed": patch.removed,
+                }),
+            });
+            next_event_id += 1;
+        }
+
         let mut summary_payload = json!({
             "summary": summary,
             "metrics": metrics.clone(),
@@ -350,6 +437,16 @@ impl SyncPointAggregator {
 
         let delta_digest = delta_patch.as_ref().map(|patch| patch.patch_digest.clone());
 
+        let mut hasher = Hasher::new();
+        hasher.update(&input.cycle_id.0.to_le_bytes());
+        hasher.update(format!("{:?}", input.kind).as_bytes());
+        hasher.update(&input.anchor.tenant_id.into_inner().to_le_bytes());
+        hasher.update(metrics.to_string().as_bytes());
+        if let Some(digest) = delta_digest.as_ref() {
+            hasher.update(digest.as_bytes());
+        }
+        let explain_fingerprint = Some(format!("blake3:{}", hasher.finalize().to_hex()));
+
         let report = SyncPointReport {
             cycle_id: input.cycle_id,
             kind: input.kind,
@@ -357,7 +454,12 @@ impl SyncPointAggregator {
             degradation_reason,
             metrics: metrics.clone(),
             injections: injections.clone(),
+            applied,
+            missing,
+            ignored,
+            budget_snapshot: input.budget.clone(),
             delta_patch_digest: delta_digest.clone(),
+            explain_fingerprint: explain_fingerprint.clone(),
         };
 
         Ok(AggregationOutcome {
@@ -365,6 +467,7 @@ impl SyncPointAggregator {
             awareness_events,
             delta_patch,
             injections,
+            explain_fingerprint,
         })
     }
 }

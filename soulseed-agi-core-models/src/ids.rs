@@ -15,6 +15,11 @@ macro_rules! newtype_u64 {
             }
 
             #[inline]
+            pub const fn new_with_raw_id(raw: u64) -> Self {
+                Self(raw)
+            }
+
+            #[inline]
             pub const fn into_inner(self) -> u64 {
                 self.0
             }
@@ -37,3 +42,4 @@ newtype_u64!(MessageId);
 newtype_u64!(SessionId);
 newtype_u64!(EventId);
 newtype_u64!(CycleId);
+newtype_u64!(InferenceCycleId);

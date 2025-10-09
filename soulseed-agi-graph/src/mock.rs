@@ -7,6 +7,8 @@ use crate::{
     },
     errors::{Degradation, GraphError},
     plan::PreparedPlan,
+    scenario::scenario_rule,
+    types::{ConceptNode, EmotionNode, SemanticEdge, SemanticEdgeKind, TopicNode},
     AwarenessEventType, DialogueEvent, EventId, LiveEventPointer, LiveSubscribe, RecallQuery,
     SyncPointKind, TimelineQuery, TimelineResponse,
 };
@@ -61,6 +63,12 @@ impl MockExecutor {
                             return Err(GraphError::InvalidQuery("scenario_mismatch"));
                         }
                     }
+                    if let Some(types) = event_types {
+                        let rule = scenario_rule(expected);
+                        if !rule.primary_event_types.iter().all(|ty| types.contains(ty)) {
+                            return Err(GraphError::InvalidQuery("scenario_event_type_mismatch"));
+                        }
+                    }
                 }
                 if let Some(expected) = event_types {
                     if let Some(actual) = query.event_types.as_ref() {
@@ -110,6 +118,12 @@ impl MockExecutor {
                         return Err(GraphError::InvalidQuery("scenario_mismatch"));
                     }
                 }
+                if let Some(types) = event_types {
+                    let rule = scenario_rule(expected);
+                    if !rule.primary_event_types.iter().all(|ty| types.contains(ty)) {
+                        return Err(GraphError::InvalidQuery("scenario_event_type_mismatch"));
+                    }
+                }
             }
             if let Some(expected) = event_types {
                 if let Some(actual) = query.event_types.as_ref() {
@@ -126,6 +140,29 @@ impl MockExecutor {
                 from: query.root_event,
                 to: EventId(query.root_event.0 + 1),
                 edge_type: "TRIGGERED".into(),
+                weight: Some(0.7),
+            }],
+            concept_nodes: vec![ConceptNode {
+                concept_id: format!("concept:{}", query.root_event.0),
+                label: "goal_alignment".into(),
+                score: Some(0.82),
+                evidence_pointer: None,
+            }],
+            topic_nodes: vec![TopicNode {
+                topic_id: "topic:collaboration".into(),
+                name: "collaboration".into(),
+                salience: Some(0.64),
+                keywords: Some(vec!["plan".into(), "tool".into()]),
+            }],
+            emotion_nodes: vec![EmotionNode {
+                emotion: "curiosity".into(),
+                intensity: Some(0.4),
+                evidence_pointer: None,
+            }],
+            semantic_edges: vec![SemanticEdge {
+                from: query.root_event.0.to_string(),
+                to: format!("concept:{}", query.root_event.0),
+                kind: SemanticEdgeKind::EventToConcept,
                 weight: Some(0.7),
             }],
             indices_used: plan.indices_used,
@@ -146,17 +183,17 @@ impl MockExecutor {
             | crate::plan::Plan::SparseBm25 { filter, .. } => {
                 if let Some(expected_scenes) = &filter.scenes {
                     if let Some(actual_scenes) = &query.filters.scenes {
-                        if !actual_scenes.iter().all(|scene| expected_scenes.contains(scene)) {
+                        if !actual_scenes
+                            .iter()
+                            .all(|scene| expected_scenes.contains(scene))
+                        {
                             return Err(GraphError::InvalidQuery("scene_mismatch"));
                         }
                     }
                 }
                 if let Some(expected_types) = &filter.event_types {
                     if let Some(actual_types) = &query.filters.event_types {
-                        if !actual_types
-                            .iter()
-                            .all(|ty| expected_types.contains(ty))
-                        {
+                        if !actual_types.iter().all(|ty| expected_types.contains(ty)) {
                             return Err(GraphError::InvalidQuery("event_type_mismatch"));
                         }
                     }
@@ -325,7 +362,15 @@ impl MockExecutor {
         sub: &LiveSubscribe,
     ) -> Result<Vec<LiveEventPointer>, GraphError> {
         self.ensure_tenant(sub.tenant_id.0)?;
-        if let crate::plan::Plan::Live { filters, rate } = &plan.plan {
+        if let crate::plan::Plan::Live {
+            filters,
+            rate,
+            heartbeat_ms,
+            idle_timeout_ms,
+            max_buffer,
+            backpressure_mode,
+        } = &plan.plan
+        {
             if (*rate as usize) > self.caps.live_max_per_tenant {
                 return Err(GraphError::InvalidQuery("rate_exceeds_cap"));
             }
@@ -334,6 +379,31 @@ impl MockExecutor {
                     if actual_scene != expected_scene {
                         return Err(GraphError::InvalidQuery("scene_mismatch"));
                     }
+                }
+            }
+            if let Some(req_rate) = sub.max_rate {
+                if *rate > req_rate && self.caps.live_max_per_tenant >= req_rate as usize {
+                    return Err(GraphError::InvalidQuery("rate_clamped_without_consent"));
+                }
+            }
+            if let Some(req_heartbeat) = sub.heartbeat_ms {
+                if *heartbeat_ms < req_heartbeat {
+                    return Err(GraphError::InvalidQuery("heartbeat_mismatch"));
+                }
+            }
+            if let Some(req_idle) = sub.idle_timeout_ms {
+                if *idle_timeout_ms < req_idle {
+                    return Err(GraphError::InvalidQuery("idle_timeout_mismatch"));
+                }
+            }
+            if let Some(req_buffer) = sub.max_buffer {
+                if *max_buffer > req_buffer {
+                    return Err(GraphError::InvalidQuery("buffer_clamped_without_consent"));
+                }
+            }
+            if let Some(req_mode) = sub.backpressure_mode.as_ref() {
+                if req_mode != backpressure_mode {
+                    return Err(GraphError::InvalidQuery("backpressure_mismatch"));
                 }
             }
         }

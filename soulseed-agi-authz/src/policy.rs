@@ -20,6 +20,14 @@ pub struct Policy {
     pub policy_digest: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct PredicateEvaluation {
+    pub results: Vec<(String, bool)>,
+    pub all_true: bool,
+    pub missing_consent: Option<String>,
+    pub quota_hint: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Predicate {
     TenantEq,
@@ -35,6 +43,15 @@ pub enum Predicate {
         start_ms: i64,
         end_ms: i64,
     },
+    OwnsResource,
+    QuotaAvailable {
+        key: String,
+        minimum: i64,
+    },
+    RiskBand {
+        min: u8,
+        max: u8,
+    },
     Custom {
         name: String,
         value: serde_json::Value,
@@ -49,6 +66,8 @@ pub enum Obligation {
     TtlSeconds(u32),
     LogExplain,
     AttachPolicyDigest,
+    AuditTrail,
+    ConsentPrompt(String),
     Custom(String),
 }
 
@@ -61,6 +80,8 @@ impl Obligation {
             Obligation::TtlSeconds(ttl) => format!("ttl={}", ttl),
             Obligation::LogExplain => "log_explain".into(),
             Obligation::AttachPolicyDigest => "attach_policy_digest".into(),
+            Obligation::AuditTrail => "audit_trail".into(),
+            Obligation::ConsentPrompt(kind) => format!("consent_prompt:{kind}"),
             Obligation::Custom(name) => format!("custom:{}", name),
         }
     }
@@ -86,9 +107,22 @@ impl Policy {
         anchor: &Anchor,
         subject: &Subject,
         context: &serde_json::Value,
-    ) -> (Vec<(String, bool)>, bool) {
+    ) -> PredicateEvaluation {
         let mut results = Vec::new();
         let mut all_true = true;
+        let mut missing_consent = None;
+        let mut quota_hint = None;
+        let subject_owner = match subject {
+            Subject::Human(h) => Some(h.0),
+            _ => None,
+        };
+        let context_owner = context.get("owner_id").and_then(|v| v.as_u64());
+        let context_quota = context.get("quota");
+        let risk_level = context
+            .get("risk_level")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u8)
+            .unwrap_or(0);
         for pred in &self.conditions {
             let (label, passed) = match pred {
                 Predicate::TenantEq => ("TenantEq".into(), true),
@@ -115,6 +149,13 @@ impl Policy {
                         consents.iter().any(|c| c == kind),
                     )
                 }
+                Predicate::OwnsResource => {
+                    let owns = subject_owner
+                        .zip(context_owner)
+                        .map(|(sub, owner)| sub == owner)
+                        .unwrap_or(false);
+                    ("OwnsResource".into(), owns)
+                }
                 Predicate::RiskAtMost { level } => {
                     let risk = context
                         .get("risk_level")
@@ -122,6 +163,10 @@ impl Policy {
                         .unwrap_or(0);
                     (format!("RiskAtMost({})", level), risk as u8 <= *level)
                 }
+                Predicate::RiskBand { min, max } => (
+                    format!("RiskBand({min}-{max})"),
+                    risk_level >= *min && risk_level <= *max,
+                ),
                 Predicate::TimeWindow { start_ms, end_ms } => {
                     let now = context
                         .get("time_ms")
@@ -129,11 +174,32 @@ impl Policy {
                         .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp() * 1000);
                     ("TimeWindow".into(), now >= *start_ms && now <= *end_ms)
                 }
+                Predicate::QuotaAvailable { key, minimum } => {
+                    let available = context_quota
+                        .and_then(|quota| quota.get(key))
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    if available < *minimum {
+                        quota_hint = Some(format!("quota:{}<{}", key, minimum));
+                    }
+                    (
+                        format!("QuotaAvailable({key}>={minimum})"),
+                        available >= *minimum,
+                    )
+                }
                 Predicate::Custom { name, value: _ } => (format!("Custom({})", name), true),
             };
             results.push((label, passed));
             if !passed {
                 all_true = false;
+                if matches!(
+                    pred,
+                    Predicate::HasConsent { .. } | Predicate::QuotaAvailable { .. }
+                ) {
+                    if let Predicate::HasConsent { kind } = pred {
+                        missing_consent = Some(kind.clone());
+                    }
+                }
             }
         }
         // Privacy red line: Restricted 时必须含 provenance
@@ -144,6 +210,11 @@ impl Policy {
         match subject {
             Subject::Human(_) | Subject::AI(_) | Subject::System | Subject::Group(_) => {}
         }
-        (results, all_true)
+        PredicateEvaluation {
+            results,
+            all_true,
+            missing_consent,
+            quota_hint,
+        }
     }
 }

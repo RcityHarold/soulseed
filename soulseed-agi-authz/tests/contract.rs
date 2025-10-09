@@ -41,6 +41,8 @@ fn default_anchor() -> Anchor {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -177,6 +179,227 @@ fn view_trace_full_requires_ticket() {
         .obligations
         .iter()
         .any(|o| o.contains("TRACE_FORBIDDEN")));
+}
+
+#[test]
+fn consent_missing_triggers_ask_consent() {
+    let env = InMemoryEnv::default();
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.dialogue.write".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 80,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_events_pattern(ConversationScenario::HumanToAi),
+            actions: vec![Action::AppendDialogueEvent],
+            effect: Effect::Allow,
+            conditions: vec![
+                Predicate::TenantEq,
+                Predicate::HasConsent {
+                    kind: "hitl".into(),
+                },
+            ],
+            obligations: vec![Obligation::ConsentPrompt("hitl".into())],
+            policy_digest: "sha256:allow-dialogue-write".into(),
+        },
+    );
+
+    let req = AuthzRequest {
+        anchor: default_anchor(),
+        subject: Subject::Human(HumanId(9)),
+        roles: vec![Role::Member],
+        resource: ResourceUrn::dialogue_events(SessionId(7), Some(ConversationScenario::HumanToAi)),
+        action: Action::AppendDialogueEvent,
+        context: json!({"scene": scenario_slug(ConversationScenario::HumanToAi)}),
+        want_trace_full: false,
+        access_ticket: None,
+        quota_cost: None,
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::AskConsent);
+    assert!(resp
+        .decision
+        .obligations
+        .iter()
+        .any(|o| o.contains("consent_required")));
+}
+
+#[test]
+fn quota_requires_consent_path() {
+    let env = InMemoryEnv::default();
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.dialogue.emit".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 50,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_events_pattern(ConversationScenario::HumanToAi),
+            actions: vec![Action::EmitToolEvent],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![],
+            policy_digest: "sha256:allow-emit".into(),
+        },
+    );
+
+    let req = AuthzRequest {
+        anchor: default_anchor(),
+        subject: Subject::Human(HumanId(9)),
+        roles: vec![Role::Member],
+        resource: ResourceUrn::dialogue_events(SessionId(7), Some(ConversationScenario::HumanToAi)),
+        action: Action::EmitToolEvent,
+        context: json!({
+            "scene": scenario_slug(ConversationScenario::HumanToAi),
+            "requires_consent": true
+        }),
+        want_trace_full: false,
+        access_ticket: None,
+        quota_cost: Some(QuotaCost {
+            items: vec![("tokens".into(), 5)],
+        }),
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::AskConsent);
+    assert!(resp
+        .decision
+        .obligations
+        .iter()
+        .any(|o| o.contains("quota_consent")));
+}
+
+#[test]
+fn resource_specificity_prefers_narrow_scope() {
+    let env = InMemoryEnv::default();
+    let scenario = ConversationScenario::HumanToAi;
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.dialogue.specific".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 70,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_events(SessionId(7), Some(scenario.clone())),
+            actions: vec![Action::Write],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![],
+            policy_digest: "sha256:specific".into(),
+        },
+    );
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.dialogue.wildcard".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 70,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_events_pattern(scenario.clone()),
+            actions: vec![Action::Write],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![],
+            policy_digest: "sha256:wildcard".into(),
+        },
+    );
+
+    let req = AuthzRequest {
+        anchor: default_anchor(),
+        subject: Subject::Human(HumanId(9)),
+        roles: vec![Role::Member],
+        resource: ResourceUrn::dialogue_events(SessionId(7), Some(scenario)),
+        action: Action::Write,
+        context: json!({"scene": scenario_slug(ConversationScenario::HumanToAi)}),
+        want_trace_full: false,
+        access_ticket: None,
+        quota_cost: None,
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::Allow);
+    assert_eq!(
+        resp.decision.matched_policies.first().unwrap().0,
+        "allow.dialogue.specific"
+    );
+}
+
+#[test]
+fn ownership_predicate_controls_access() {
+    let env = InMemoryEnv::default();
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.own.session".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 65,
+            subject_roles: vec![Role::Owner],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_session(SessionId(7)),
+            actions: vec![Action::Write],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq, Predicate::OwnsResource],
+            obligations: vec![Obligation::AuditTrail],
+            policy_digest: "sha256:own".into(),
+        },
+    );
+
+    let anchor = default_anchor();
+    let subject = Subject::Human(HumanId(9));
+    let resource = ResourceUrn::dialogue_session(SessionId(7));
+    let context_allow = json!({
+        "owner_id": 9u64,
+        "scene": scenario_slug(ConversationScenario::HumanToAi)
+    });
+    let allow_req = AuthzRequest {
+        anchor: anchor.clone(),
+        subject: subject.clone(),
+        roles: vec![Role::Owner],
+        resource: resource.clone(),
+        action: Action::Write,
+        context: context_allow,
+        want_trace_full: false,
+        access_ticket: None,
+        quota_cost: None,
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(allow_req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::Allow);
+
+    let context_deny = json!({
+        "owner_id": 99u64,
+        "scene": scenario_slug(ConversationScenario::HumanToAi)
+    });
+    let deny_req = AuthzRequest {
+        anchor,
+        subject,
+        roles: vec![Role::Owner],
+        resource,
+        action: Action::Write,
+        context: context_deny,
+        want_trace_full: false,
+        access_ticket: None,
+        quota_cost: None,
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(deny_req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::Deny);
 }
 
 #[test]
@@ -546,7 +769,12 @@ fn hitl_append_requires_consent() {
             idem_key: None,
         })
         .unwrap();
-    assert_eq!(missing.decision.effect, Effect::Deny);
+    assert_eq!(missing.decision.effect, Effect::AskConsent);
+    assert!(missing
+        .decision
+        .obligations
+        .iter()
+        .any(|o| o.contains("consent_required")));
 
     let allowed = env
         .evaluator()

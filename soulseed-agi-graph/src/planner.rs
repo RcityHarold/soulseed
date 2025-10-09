@@ -10,6 +10,7 @@ use crate::{
         IDX_AWARENESS_COLLAB, IDX_AWARENESS_CYCLE, IDX_AWARENESS_ENV, IDX_AWARENESS_PARENT,
         IDX_EDGE, IDX_SESSION_ORDER, IDX_SPARSE, IDX_TIMELINE, IDX_VEC,
     },
+    scenario::scenario_rule,
     AwarenessEventType, SyncPointKind,
 };
 
@@ -29,6 +30,10 @@ impl Planner {
         if query.tenant_id.0 == 0 {
             return Err(GraphError::AuthForbidden);
         }
+        let scenario_event_types = query
+            .scenario
+            .as_ref()
+            .map(|scene| scenario_rule(scene).primary_event_types.to_vec());
         let limit = query.limit.min(self.cfg.max_limit).max(1);
         let mut indices = Vec::new();
         let plan = if let Some(session) = query.session_id {
@@ -46,7 +51,9 @@ impl Planner {
                 window: query.window.clone(),
                 order: ("timestamp_ms".to_string(), "event_id".to_string()),
                 scenario: query.scenario.clone(),
-                event_types: query.event_types.clone(),
+                event_types: scenario_event_types
+                    .clone()
+                    .or_else(|| query.event_types.clone()),
             }
         };
         let hash = format!("timeline:tenant={}:limit={}", query.tenant_id.0, limit);
@@ -67,6 +74,10 @@ impl Planner {
         if query.tenant_id.0 == 0 {
             return Err(GraphError::AuthForbidden);
         }
+        let scenario_event_types = query
+            .scenario
+            .as_ref()
+            .map(|scene| scenario_rule(scene).primary_event_types.to_vec());
         let requested = query.max_depth.unwrap_or(self.cfg.default_causal_depth);
         let depth = requested.min(self.cfg.max_causal_depth);
         let degradation = if requested > self.cfg.default_causal_depth {
@@ -88,7 +99,9 @@ impl Planner {
             depth,
             window: query.time_window.clone(),
             scenario: query.scenario.clone(),
-            event_types: query.event_types.clone(),
+            event_types: scenario_event_types
+                .clone()
+                .or_else(|| query.event_types.clone()),
         };
         let hash = format!(
             "causal:tenant={}:root={}:depth={}",
@@ -168,17 +181,46 @@ impl Planner {
         if subscribe.tenant_id.0 == 0 {
             return Err(GraphError::AuthForbidden);
         }
-        let requested = subscribe
+        let requested_rate = subscribe
             .max_rate
             .unwrap_or(self.cfg.live_default_rate)
             .max(1);
-        let rate = requested.min(self.cfg.live_max_rate);
+        let rate = requested_rate.min(self.cfg.live_max_rate);
+        let heartbeat_requested = subscribe
+            .heartbeat_ms
+            .unwrap_or(self.cfg.live_default_heartbeat_ms);
+        let heartbeat_ms = heartbeat_requested.max(self.cfg.live_min_heartbeat_ms);
+        let idle_requested = subscribe
+            .idle_timeout_ms
+            .unwrap_or(self.cfg.live_default_idle_timeout_ms);
+        let idle_timeout_ms = idle_requested.max(heartbeat_ms * 2);
+        let buffer_requested = subscribe.max_buffer.unwrap_or(self.cfg.live_max_buffer);
+        let max_buffer = buffer_requested.min(self.cfg.live_max_buffer).max(1);
+        let backpressure_mode = subscribe
+            .backpressure_mode
+            .clone()
+            .unwrap_or_else(|| self.cfg.live_default_backpressure_mode.clone());
+        let mut degradation = None;
+        if rate != requested_rate {
+            degradation = Some(Degradation {
+                reason: "rate_clamped".into(),
+            });
+        }
+        if max_buffer != buffer_requested && degradation.is_none() {
+            degradation = Some(Degradation {
+                reason: "buffer_clamped".into(),
+            });
+        }
         let plan = Plan::Live {
             filters: subscribe.filters.clone(),
             rate,
+            heartbeat_ms,
+            idle_timeout_ms,
+            max_buffer,
+            backpressure_mode: backpressure_mode.clone(),
         };
         let hash = format!(
-            "live:tenant={}:scene={:?}:participants={}",
+            "live:tenant={}:scene={:?}:participants={}:rate={}:heartbeat={}:buffer={}:bp={}",
             subscribe.tenant_id.0,
             subscribe.filters.scene,
             subscribe
@@ -186,7 +228,11 @@ impl Planner {
                 .participants
                 .as_ref()
                 .map(|p| p.len())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            rate,
+            heartbeat_ms,
+            max_buffer,
+            backpressure_mode
         );
         Ok((
             PreparedPlan {
@@ -194,7 +240,7 @@ impl Planner {
                 indices_used: Vec::new(),
             },
             hash,
-            None,
+            degradation,
         ))
     }
 
@@ -299,11 +345,7 @@ impl Planner {
         let hash = format!(
             "explain:{}:forks={}",
             base_hash,
-            query
-                .forks
-                .as_ref()
-                .map(|forks| forks.len())
-                .unwrap_or(0)
+            query.forks.as_ref().map(|forks| forks.len()).unwrap_or(0)
         );
 
         Ok((prepared, hash, degradation))

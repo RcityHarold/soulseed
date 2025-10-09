@@ -8,6 +8,8 @@ use crate::metrics::Observability;
 use crate::traits::{Explainer, Orchestrator, Planner, Router, ToolEngineRunner};
 use crate::tw_client::ThinWaistClient;
 use serde_json::{json, Map, Value};
+#[cfg(feature = "vectors-extra")]
+use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::{
     CorrelationId, DialogueEvent, DialogueEventType, EnvelopeHead, RealTimePriority,
     SelfReflectionRecord, Snapshot, ToolInvocation, ToolResult, TraceId,
@@ -43,7 +45,7 @@ impl<'a> ToolEngine<'a> {
     ) -> Result<RouterState, EngineError> {
         let (defs, policy_digest) = client
             .tools_list(&input.anchor, &input.scene, hints)
-            .map_err(|e| EngineError::Tool(e.into()))?;
+            .map_err(|e| EngineError::Tool(ToolError::ThinWaist(e.to_string())))?;
 
         let stats_override = input
             .context_tags
@@ -169,6 +171,7 @@ impl<'a> ToolEngineRunner for ToolEngine<'a> {
             anchor: input.anchor.clone(),
             ranked: router_output.ranked,
             policy_digest: router_output.policy_digest,
+            excluded: router_output.excluded,
             scene: input.scene.clone(),
             capability_hints,
             request_context: input.request_context.clone(),
@@ -191,7 +194,7 @@ impl<'a> ToolEngineRunner for ToolEngine<'a> {
 
         let mut execution = self
             .orchestrator
-            .execute_plan(&plan, client, obs)
+            .execute_plan(&plan, obs)
             .map_err(EngineError::Orchestrator)?;
         self.explainer.decorate(&plan, &mut execution);
 
@@ -275,17 +278,10 @@ fn build_dialogue_events(
 
         let summary_index = summary_pool.iter().position(|s| s.tool_id == spec.tool_id);
         let summary = summary_index.map(|idx| summary_pool.remove(idx));
-        let pointer_uri = summary
-            .as_ref()
-            .and_then(|s| s.evidence_pointer.as_ref())
-            .map(|ptr| ptr.uri.clone());
-        let result_digest = summary.as_ref().map(|s| s.result_digest.clone());
-
-        let success = stage_outcome == "ok" && summary.is_some();
-        let output_value = summary
-            .as_ref()
-            .map(|s| s.summary.clone())
-            .unwrap_or_else(|| serde_json::Value::Null);
+        let stage_latency_ms = stage
+            .end_ms
+            .saturating_sub(stage.start_ms)
+            .min(u64::from(u32::MAX)) as u32;
 
         let call_event = DialogueEvent {
             tenant_id: plan.anchor.tenant_id,
@@ -304,6 +300,7 @@ fn build_dialogue_events(
             sequence_number: next_sequence,
             trigger_event_id: None,
             temporal_pattern_id: None,
+            causal_links: Vec::new(),
             reasoning_trace: None,
             reasoning_confidence: None,
             reasoning_strategy: None,
@@ -318,6 +315,10 @@ fn build_dialogue_events(
             real_time_priority: None,
             notification_targets: None,
             live_stream_id: None,
+            growth_stage: Some("tool:call".into()),
+            processing_latency_ms: Some(stage_latency_ms),
+            influence_score: None,
+            community_impact: None,
             evidence_pointer: None,
             content_digest_sha256: None,
             blob_ref: None,
@@ -350,10 +351,21 @@ fn build_dialogue_events(
                 }
                 Value::Object(meta)
             },
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
         };
         events.push(call_event);
         next_sequence += 1;
         next_timestamp += 1;
+
+        let Some(summary) = summary else {
+            continue;
+        };
+        let pointer = summary.evidence_pointer.clone();
+        let pointer_uri = pointer.uri.clone();
+        let result_digest = summary.result_digest.clone();
+        let output_value = summary.summary.clone();
+        let success = stage_outcome == "ok";
 
         let tool_result = ToolResult {
             tool_id: spec.tool_id.clone(),
@@ -393,6 +405,7 @@ fn build_dialogue_events(
             sequence_number: next_sequence,
             trigger_event_id: None,
             temporal_pattern_id: None,
+            causal_links: Vec::new(),
             reasoning_trace: None,
             reasoning_confidence: None,
             reasoning_strategy: None,
@@ -407,8 +420,12 @@ fn build_dialogue_events(
             real_time_priority: None,
             notification_targets: None,
             live_stream_id: None,
-            evidence_pointer: pointer_uri,
-            content_digest_sha256: result_digest,
+            growth_stage: Some("tool:result".into()),
+            processing_latency_ms: Some(stage_latency_ms),
+            influence_score: None,
+            community_impact: None,
+            evidence_pointer: Some(pointer.clone()),
+            content_digest_sha256: Some(result_digest.clone()),
             blob_ref: None,
             supersedes: None,
             superseded_by: None,
@@ -437,8 +454,11 @@ fn build_dialogue_events(
                 if let Some(hash) = execution.explain_run.query_hash.as_ref() {
                     meta.insert("query_hash".into(), json!(hash));
                 }
+                meta.insert("evidence_uri".into(), json!(pointer_uri.clone()));
                 Value::Object(meta)
             },
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
         };
         events.push(result_event);
         next_sequence += 1;
@@ -469,6 +489,7 @@ fn build_dialogue_events(
                 sequence_number: next_sequence,
                 trigger_event_id: None,
                 temporal_pattern_id: None,
+                causal_links: Vec::new(),
                 reasoning_trace: None,
                 reasoning_confidence: None,
                 reasoning_strategy: None,
@@ -483,6 +504,10 @@ fn build_dialogue_events(
                 real_time_priority: Some(RealTimePriority::Normal),
                 notification_targets: None,
                 live_stream_id: None,
+                growth_stage: Some("self_reflection".into()),
+                processing_latency_ms: None,
+                influence_score: None,
+                community_impact: None,
                 evidence_pointer: None,
                 content_digest_sha256: None,
                 blob_ref: None,
@@ -507,11 +532,14 @@ fn build_dialogue_events(
                     }
                     Value::Object(meta)
                 },
+                #[cfg(feature = "vectors-extra")]
+                vectors: ExtraVectors::default(),
             };
             events.push(event);
         }
     } else if matches!(plan.lane, ToolLane::Collaboration) {
         if let Some(summary) = &execution.summary {
+            let collab_pointer = summary.evidence_pointer.clone();
             let collab_event = DialogueEvent {
                 tenant_id: plan.anchor.tenant_id,
                 event_id: new_event_id(&plan.plan_id, "collaboration", &summary.tool_id),
@@ -529,6 +557,7 @@ fn build_dialogue_events(
                 sequence_number: next_sequence,
                 trigger_event_id: None,
                 temporal_pattern_id: None,
+                causal_links: Vec::new(),
                 reasoning_trace: None,
                 reasoning_confidence: None,
                 reasoning_strategy: None,
@@ -543,7 +572,11 @@ fn build_dialogue_events(
                 real_time_priority: Some(RealTimePriority::Normal),
                 notification_targets: None,
                 live_stream_id: None,
-                evidence_pointer: None,
+                growth_stage: Some("tool:collaboration".into()),
+                processing_latency_ms: None,
+                influence_score: None,
+                community_impact: None,
+                evidence_pointer: Some(collab_pointer.clone()),
                 content_digest_sha256: None,
                 blob_ref: None,
                 supersedes: None,
@@ -572,8 +605,11 @@ fn build_dialogue_events(
                     if let Some(hash) = execution.explain_run.query_hash.as_ref() {
                         meta.insert("query_hash".into(), json!(hash));
                     }
+                    meta.insert("evidence_uri".into(), json!(collab_pointer.uri.clone()));
                     Value::Object(meta)
                 },
+                #[cfg(feature = "vectors-extra")]
+                vectors: ExtraVectors::default(),
             };
             events.push(collab_event);
         }

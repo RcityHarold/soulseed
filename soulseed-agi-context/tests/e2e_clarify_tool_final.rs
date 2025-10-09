@@ -2,9 +2,11 @@ use serde_json::json;
 use soulseed_agi_context::config::ContextConfig;
 use soulseed_agi_context::thinwaist::{ContextRuntimeInput, LocalContextRuntime};
 use soulseed_agi_context::types::{
-    AccessClass, Anchor, ContextItem, ConversationScenario, EventId, EvidencePointer, FeatureVec,
-    GraphExplain, MessageId, Partition, PlanAction, Provenance, SessionId, TenantId,
+    AccessClass, Anchor, ContextItem, ContextItemDigests, ContextItemLinks, ConversationScenario,
+    EventId, EvidencePointer, FeatureVec, GraphExplain, MessageId, Partition, PlanAction,
+    Provenance, SessionId, TenantId,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 fn anchor() -> Anchor {
@@ -24,6 +26,8 @@ fn anchor() -> Anchor {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -31,9 +35,11 @@ fn mk_item(anchor: &Anchor, id: &str, partition: Partition, tokens: u32) -> Cont
     ContextItem {
         anchor: anchor.clone(),
         id: id.into(),
+        partition,
         partition_hint: Some(partition),
         source_event_id: EventId(100 + u64::from(tokens)),
         source_message_id: Some(MessageId(u64::from(tokens))),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({
             "text": format!("{} content", id),
             "kind": match partition {
@@ -57,13 +63,29 @@ fn mk_item(anchor: &Anchor, id: &str, partition: Partition, tokens: u32) -> Cont
             risk: 0.1,
         },
         policy_tags: json!({"stage": id}),
-        evidence: Some(EvidencePointer {
-            uri: format!("s3://fixtures/{id}.json"),
-            blob_ref: None,
-            span: Some((0, 10)),
-            checksum: "sha256:ok".into(),
-            access_policy: "restricted".into(),
-        }),
+        typ: Some(
+            match partition {
+                Partition::P2Evidence => "evidence",
+                Partition::P3WorkingDelta => "working",
+                _ => "dialogue",
+            }
+            .into(),
+        ),
+        digests: ContextItemDigests {
+            content: Some(format!("sha256:{id}")),
+            ..Default::default()
+        },
+        links: ContextItemLinks {
+            evidence_ptrs: vec![EvidencePointer {
+                uri: format!("s3://fixtures/{id}.json"),
+                digest_sha256: Some("sha256:ok".into()),
+                media_type: Some("application/json".into()),
+                blob_ref: None,
+                span: Some((0, 10)),
+                access_policy: Some("restricted".into()),
+            }],
+            supersedes: None,
+        },
     }
 }
 

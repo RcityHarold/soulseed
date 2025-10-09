@@ -41,6 +41,7 @@ impl Compressor for CompressorMock {
                 };
                 let summary = SummaryUnit {
                     anchor: item.anchor.clone(),
+                    schema_v: item.anchor.schema_v,
                     su_id: format!("su:{}:{}", item.id, level as u8),
                     from_ids: vec![item.id.clone()],
                     level,
@@ -50,13 +51,19 @@ impl Compressor for CompressorMock {
                         qag: 1.0,
                         coverage: 1.0,
                         nli_contrad: 0.0,
-                        pointer_ok: item.evidence.is_some(),
+                        pointer_ok: !item.links.evidence_ptrs.is_empty(),
                     },
                     lineage: Lineage {
-                        version: 1,
-                        supersedes: None,
+                        version: item
+                            .anchor
+                            .sequence_number
+                            .unwrap_or(0)
+                            .min(u32::MAX as u64) as u32,
+                        supersedes: item.links.supersedes.clone(),
+                        superseded_by: None,
                     },
-                    evidence: item.evidence.clone(),
+                    evidence: item.links.evidence_ptrs.first().cloned(),
+                    metadata: json!({}),
                 };
                 CompressionOutcome {
                     tokens_after,

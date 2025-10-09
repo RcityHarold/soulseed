@@ -1,24 +1,22 @@
 use blake3::Hasher;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use soulseed_agi_core_models::awareness::{
     AwarenessFork, ClarifyLimits, ClarifyPlan, DecisionBudgetEstimate, DecisionExplain,
-    DecisionPath, DecisionPlan, DecisionRationale,
+    DecisionPath, DecisionPlan, DecisionRationale, SelfPlan,
 };
 
+use crate::scorer::ScoreBreakdown;
 use crate::types::{
-    BudgetEstimate, RouteExplain, RoutePlan, RouterCandidate, RouterInput, map_degradation,
-    new_cycle_id,
+    BudgetEstimate, RouteExplain, RoutePlan, RouterCandidate, RouterInput, fork_key,
+    map_degradation, new_cycle_id,
 };
+use std::{cmp::Ordering, collections::HashMap};
 
-pub struct RoutePlanner {
-    router_config_digest: String,
-}
+pub struct RoutePlanner;
 
 impl Default for RoutePlanner {
     fn default() -> Self {
-        Self {
-            router_config_digest: format!("blake3:{}", blake3::hash(b"dfr-router-config-v1")),
-        }
+        Self
     }
 }
 
@@ -30,8 +28,13 @@ impl RoutePlanner {
         rejected: &[(String, String)],
     ) -> RoutePlan {
         let cycle_id = new_cycle_id();
-        let routing_seed = self.compute_seed(&input.scene_label, candidate.priority);
-        let mut explain = self.build_explain(candidate, routing_seed, rejected.to_vec());
+        let routing_seed = self.compute_seed(
+            input.routing_seed,
+            &input.scene_label,
+            candidate,
+            &input.router_config.digest,
+        );
+        let mut explain = self.build_explain(input, candidate, routing_seed, rejected.to_vec());
         if explain.degradation_reason.is_none() {
             explain.degradation_reason = input.context.explain.degradation_reason.clone();
         }
@@ -54,10 +57,20 @@ impl RoutePlanner {
         }
     }
 
-    fn compute_seed(&self, scene: &str, priority: f32) -> u64 {
+    fn compute_seed(
+        &self,
+        base_seed: u64,
+        scene: &str,
+        candidate: &RouterCandidate,
+        router_config_digest: &str,
+    ) -> u64 {
         let mut hasher = Hasher::new();
+        hasher.update(base_seed.to_le_bytes().as_ref());
         hasher.update(scene.as_bytes());
-        hasher.update(priority.to_le_bytes().as_ref());
+        hasher.update(router_config_digest.as_bytes());
+        hasher.update(candidate.priority.to_le_bytes().as_ref());
+        hasher.update(format!("{:?}", candidate.fork).as_bytes());
+        hasher.update(candidate.metadata.to_string().as_bytes());
         let bytes = hasher.finalize().as_bytes().to_owned();
         let mut arr = [0u8; 8];
         arr.copy_from_slice(&bytes[..8]);
@@ -66,6 +79,7 @@ impl RoutePlanner {
 
     fn build_explain(
         &self,
+        input: &RouterInput,
         candidate: &RouterCandidate,
         routing_seed: u64,
         rejected: Vec<(String, String)>,
@@ -90,17 +104,24 @@ impl RoutePlanner {
             .get("degrade_hint")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let diagnostics = candidate
+        let mut diagnostics = candidate
             .metadata
             .get("diagnostics")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let digest = self.router_digest(&candidate.metadata, routing_seed);
+        let digest = self.router_digest(
+            &input.router_config.digest,
+            &candidate.metadata,
+            routing_seed,
+        );
+        if diagnostics.is_null() {
+            diagnostics = json!({});
+        }
 
         RouteExplain {
             routing_seed,
             router_digest: digest,
-            router_config_digest: self.router_config_digest.clone(),
+            router_config_digest: input.router_config.digest.clone(),
             indices_used,
             query_hash,
             degradation_reason: degradation,
@@ -109,9 +130,15 @@ impl RoutePlanner {
         }
     }
 
-    fn router_digest(&self, metadata: &serde_json::Value, routing_seed: u64) -> String {
+    fn router_digest(
+        &self,
+        config_digest: &str,
+        metadata: &serde_json::Value,
+        routing_seed: u64,
+    ) -> String {
         let mut hasher = Hasher::new();
         hasher.update(routing_seed.to_le_bytes().as_ref());
+        hasher.update(config_digest.as_bytes());
         hasher.update(metadata.to_string().as_bytes());
         format!("blake3:{}", hasher.finalize())
     }
@@ -142,6 +169,7 @@ impl RoutePlanner {
         input: &RouterInput,
         plan: &RoutePlan,
         sequence: u32,
+        fork_scores: &HashMap<AwarenessFork, ScoreBreakdown>,
     ) -> DecisionPath {
         let mut budget_plan = DecisionBudgetEstimate::default();
         if plan.budget.tokens > 0 {
@@ -155,19 +183,59 @@ impl RoutePlanner {
         }
 
         let mut rationale = DecisionRationale::default();
-        rationale
-            .scores
-            .insert("priority".into(), plan.priority.clamp(0.0, 1.0));
+        for (fork, breakdown) in fork_scores {
+            rationale
+                .scores
+                .insert(fork_key(*fork).to_string(), breakdown.score.clamp(0.0, 1.0));
+        }
         if let Some(reason) = &plan.explain.degradation_reason {
             rationale
                 .thresholds_hit
                 .push(format!("candidate_degrade:{}", reason));
         }
 
-        let features = json!({
-            "context_reasons": input.context.explain.reasons,
-            "context_indices": input.context.explain.indices_used,
-        });
+        let selected_score = fork_scores
+            .get(&plan.fork)
+            .map(|score| score.score)
+            .unwrap_or(plan.priority);
+
+        let mut ranked: Vec<_> = fork_scores.iter().collect();
+        ranked.sort_by(|a, b| b.1.score.partial_cmp(&a.1.score).unwrap_or(Ordering::Equal));
+        if ranked.len() > 1 {
+            let top = ranked[0];
+            let runner_up = ranked[1];
+            rationale.tradeoff = Some(format!(
+                "{} {:.2} vs {} {:.2}",
+                fork_key(*top.0),
+                top.1.score,
+                fork_key(*runner_up.0),
+                runner_up.1.score
+            ));
+        } else if let Some(top) = ranked.first() {
+            rationale.tradeoff = Some(format!("{} {:.2} selected", fork_key(*top.0), top.1.score));
+        }
+
+        let mut fork_feature_map = Map::new();
+        for (fork, breakdown) in fork_scores {
+            fork_feature_map.insert(fork_key(*fork).to_string(), breakdown.as_value());
+        }
+
+        let mut features_root = Map::new();
+        features_root.insert(
+            "context_reasons".into(),
+            json!(input.context.explain.reasons),
+        );
+        features_root.insert(
+            "context_indices".into(),
+            json!(input.context.explain.indices_used),
+        );
+        features_root.insert("selected_fork".into(), json!(fork_key(plan.fork)));
+        features_root.insert(
+            "fork_scores".into(),
+            Value::Object(fork_feature_map.clone()),
+        );
+
+        let features = Value::Object(features_root);
 
         let explain = DecisionExplain {
             routing_seed: plan.explain.routing_seed,
@@ -184,7 +252,7 @@ impl RoutePlanner {
             plan: plan.decision_plan.clone(),
             budget_plan,
             rationale,
-            confidence: plan.priority.clamp(0.0, 1.0),
+            confidence: selected_score.clamp(0.0, 1.0),
             explain,
             degradation_reason: plan
                 .explain
@@ -226,6 +294,45 @@ impl RoutePlanner {
         }
         if let Some(obj) = plan.explain.diagnostics.as_object_mut() {
             obj.insert("fallback".into(), serde_json::json!(true));
+        }
+        plan
+    }
+
+    pub fn build_fallback_self(
+        &self,
+        input: &RouterInput,
+        rejected: &[(String, String)],
+        reason: &str,
+    ) -> RoutePlan {
+        let candidate = RouterCandidate {
+            decision_plan: DecisionPlan::SelfReason {
+                plan: SelfPlan {
+                    hint: Some("budget_safety_reflection".into()),
+                    max_ic: Some(1),
+                },
+            },
+            fork: AwarenessFork::SelfReason,
+            priority: 0.4,
+            metadata: serde_json::json!({
+                "label": "fallback_self",
+                "degrade_hint": reason,
+                "diagnostics": { "fallback": true },
+            }),
+        };
+
+        let mut plan = self.build_plan(input, &candidate, rejected);
+        plan.priority = clamp_priority(plan.priority.max(0.35));
+        if plan.explain.degradation_reason.is_none() {
+            plan.explain.degradation_reason = Some(reason.to_string());
+        }
+        if plan.explain.diagnostics.is_null() {
+            plan.explain.diagnostics = serde_json::json!({});
+        }
+        if let Some(obj) = plan.explain.diagnostics.as_object_mut() {
+            obj.insert(
+                "fallback".into(),
+                serde_json::json!({ "self": true, "reason": reason }),
+            );
         }
         plan
     }

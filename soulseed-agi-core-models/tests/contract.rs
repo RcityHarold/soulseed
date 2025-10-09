@@ -11,6 +11,13 @@ fn mk_head() -> EnvelopeHead {
     }
 }
 
+fn mk_snapshot() -> Snapshot {
+    Snapshot {
+        schema_v: 1,
+        created_at: time::OffsetDateTime::now_utc(),
+    }
+}
+
 fn mk_base_event() -> DialogueEvent {
     DialogueEvent {
         tenant_id: TenantId::new(1),
@@ -37,6 +44,7 @@ fn mk_base_event() -> DialogueEvent {
         sequence_number: 1,
         trigger_event_id: None,
         temporal_pattern_id: None,
+        causal_links: vec![],
         reasoning_trace: None,
         reasoning_confidence: None,
         reasoning_strategy: None,
@@ -55,6 +63,10 @@ fn mk_base_event() -> DialogueEvent {
         real_time_priority: None,
         notification_targets: None,
         live_stream_id: None,
+        growth_stage: None,
+        processing_latency_ms: None,
+        influence_score: None,
+        community_impact: None,
         evidence_pointer: None,
         content_digest_sha256: None,
         blob_ref: None,
@@ -67,6 +79,8 @@ fn mk_base_event() -> DialogueEvent {
         tool_result: None,
         self_reflection: None,
         metadata: serde_json::json!({}),
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
     }
 }
 
@@ -194,6 +208,80 @@ fn awareness_event_contract_samples() {
     ] {
         evt.validate().expect("awareness event sample valid");
     }
+}
+
+#[test]
+fn message_contract_fields() {
+    let head = mk_head();
+    let snapshot = mk_snapshot();
+    let msg = Message {
+        tenant_id: TenantId::new(1),
+        message_id: MessageId::new(22),
+        session_id: SessionId::new(5),
+        head,
+        snapshot,
+        timestamp_ms: 99,
+        sender: Subject::Human(HumanId::new(7)),
+        content_type: "text/plain".into(),
+        content: serde_json::json!({"text": "hello"}),
+        metadata: serde_json::json!({"channel": "chat"}),
+        access_class: AccessClass::Restricted,
+        provenance: Some(Provenance {
+            source: "ui".into(),
+            method: "compose".into(),
+            model: None,
+            content_digest_sha256: Some("sha256:msg".into()),
+        }),
+        sequence_number: Some(1),
+        participants: vec![SubjectRef {
+            kind: Subject::AI(AIId::new(9)),
+            role: Some("assistant".into()),
+        }],
+        supersedes: None,
+        superseded_by: None,
+        evidence_pointer: Some(EvidencePointer {
+            uri: "blob://messages/msg-22".into(),
+            digest_sha256: Some("sha256:msg".into()),
+            media_type: Some("application/json".into()),
+            blob_ref: None,
+            span: None,
+            access_policy: Some("internal".into()),
+        }),
+        blob_ref: None,
+        content_digest_sha256: Some("sha256:msg".into()),
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
+    };
+
+    assert!(msg.validate().is_ok());
+}
+
+#[test]
+fn session_requires_provenance_when_restricted() {
+    let session = Session {
+        tenant_id: TenantId::new(2),
+        session_id: SessionId::new(77),
+        subject: Subject::Human(HumanId::new(4)),
+        participants: vec![SubjectRef {
+            kind: Subject::AI(AIId::new(5)),
+            role: Some("assistant".into()),
+        }],
+        head: mk_head(),
+        snapshot: mk_snapshot(),
+        created_at: 1_700_000_000,
+        scenario: Some(ConversationScenario::HumanToAi),
+        access_class: AccessClass::Restricted,
+        provenance: None,
+        supersedes: None,
+        superseded_by: None,
+        evidence_pointer: None,
+        blob_ref: None,
+        content_digest_sha256: None,
+        metadata: serde_json::Value::Null,
+    };
+
+    let err = session.validate().unwrap_err();
+    assert!(matches!(err, ModelError::Missing("provenance")));
 }
 
 #[test]

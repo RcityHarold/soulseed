@@ -1,4 +1,9 @@
-use crate::{AccessClass, MessageId, ModelError, Provenance, SessionId, Subject, TenantId};
+#[cfg(feature = "vectors-extra")]
+use crate::vectors_ext::ExtraVectors;
+use crate::{
+    common::EvidencePointer, AccessClass, EnvelopeHead, MessageId, ModelError, Provenance,
+    SessionId, Snapshot, Subject, SubjectRef, TenantId,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6,6 +11,8 @@ pub struct Message {
     pub tenant_id: TenantId,
     pub message_id: MessageId,
     pub session_id: SessionId,
+    pub head: EnvelopeHead,
+    pub snapshot: Snapshot,
     pub timestamp_ms: i64,
     pub sender: Subject,
     pub content_type: String,
@@ -16,11 +23,22 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_pointer: Option<String>,
+    pub sequence_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<SubjectRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<MessageId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_pointer: Option<EvidencePointer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest_sha256: Option<String>,
+    #[cfg(feature = "vectors-extra")]
+    #[serde(default)]
+    pub vectors: ExtraVectors,
 }
 
 impl Message {
@@ -33,6 +51,11 @@ impl Message {
         }
         if matches!(self.access_class, AccessClass::Restricted) && self.provenance.is_none() {
             return Err(ModelError::Missing("provenance"));
+        }
+        if let Some(seq) = self.sequence_number {
+            if seq == 0 {
+                return Err(ModelError::Invariant("sequence_number must be >= 1"));
+            }
         }
         Ok(())
     }

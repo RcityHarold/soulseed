@@ -1,29 +1,22 @@
 use crate::types::{FilterOutcome, RouterCandidate, RouterInput};
+use std::collections::HashSet;
 
-pub struct CandidateFilter {
-    pub max_risk: Option<f32>,
-}
+pub struct CandidateFilter;
 
 impl Default for CandidateFilter {
     fn default() -> Self {
-        Self {
-            max_risk: Some(0.8),
-        }
+        Self
     }
 }
 
 impl CandidateFilter {
     pub fn filter(&self, input: &RouterInput, candidates: Vec<RouterCandidate>) -> FilterOutcome {
         let mut outcome = FilterOutcome::default();
+        let mut seen: HashSet<(soulseed_agi_core_models::awareness::AwarenessFork, String)> =
+            HashSet::new();
+
         for candidate in candidates {
-            if input.anchor.access_class == soulseed_agi_core_models::AccessClass::Restricted
-                && input.anchor.provenance.is_none()
-            {
-                outcome
-                    .rejected
-                    .push(("privacy_restricted".into(), candidate_label(&candidate)));
-                continue;
-            }
+            let label = candidate.label();
 
             if let Some(policy) = candidate.metadata.get("policy") {
                 if policy
@@ -34,27 +27,26 @@ impl CandidateFilter {
                 {
                     outcome
                         .rejected
-                        .push(("policy_denied".into(), candidate_label(&candidate)));
+                        .push(("policy_denied".into(), label.clone()));
                     continue;
                 }
             }
 
-            if let Some(max_risk) = self.max_risk {
-                if candidate
-                    .metadata
-                    .get("estimate")
-                    .and_then(|est| est.get("risk"))
-                    .and_then(|r| r.as_f64())
-                    .map(|risk| risk as f32 > max_risk)
-                    .unwrap_or(false)
-                {
-                    outcome
-                        .rejected
-                        .push(("risk_too_high".into(), candidate_label(&candidate)));
-                    continue;
-                }
+            if seen.contains(&(candidate.fork, label.clone())) {
+                outcome
+                    .rejected
+                    .push(("duplicate_candidate".into(), label.clone()));
+                continue;
             }
 
+            if is_denied_by_snapshot(&label, &candidate, input) {
+                outcome
+                    .rejected
+                    .push(("policy_denied".into(), label.clone()));
+                continue;
+            }
+
+            seen.insert((candidate.fork, label));
             outcome.accepted.push(candidate);
         }
 
@@ -62,11 +54,29 @@ impl CandidateFilter {
     }
 }
 
-fn candidate_label(candidate: &RouterCandidate) -> String {
-    candidate
-        .metadata
-        .get("label")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{:?}", candidate.fork))
+fn is_denied_by_snapshot(label: &str, candidate: &RouterCandidate, input: &RouterInput) -> bool {
+    match candidate.fork {
+        soulseed_agi_core_models::awareness::AwarenessFork::ToolPath => {
+            if input.policies.denied_tools.iter().any(|id| id == label) {
+                return true;
+            }
+            if !input.policies.allowed_tools.is_empty()
+                && !input.policies.allowed_tools.iter().any(|id| id == label)
+            {
+                return true;
+            }
+        }
+        soulseed_agi_core_models::awareness::AwarenessFork::Collab => {
+            if input.policies.denied_collabs.iter().any(|id| id == label) {
+                return true;
+            }
+            if !input.policies.allowed_collabs.is_empty()
+                && !input.policies.allowed_collabs.iter().any(|id| id == label)
+            {
+                return true;
+            }
+        }
+        _ => {}
+    }
+    false
 }

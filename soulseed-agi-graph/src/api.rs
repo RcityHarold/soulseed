@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AIId, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType, AwarenessFork,
-    ConversationScenario, CycleId, DialogueEvent, DialogueEventType, EventId, HumanId,
-    RelationshipEdge, RelationshipSnapshot, SessionId, SubjectRef, SyncPointKind, TenantId,
+    ConceptNode, ConversationScenario, CycleId, DialogueEvent, DialogueEventType, EmotionNode,
+    EventId, HumanId, RelationshipEdge, RelationshipSnapshot, SemanticEdge, SessionId, SubjectRef,
+    SyncPointKind, TenantId, TopicNode,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,6 +75,14 @@ pub struct CausalResponse {
     pub tenant_id: TenantId,
     pub nodes: Vec<DialogueEvent>,
     pub edges: Vec<CausalEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concept_nodes: Vec<ConceptNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_nodes: Vec<TopicNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emotion_nodes: Vec<EmotionNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_edges: Vec<SemanticEdge>,
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
@@ -268,6 +277,7 @@ pub struct RerankResponse {
     pub items: Vec<RerankItem>,
     pub indices_used: Vec<String>,
     pub query_hash: String,
+    pub degradation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -285,6 +295,7 @@ pub struct RelationResponse {
     pub snapshot: Option<RelationshipSnapshot>,
     pub indices_used: Vec<String>,
     pub query_hash: String,
+    pub degradation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -300,6 +311,14 @@ pub struct LiveSubscribe {
     pub tenant_id: TenantId,
     pub filters: LiveFilters,
     pub max_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buffer: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backpressure_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

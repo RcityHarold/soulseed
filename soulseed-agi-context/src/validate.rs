@@ -160,7 +160,20 @@ fn validate_quota(
     partition: &crate::types::Partition,
     quota: &PartitionQuota,
 ) -> Result<(), ContextError> {
-    if quota.min_tokens > quota.max_tokens {
+    if let (Some(min_ratio), Some(max_ratio)) = (quota.min_ratio, quota.max_ratio) {
+        if min_ratio > max_ratio {
+            return Err(ContextError::PlannerFailure(format!(
+                "partition_ratio_min_gt_max:{partition:?}:{min}>{max}",
+                min = min_ratio,
+                max = max_ratio
+            )));
+        }
+        if !(0.0..=1.0).contains(&min_ratio) || !(0.0..=1.0).contains(&max_ratio) {
+            return Err(ContextError::PlannerFailure(format!(
+                "partition_ratio_out_of_range:{partition:?}",
+            )));
+        }
+    } else if quota.min_tokens > quota.max_tokens {
         return Err(ContextError::PlannerFailure(format!(
             "partition_min_gt_max:{partition:?}:{min}>{max}",
             partition = partition,

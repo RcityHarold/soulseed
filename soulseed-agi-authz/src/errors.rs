@@ -10,4 +10,6 @@ pub enum AuthzError {
     InvalidResource,
     #[error("quota failure: {0}")]
     QuotaFailure(String),
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 }

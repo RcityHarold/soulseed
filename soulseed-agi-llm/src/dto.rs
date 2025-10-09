@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
+#[cfg(feature = "vectors-extra")]
+use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::{
-    ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType, EnvelopeHead, EventId,
-    RealTimePriority, Snapshot, Subject, SubjectRef, TraceId,
+    ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType, EnvelopeHead,
+    EvidencePointer, EventId, RealTimePriority, Snapshot, Subject, SubjectRef, TraceId,
 };
 use soulseed_agi_tools::dto::{Anchor, ToolResultSummary};
 use time::OffsetDateTime;
@@ -66,19 +68,54 @@ pub struct ModelProfile {
     pub policy_digest: String,
     pub safety_tier: String,
     pub max_output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_rank: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_band: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f32>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub should_use_factors: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningVisibility {
+    SummaryOnly,
+    Full,
+    TicketRequired,
+    Redacted,
+}
+
+impl Default for ReasoningVisibility {
+    fn default() -> Self {
+        ReasoningVisibility::SummaryOnly
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlmResult {
     pub completion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_pointer: Option<EvidencePointer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning: Vec<PromptSegment>,
+    #[serde(default)]
+    pub reasoning_visibility: ReasoningVisibility,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +135,16 @@ pub struct LlmExplain {
     pub indices_used: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_rank: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_band: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub should_use_factors: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -146,6 +193,19 @@ pub fn build_final_event(
         config_snapshot_hash: anchor.config_snapshot_hash.clone(),
         config_snapshot_version: anchor.config_snapshot_version,
     };
+    let should_use_factors = if !model.should_use_factors.is_null() {
+        model.should_use_factors.clone()
+    } else {
+        json!({
+            "source": "llm_engine",
+            "reasoning_visibility": result.reasoning_visibility,
+            "usage_tokens": {
+                "prompt": result.usage.prompt_tokens,
+                "completion": result.usage.completion_tokens,
+            },
+            "degradation_chain": degrade_chain
+        })
+    };
     let now = OffsetDateTime::now_utc();
     DialogueEvent {
         tenant_id: anchor.tenant_id,
@@ -167,6 +227,7 @@ pub fn build_final_event(
         sequence_number: anchor.sequence_number.unwrap_or(1) + 100,
         trigger_event_id: None,
         temporal_pattern_id: None,
+        causal_links: Vec::new(),
         reasoning_trace: None,
         reasoning_confidence: None,
         reasoning_strategy: None,
@@ -181,7 +242,11 @@ pub fn build_final_event(
         real_time_priority: Some(RealTimePriority::Normal),
         notification_targets: None,
         live_stream_id: None,
-        evidence_pointer: None,
+        growth_stage: Some("llm:final".into()),
+        processing_latency_ms: None,
+        influence_score: None,
+        community_impact: None,
+        evidence_pointer: result.evidence_pointer.clone(),
         content_digest_sha256: Some(format!(
             "sha256:{}",
             blake3::hash(result.completion.as_bytes())
@@ -206,8 +271,13 @@ pub fn build_final_event(
                 json!({
                     "prompt_tokens": result.usage.prompt_tokens,
                     "completion_tokens": result.usage.completion_tokens,
+                    "total_cost_usd": result.usage.total_cost_usd,
+                    "currency": result.usage.currency,
                 }),
             );
+            if let Some(summary) = result.summary.as_ref() {
+                meta.insert("summary".into(), json!(summary));
+            }
             if let Some(reason) = result.degradation_reason.as_ref() {
                 meta.insert("degradation_reason".into(), json!(reason));
             }
@@ -217,8 +287,29 @@ pub fn build_final_event(
             if let Some(hash) = query_hash.clone() {
                 meta.insert("query_hash".into(), json!(hash));
             }
+            if let Some(rank) = model.selection_rank {
+                meta.insert("model_rank".into(), json!(rank));
+            }
+            if let Some(score) = model.selection_score {
+                meta.insert("model_score".into(), json!(score));
+            }
+            if let Some(band) = model.usage_band.as_ref() {
+                meta.insert("usage_band".into(), json!(band));
+            }
+            if let Some(cost) = model.estimated_cost_usd {
+                meta.insert("estimated_cost_usd".into(), json!(cost));
+            } else if let Some(cost) = result.usage.total_cost_usd {
+                meta.insert("estimated_cost_usd".into(), json!(cost));
+            }
+            meta.insert("should_use_factors".into(), should_use_factors);
+            meta.insert(
+                "reasoning_visibility".into(),
+                json!(result.reasoning_visibility.clone()),
+            );
             Value::Object(meta)
         },
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
     }
 }
 

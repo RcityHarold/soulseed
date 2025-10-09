@@ -125,10 +125,7 @@ mod tests {
                     goal: "goal".into(),
                     constraints: vec![],
                 },
-                latency_window: LatencyWindow {
-                    p50_ms: 80,
-                    p95_ms: 200,
-                },
+                latency_window: LatencyWindow::new(80, 200),
                 risk_flag: RiskLevel::Low,
             })
         }
@@ -192,7 +189,17 @@ mod tests {
                     digest: "p".into(),
                     at: None,
                 },
+                tool_catalog_snapshot: Some(VersionPointer {
+                    digest: "tool".into(),
+                    at: None,
+                }),
+                authz_snapshot: Some(VersionPointer {
+                    digest: "auth".into(),
+                    at: None,
+                }),
+                quota_snapshot: None,
                 observe_watermark: None,
+                monitoring_snapshot: None,
             })
         }
     }
@@ -253,6 +260,8 @@ mod tests {
             access_class: soulseed_agi_core_models::AccessClass::Internal,
             provenance: None,
             schema_v: 1,
+            supersedes: None,
+            superseded_by: None,
         }
     }
 

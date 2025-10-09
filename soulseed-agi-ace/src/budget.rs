@@ -5,6 +5,7 @@ use crate::types::{BudgetDecision, BudgetSnapshot, CycleLane};
 pub struct BudgetPolicy {
     pub lane_token_ceiling: Option<u32>,
     pub lane_walltime_ceiling_ms: Option<u64>,
+    pub lane_external_cost_ceiling: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -39,6 +40,7 @@ impl BudgetManager {
                     allowed: false,
                     reason: Some("token_budget_exceeded".into()),
                     snapshot,
+                    degradation_reason: Some("budget_tokens".into()),
                 });
             }
         }
@@ -49,6 +51,18 @@ impl BudgetManager {
                     allowed: false,
                     reason: Some("walltime_budget_exceeded".into()),
                     snapshot,
+                    degradation_reason: Some("budget_walltime".into()),
+                });
+            }
+        }
+        if let Some(max_cost) = policy.lane_external_cost_ceiling {
+            if snapshot.external_cost_spent > max_cost {
+                return Ok(BudgetDecision {
+                    cycle_id,
+                    allowed: false,
+                    reason: Some("external_cost_budget_exceeded".into()),
+                    snapshot,
+                    degradation_reason: Some("budget_external_cost".into()),
                 });
             }
         }
@@ -57,6 +71,7 @@ impl BudgetManager {
             allowed: true,
             reason: None,
             snapshot,
+            degradation_reason: None,
         })
     }
 }

@@ -1,5 +1,6 @@
 pub mod awareness;
 pub mod common;
+pub mod components;
 pub mod contracts;
 pub mod dialogue_event;
 pub mod enums;
@@ -15,6 +16,7 @@ pub mod vectors_ext;
 
 pub use awareness::*;
 pub use common::*;
+pub use components::*;
 pub use contracts::*;
 pub use dialogue_event::*;
 pub use enums::*;

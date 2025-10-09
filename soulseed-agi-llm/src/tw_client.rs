@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use thiserror::Error;
 
-use crate::dto::{LlmResult, ModelProfile, PromptBundle};
+use crate::dto::{LlmResult, ModelProfile, PromptBundle, ReasoningVisibility};
 use soulseed_agi_tools::dto::{AccessClass, Anchor};
 
 #[derive(Error, Debug, Clone)]
@@ -252,7 +252,10 @@ impl ThinWaistClient for MockThinWaistClient {
         let next = inner.results.pop_front().unwrap_or_else(|| {
             Ok(LlmResult {
                 completion: format!("Model {} fallback response", model.model_id),
+                summary: Some(format!("fallback summary for {}", model.model_id)),
+                evidence_pointer: None,
                 reasoning: Vec::new(),
+                reasoning_visibility: ReasoningVisibility::SummaryOnly,
                 degradation_reason: None,
                 indices_used: None,
                 query_hash: None,

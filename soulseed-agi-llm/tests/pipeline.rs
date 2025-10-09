@@ -1,4 +1,6 @@
 use serde_json::json;
+#[cfg(feature = "vectors-extra")]
+use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::awareness::{
     AwarenessAnchor, AwarenessDegradationReason, AwarenessFork, ClarifyLimits, ClarifyPlan,
     CollabPlan, DecisionBudgetEstimate, DecisionExplain, DecisionPath as AwarenessDecisionPath,
@@ -8,38 +10,22 @@ use soulseed_agi_core_models::{
     AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
     EnvelopeHead, EventId, Provenance, RealTimePriority, Snapshot, Subject, SubjectRef, TraceId,
 };
+use soulseed_agi_core_models::common::EvidencePointer;
 use soulseed_agi_dfr::types::{BudgetEstimate, RouteExplain, RoutePlan, RouterDecision};
 use soulseed_agi_llm::{
-    dto::{LlmInput, LlmResult, ModelProfile, PromptSegment, TokenUsage},
+    dto::{
+        LlmInput, LlmResult, ModelProfile, PromptSegment, ReasoningVisibility, TokenUsage,
+    },
     engine::{LlmConfig, LlmEngine},
     integrator::{LlmIntegrationOptions, build_llm_input},
     tw_client::MockThinWaistClient,
 };
-use soulseed_agi_tools::config::ToolsConfig;
-use soulseed_agi_tools::engine::ToolEngine;
-use soulseed_agi_tools::explainer::DefaultExplainer;
-use soulseed_agi_tools::metrics::NoopMetrics;
-use soulseed_agi_tools::orchestrator::ToolOrchestrator;
-use soulseed_agi_tools::planner::ToolPlanner;
-use soulseed_agi_tools::router::RouterDeterministic;
-use soulseed_agi_tools::traits::ToolEngineRunner;
-use soulseed_agi_tools::tw_client::{ToolDef, TwClientMock, TwExecuteResult};
-use soulseed_agi_tools::{dto::*, errors::EngineError as ToolEngineError};
+use soulseed_agi_tools::dto::{
+    Anchor, EvidencePointer as ToolEvidencePointer, SessionId, SummaryLineage, TenantId,
+    ToolResultSummary,
+};
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-fn tool_def(id: &str, capability: &[&str]) -> ToolDef {
-    ToolDef {
-        tool_id: id.into(),
-        version: "1".into(),
-        capability: capability.iter().map(|s| s.to_string()).collect(),
-        input_schema: json!({"type": "object"}),
-        output_schema: json!({"type": "object"}),
-        side_effect: false,
-        supports_stream: true,
-        risk_level: "low".into(),
-    }
-}
 
 fn anchor() -> Anchor {
     Anchor {
@@ -58,6 +44,8 @@ fn anchor() -> Anchor {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -96,6 +84,7 @@ fn clarify_event(anchor: &Anchor, text: &str) -> DialogueEvent {
         sequence_number: anchor.sequence_number.unwrap_or(1),
         trigger_event_id: None,
         temporal_pattern_id: None,
+        causal_links: vec![],
         reasoning_trace: None,
         reasoning_confidence: None,
         reasoning_strategy: None,
@@ -110,6 +99,10 @@ fn clarify_event(anchor: &Anchor, text: &str) -> DialogueEvent {
         real_time_priority: Some(RealTimePriority::Normal),
         notification_targets: None,
         live_stream_id: None,
+        growth_stage: None,
+        processing_latency_ms: None,
+        influence_score: None,
+        community_impact: None,
         evidence_pointer: None,
         content_digest_sha256: None,
         blob_ref: None,
@@ -122,148 +115,151 @@ fn clarify_event(anchor: &Anchor, text: &str) -> DialogueEvent {
         tool_result: None,
         self_reflection: None,
         metadata: json!({"clarify": true, "text": text}),
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
     }
 }
 
-fn tool_engine<'a>(anchor: &Anchor) -> ToolEngine<'a> {
-    let mut cfg = ToolsConfig::default();
-    cfg.snapshot_hash = anchor.config_snapshot_hash.clone();
-    cfg.snapshot_version = anchor.config_snapshot_version;
-    ToolEngine {
-        router: &RouterDeterministic,
-        planner: &ToolPlanner,
-        orchestrator: &ToolOrchestrator,
-        explainer: &DefaultExplainer,
-        config: cfg,
-    }
+fn tool_event(
+    anchor: &Anchor,
+    event_type: DialogueEventType,
+    metadata: serde_json::Value,
+) -> DialogueEvent {
+    let mut event = clarify_event(anchor, "");
+    event.event_type = event_type;
+    event.subject = Subject::AI(soulseed_agi_core_models::AIId::new(0));
+    event.participants = vec![SubjectRef {
+        kind: Subject::Human(soulseed_agi_core_models::HumanId(777)),
+        role: Some("requester".into()),
+    }];
+    event.metadata = metadata;
+    event
 }
 
 #[test]
-fn clarify_tool_llm_pipeline() -> Result<(), ToolEngineError> {
+fn clarify_tool_llm_pipeline() {
     let anchor = anchor();
     let clarify = "请确认你希望我总结工具执行结果。";
 
-    let tool_tw = TwClientMock::with_defs(vec![tool_def("web.search", &["search"])]);
-    tool_tw.push_execute(Ok(TwExecuteResult {
-        summary: ToolResultSummary {
-            tool_id: "web.search".into(),
-            schema_v: 1,
-            summary: json!({"hits": 3, "top": "Soulseed"}),
-            evidence_pointer: Some(soulseed_agi_tools::dto::EvidencePointer {
-                uri: "s3://search/result.json".into(),
-                blob_ref: None,
-                span: None,
-                checksum: "sha256:tool".into(),
-                access_policy: "internal".into(),
-            }),
-            result_digest: "digest-search".into(),
+    let tool_degrade = Some("timeout_fallback".to_string());
+    let tool_indices = Some(vec![String::from("timeline_v1")]);
+    let tool_query_hash = Some("timeline#clarify".to_string());
+    let tool_meta = json!({
+        "degradation_reason": tool_degrade.clone().unwrap(),
+        "indices_used": tool_indices.clone().unwrap(),
+        "query_hash": tool_query_hash.clone().unwrap(),
+    });
+    let tool_dialogue_events = vec![
+        tool_event(&anchor, DialogueEventType::ToolCall, tool_meta.clone()),
+        tool_event(&anchor, DialogueEventType::ToolResult, tool_meta.clone()),
+    ];
+
+    let call_meta = tool_dialogue_events[0].metadata.as_object().expect("call meta");
+    assert_eq!(
+        call_meta
+            .get("degradation_reason")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "timeout_fallback"
+    );
+    assert_eq!(
+        call_meta
+            .get("indices_used")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["timeline_v1"]
+    );
+    assert_eq!(
+        call_meta
+            .get("query_hash")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "timeline#clarify"
+    );
+
+    let result_meta = tool_dialogue_events[1]
+        .metadata
+        .as_object()
+        .expect("result meta");
+    assert_eq!(
+        result_meta
+            .get("degradation_reason")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "timeout_fallback"
+    );
+    assert_eq!(
+        result_meta
+            .get("indices_used")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["timeline_v1"]
+    );
+    assert_eq!(
+        result_meta
+            .get("query_hash")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "timeline#clarify"
+    );
+
+    let tool_summary = Some(ToolResultSummary {
+        tool_id: "web.search".into(),
+        schema_v: 1,
+        summary: json!({"hits": 3, "top": "Soulseed"}),
+        evidence_pointer: ToolEvidencePointer {
+            uri: "s3://search/result.json".into(),
+            digest_sha256: Some("sha256:tool".into()),
+            media_type: Some("application/json".into()),
+            blob_ref: None,
+            span: None,
+            access_policy: Some("internal".into()),
         },
-        degradation_reason: Some("timeout_fallback".into()),
-        indices_used: Some(vec!["timeline_v1".into()]),
-        query_hash: Some("timeline#clarify".into()),
-    }));
-
-    let clarify_input = EngineInput {
-        anchor: anchor.clone(),
-        scene: "clarify_tool".into(),
-        capability_hints: vec!["search".into()],
-        context_tags: json!({"stage": "clarify"}),
-        request_context: json!({
-            "inputs": {"web.search": {"query": "Soulseed"}},
-            "clarify": {"question": clarify}
-        }),
-        subject: None,
-    };
-
-    let tool_engine = tool_engine(&anchor);
-    let obs = NoopMetrics;
-    let tool_output = tool_engine.run(clarify_input, &tool_tw, &obs)?;
-    let tool_degrade = tool_output.execution.explain_run.degradation_reason.clone();
-    let tool_indices = tool_output.execution.explain_run.indices_used.clone();
-    let tool_query_hash = tool_output.execution.explain_run.query_hash.clone();
-    assert_eq!(tool_output.dialogue_events.len(), 2);
-
-    let tool_call = tool_output
-        .dialogue_events
-        .iter()
-        .find(|event| event.event_type == DialogueEventType::ToolCall)
-        .expect("tool call event");
-    let call_meta = tool_call.metadata.as_object().expect("call meta");
-    assert_eq!(
-        call_meta
-            .get("degradation_reason")
-            .and_then(|v| v.as_str())
-            .unwrap(),
-        "timeout_fallback"
-    );
-    assert_eq!(
-        call_meta
-            .get("indices_used")
-            .and_then(|v| v.as_array())
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec!["timeline_v1"]
-    );
-    assert_eq!(
-        call_meta
-            .get("query_hash")
-            .and_then(|v| v.as_str())
-            .unwrap(),
-        "timeline#clarify"
-    );
-
-    let tool_result = tool_output
-        .dialogue_events
-        .iter()
-        .find(|event| event.event_type == DialogueEventType::ToolResult)
-        .expect("tool result event");
-    let result_meta = tool_result.metadata.as_object().expect("result meta");
-    assert_eq!(
-        result_meta
-            .get("degradation_reason")
-            .and_then(|v| v.as_str())
-            .unwrap(),
-        "timeout_fallback"
-    );
-    assert_eq!(
-        result_meta
-            .get("indices_used")
-            .and_then(|v| v.as_array())
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect::<Vec<_>>(),
-        vec!["timeline_v1"]
-    );
-    assert_eq!(
-        result_meta
-            .get("query_hash")
-            .and_then(|v| v.as_str())
-            .unwrap(),
-        "timeline#clarify"
-    );
+        result_digest: "digest-search".into(),
+        lineage: SummaryLineage::default(),
+    });
 
     let model = ModelProfile {
         model_id: "llm.soulseed.v1".into(),
         policy_digest: "sha256:llm-policy".into(),
         safety_tier: "standard".into(),
         max_output_tokens: 2048,
+        selection_rank: Some(1),
+        selection_score: Some(0.82),
+        usage_band: Some("standard".into()),
+        estimated_cost_usd: Some(0.0032),
+        should_use_factors: json!({"quality": 0.9, "latency_ms": 820}),
     };
     let llm_client = MockThinWaistClient::new(model.clone());
     llm_client.push_result(Ok(LlmResult {
         completion: "工具已成功执行，结果简介如下：...".into(),
+        summary: Some("工具执行成功，返回经压缩的最终答复".into()),
+        evidence_pointer: Some(EvidencePointer {
+            uri: "soulbase://llm/result/123".into(),
+            digest_sha256: Some("sha256:llm-result-123".into()),
+            media_type: Some("text/plain".into()),
+            blob_ref: None,
+            span: None,
+            access_policy: Some("summary_only".into()),
+        }),
         reasoning: vec![PromptSegment {
             role: "assistant".into(),
             content: "综合工具结果生成最终答复".into(),
         }],
+        reasoning_visibility: ReasoningVisibility::TicketRequired,
         degradation_reason: Some("llm_timeout_recovered".into()),
         indices_used: Some(vec!["llm_cache_v1".into()]),
         query_hash: Some("llm#clarify".into()),
         usage: TokenUsage {
             prompt_tokens: 128,
             completion_tokens: 64,
+            ..Default::default()
         },
     }));
 
@@ -272,19 +268,19 @@ fn clarify_tool_llm_pipeline() -> Result<(), ToolEngineError> {
         anchor: anchor.clone(),
         scene: "clarify_tool".into(),
         clarify_prompt: Some(clarify.into()),
-        tool_summary: tool_output.execution.summary.clone(),
+        tool_summary: tool_summary.clone(),
         user_prompt: "请生成最终结论".into(),
         context_tags: json!({"clarify": true}),
         degrade_hint: tool_degrade.clone(),
-        tool_indices,
-        tool_query_hash,
+        tool_indices: tool_indices.clone(),
+        tool_query_hash: tool_query_hash.clone(),
     };
 
     let llm_output = llm_engine.run(llm_input).expect("llm run");
     let final_event = llm_output.final_event.clone();
 
     let mut pipeline = vec![clarify_event(&anchor, clarify)];
-    pipeline.extend(tool_output.dialogue_events.clone());
+    pipeline.extend(tool_dialogue_events.clone());
     pipeline.push(final_event.clone());
 
     assert_eq!(pipeline.len(), 4);
@@ -311,6 +307,56 @@ fn clarify_tool_llm_pipeline() -> Result<(), ToolEngineError> {
             .and_then(|v| v.as_str())
             .unwrap(),
         "llm_timeout_recovered"
+    );
+    assert_eq!(
+        final_event
+            .metadata
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap(),
+        "工具执行成功，返回经压缩的最终答复"
+    );
+    assert_eq!(
+        final_event
+            .metadata
+            .get("model_rank")
+            .and_then(|v| v.as_u64())
+            .unwrap(),
+        1
+    );
+    assert!(
+        final_event
+            .metadata
+            .get("should_use_factors")
+            .unwrap()
+            .get("quality")
+            .is_some()
+    );
+    assert_eq!(
+        final_event.evidence_pointer.as_ref().unwrap().uri,
+        "soulbase://llm/result/123"
+    );
+    assert_eq!(
+        llm_output.explain.usage_rank,
+        Some(1),
+        "should propagate rank into explain"
+    );
+    assert_eq!(llm_output.explain.usage_score, Some(0.82));
+    assert_eq!(llm_output.explain.usage_band.as_deref(), Some("standard"));
+    assert!(
+        llm_output
+            .explain
+            .should_use_factors
+            .get("quality")
+            .is_some()
+    );
+    assert_eq!(
+        llm_output
+            .result
+            .summary
+            .as_deref()
+            .expect("summary returned"),
+        "工具执行成功，返回经压缩的最终答复"
     );
 
     let explain_reason = llm_output.explain.degradation_reason.as_deref().unwrap();
@@ -354,8 +400,6 @@ fn clarify_tool_llm_pipeline() -> Result<(), ToolEngineError> {
 
     let reconciles = llm_client.take_reconciles();
     assert!(!reconciles.is_empty());
-
-    Ok(())
 }
 
 #[test]

@@ -6,11 +6,16 @@ use soulseed_agi_core_models::{
     AccessClass, ConversationScenario, Provenance, SessionId, TenantId,
     awareness::{
         AwarenessAnchor, AwarenessDegradationReason, AwarenessFork, ClarifyLimits, ClarifyPlan,
-        CollabPlan, DecisionPlan, SelfPlan, ToolPlan, ToolPlanBarrier, ToolPlanEdge, ToolPlanNode,
+        ClarifyQuestion, CollabPlan, DecisionPlan, SelfPlan, ToolPlan, ToolPlanBarrier,
+        ToolPlanEdge, ToolPlanNode,
     },
 };
-use soulseed_agi_dfr::types::RoutePlan;
-use soulseed_agi_dfr::{AuthzService, QuotaService};
+use soulseed_agi_dfr::hardgate::HardGate;
+use soulseed_agi_dfr::scorer::CandidateScorer;
+use soulseed_agi_dfr::types::{
+    AssessmentSnapshot, BudgetEstimate, BudgetTarget, CatalogItem, CatalogSnapshot, ContextSignals,
+    PolicySnapshot, RouterConfig,
+};
 use soulseed_agi_dfr::{
     CandidateFilter, DfrEngine, RoutePlanner, RouterCandidate, RouterInput, RouterService,
 };
@@ -46,6 +51,8 @@ fn context_anchor(
         provenance,
         schema_v: 1,
         scenario: Some(scenario),
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -66,6 +73,8 @@ fn context_bundle(
 
     let bundle = ContextBundle {
         anchor: context_anchor(access, provenance, scenario.clone()),
+        schema_v: 1,
+        version: 1,
         segments: vec![BundleSegment {
             partition: Partition::P4Dialogue,
             items: Vec::new(),
@@ -75,6 +84,7 @@ fn context_bundle(
             target_tokens: 800,
             projected_tokens: 480,
         },
+        prompt: soulseed_agi_context::types::PromptBundle::default(),
     };
 
     (bundle, format!("sha256:{}", Uuid::nil()))
@@ -96,6 +106,12 @@ fn router_input(
         indices,
         query_hash,
     );
+    let mut assessment = AssessmentSnapshot::default();
+    assessment.intent_clarity = Some(0.85);
+
+    let mut context_signals = ContextSignals::default();
+    context_signals.primary_intent = Some("general.help".into());
+
     RouterInput {
         anchor: awareness_anchor(access, provenance),
         context_digest: digest,
@@ -104,36 +120,28 @@ fn router_input(
         scene_label: "demo.scene".into(),
         user_prompt: "hello".into(),
         tags: json!({}),
-    }
-}
-
-struct AllowAuthz;
-
-impl AuthzService for AllowAuthz {
-    fn authorize(
-        &self,
-        _input: &RouterInput,
-        _plan: &RoutePlan,
-    ) -> Result<(), soulseed_agi_dfr::DfrError> {
-        Ok(())
-    }
-}
-
-struct AllowQuota;
-
-impl QuotaService for AllowQuota {
-    fn consume(
-        &self,
-        _input: &RouterInput,
-        _plan: &RoutePlan,
-    ) -> Result<(), soulseed_agi_dfr::DfrError> {
-        Ok(())
+        assessment,
+        context_signals,
+        policies: PolicySnapshot::default(),
+        catalogs: CatalogSnapshot::default(),
+        budget: BudgetTarget {
+            max_tokens: 1_200,
+            max_walltime_ms: 1_500,
+            max_external_cost: 5.0,
+        },
+        router_config: RouterConfig::default(),
+        routing_seed: 0xD0E5_1EED,
     }
 }
 
 #[test]
 fn filter_rejects_restricted_without_provenance() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let input = router_input(
         AccessClass::Restricted,
         None,
@@ -154,20 +162,22 @@ fn filter_rejects_restricted_without_provenance() {
         metadata: json!({ "label": "self" }),
     };
 
-    let (outcome, plans) = router.evaluate(&input, vec![candidate]).expect("evaluate");
-    assert!(plans.is_empty());
-    assert!(outcome.accepted.is_empty());
-    assert_eq!(outcome.rejected.len(), 1);
-    assert_eq!(outcome.rejected[0].0, "privacy_restricted");
+    let evaluation = router.evaluate(&input, vec![candidate]).expect("evaluate");
+    assert!(evaluation.plans.is_empty());
+    assert_eq!(evaluation.rejected.len(), 1);
+    assert_eq!(evaluation.rejected[0].0, "privacy_restricted");
 }
 
 #[test]
 fn engine_emits_budget_and_explain_details() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "user".into(),
@@ -253,12 +263,306 @@ fn engine_emits_budget_and_explain_details() {
 }
 
 #[test]
-fn clarify_timeout_maps_to_clarify_exhausted() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+fn catalog_candidates_used_when_none_provided() {
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
+
+    let provenance = Some(Provenance {
+        source: "user".into(),
+        method: "oauth".into(),
+        model: None,
+        content_digest_sha256: None,
+    });
+
+    let mut input = router_input(
+        AccessClass::Internal,
+        provenance,
+        None,
+        &["timeline"],
+        Some("graph:catalog"),
+    );
+
+    input.catalogs = CatalogSnapshot {
+        items: vec![CatalogItem {
+            id: "self-default".into(),
+            fork: AwarenessFork::SelfReason,
+            label: Some("self_from_catalog".into()),
+            score_hint: Some(0.64),
+            risk: Some(0.1),
+            estimate: Some(BudgetEstimate {
+                tokens: 120,
+                walltime_ms: 600,
+                external_cost: 0.0,
+            }),
+            metadata: json!({
+                "hint": "catalog_reflect",
+                "max_ic": 2
+            }),
+        }],
+        metadata: json!({}),
+    };
+
+    let decision = engine.route(input, Vec::new()).expect("catalog route");
+
+    assert_eq!(decision.plan.fork, AwarenessFork::SelfReason);
+    if let DecisionPlan::SelfReason { plan } = &decision.decision_path.plan {
+        assert_eq!(plan.hint.as_deref(), Some("catalog_reflect"));
+    } else {
+        panic!("expected self plan from catalog");
+    }
+}
+
+#[test]
+fn policy_denied_candidate_triggers_fallback() {
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let planner = RoutePlanner::default();
+    let engine = DfrEngine::new(&router, &planner);
+
+    let provenance = Some(Provenance {
+        source: "ops".into(),
+        method: "console".into(),
+        model: None,
+        content_digest_sha256: None,
+    });
+
+    let mut input = router_input(
+        AccessClass::Internal,
+        provenance,
+        None,
+        &["timeline"],
+        Some("graph:policy"),
+    );
+    input.policies.denied_tools = vec!["policy_tool".into()];
+
+    let candidate = RouterCandidate {
+        decision_plan: DecisionPlan::Tool {
+            plan: ToolPlan {
+                nodes: vec![ToolPlanNode {
+                    id: "t1".into(),
+                    tool_id: "policy_tool".into(),
+                    version: None,
+                    input: json!({}),
+                    timeout_ms: Some(1000),
+                    success_criteria: None,
+                    evidence_policy: None,
+                }],
+                edges: Vec::new(),
+                barrier: ToolPlanBarrier::default(),
+            },
+        },
+        fork: AwarenessFork::ToolPath,
+        priority: 0.7,
+        metadata: json!({
+            "label": "policy_tool",
+            "estimate": { "tokens": 100 }
+        }),
+    };
+
+    let decision = engine
+        .route(input, vec![candidate])
+        .expect("policy fallback");
+
+    assert_eq!(decision.plan.fork, AwarenessFork::Clarify);
+    assert_eq!(
+        decision.plan.explain.degradation_reason.as_deref(),
+        Some("policy_denied")
+    );
+    assert!(
+        decision
+            .rejected
+            .iter()
+            .any(|(code, _)| code == "policy_denied")
+    );
+}
+
+#[test]
+fn budget_exceed_collab_degrades_to_clarify() {
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let planner = RoutePlanner::default();
+    let engine = DfrEngine::new(&router, &planner);
+
+    let provenance = Some(Provenance {
+        source: "team".into(),
+        method: "ops".into(),
+        model: None,
+        content_digest_sha256: None,
+    });
+
+    let mut input = router_input(
+        AccessClass::Internal,
+        provenance,
+        None,
+        &["timeline", "collab"],
+        Some("graph:budget-collab"),
+    );
+    input.budget.max_tokens = 100;
+
+    let collab_candidate = RouterCandidate {
+        decision_plan: DecisionPlan::Collab {
+            plan: CollabPlan {
+                scope: json!({ "channel": "alpha" }),
+                order: Some("round_robin".into()),
+                rounds: Some(2),
+                privacy_mode: Some("shared".into()),
+                barrier: ToolPlanBarrier::default(),
+            },
+        },
+        fork: AwarenessFork::Collab,
+        priority: 0.8,
+        metadata: json!({
+            "label": "collab_heavy",
+            "estimate": {
+                "tokens": 400,
+                "walltime_ms": 2500,
+                "external_cost": 1.2
+            }
+        }),
+    };
+
+    let decision = engine
+        .route(input, vec![collab_candidate])
+        .expect("budget downgrade");
+
+    assert_eq!(decision.plan.fork, AwarenessFork::Clarify);
+    assert_eq!(
+        decision.plan.explain.degradation_reason.as_deref(),
+        Some("budget_tokens")
+    );
+    assert_eq!(
+        decision.decision_path.degradation_reason,
+        Some(AwarenessDegradationReason::BudgetTokens)
+    );
+    assert!(
+        decision
+            .decision_path
+            .rationale
+            .thresholds_hit
+            .iter()
+            .any(|tag| tag == "candidate_degrade:budget_tokens")
+    );
+    assert!(
+        decision
+            .rejected
+            .iter()
+            .any(|(code, fork)| code == "budget_exceeded:budget_tokens" && fork == "collab")
+    );
+    let diag = decision
+        .plan
+        .explain
+        .diagnostics
+        .as_object()
+        .expect("diagnostics");
+    assert_eq!(
+        diag.get("budget_exceeded")
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str()),
+        Some("budget_tokens")
+    );
+}
+
+#[test]
+fn budget_exceed_clarify_degrades_to_self() {
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let planner = RoutePlanner::default();
+    let engine = DfrEngine::new(&router, &planner);
+
+    let provenance = Some(Provenance {
+        source: "ops".into(),
+        method: "console".into(),
+        model: None,
+        content_digest_sha256: None,
+    });
+
+    let mut input = router_input(
+        AccessClass::Internal,
+        provenance,
+        None,
+        &["timeline", "clarify"],
+        Some("graph:budget-clarify"),
+    );
+    input.budget.max_tokens = 50;
+
+    let clarify_candidate = RouterCandidate {
+        decision_plan: DecisionPlan::Clarify {
+            plan: ClarifyPlan {
+                questions: vec![ClarifyQuestion {
+                    q_id: "q1".into(),
+                    text: "need more info?".into(),
+                }],
+                limits: ClarifyLimits {
+                    max_parallel: Some(2),
+                    max_rounds: Some(3),
+                    wait_ms: Some(1500),
+                    total_wait_ms: Some(4000),
+                },
+            },
+        },
+        fork: AwarenessFork::Clarify,
+        priority: 0.7,
+        metadata: json!({
+            "label": "clarify_heavy",
+            "estimate": {
+                "tokens": 220,
+                "walltime_ms": 3000,
+                "external_cost": 0.5
+            }
+        }),
+    };
+
+    let decision = engine
+        .route(input, vec![clarify_candidate])
+        .expect("budget downgrade clarify");
+
+    assert_eq!(decision.plan.fork, AwarenessFork::SelfReason);
+    assert_eq!(
+        decision.plan.explain.degradation_reason.as_deref(),
+        Some("budget_tokens")
+    );
+    assert_eq!(
+        decision.decision_path.degradation_reason,
+        Some(AwarenessDegradationReason::BudgetTokens)
+    );
+    assert!(
+        decision
+            .rejected
+            .iter()
+            .any(|(code, fork)| code == "budget_exceeded:budget_tokens" && fork == "clarify")
+    );
+    let rationale_scores = &decision.decision_path.rationale.scores;
+    assert!(rationale_scores.contains_key("self"));
+}
+
+#[test]
+fn clarify_timeout_maps_to_clarify_exhausted() {
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let planner = RoutePlanner::default();
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "ops".into(),
@@ -313,11 +617,14 @@ fn clarify_timeout_maps_to_clarify_exhausted() {
 
 #[test]
 fn tool_plan_barrier_preserved_and_timeout_mapped() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "bot".into(),
@@ -405,11 +712,14 @@ fn tool_plan_barrier_preserved_and_timeout_mapped() {
 
 #[test]
 fn explain_falls_back_to_context_when_candidate_missing_fields() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "human".into(),
@@ -491,11 +801,14 @@ fn explain_falls_back_to_context_when_candidate_missing_fields() {
 
 #[test]
 fn stickiness_and_oscillation_tracking() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "ops".into(),
@@ -616,11 +929,14 @@ fn stickiness_and_oscillation_tracking() {
 
 #[test]
 fn plan_validation_fallbacks_to_clarify() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "ops".into(),
@@ -711,11 +1027,14 @@ fn plan_validation_fallbacks_to_clarify() {
 
 #[test]
 fn collab_plan_routing() {
-    let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+    let router = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
     let planner = RoutePlanner::default();
-    let authz = AllowAuthz;
-    let quota = AllowQuota;
-    let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+    let engine = DfrEngine::new(&router, &planner);
 
     let provenance = Some(Provenance {
         source: "ops".into(),
@@ -797,11 +1116,14 @@ fn collab_plan_routing() {
 #[test]
 fn explain_digest_is_stable() {
     fn run_once() -> soulseed_agi_dfr::RouterDecision {
-        let router = RouterService::new(CandidateFilter::default(), RoutePlanner::default());
+        let router = RouterService::new(
+            HardGate::default(),
+            CandidateFilter::default(),
+            CandidateScorer::default(),
+            RoutePlanner::default(),
+        );
         let planner = RoutePlanner::default();
-        let authz = AllowAuthz;
-        let quota = AllowQuota;
-        let engine = DfrEngine::new(&router, &planner, &authz, &quota);
+        let engine = DfrEngine::new(&router, &planner);
 
         let provenance = Some(Provenance {
             source: "user".into(),

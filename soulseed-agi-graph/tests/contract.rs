@@ -10,10 +10,10 @@ use soulseed_agi_graph::{
     mock::{Capabilities, MockExecutor},
     plan::{Plan, PlannerConfig},
     planner::Planner,
-    AccessClass, AwarenessDegradationReason, AwarenessEventType, AwarenessFork, ConversationScenario,
-    CorrelationId, CycleId, DialogueEvent, DialogueEventType, EnvelopeHead, EventId, HumanId,
-    InvariantCheck, LiveFilters, LiveSubscribe, MessageId, MessagePointer, SessionId, Snapshot,
-    Subject, SyncPointKind, TenantId, TraceId,
+    scenario_rule, AccessClass, AwarenessDegradationReason, AwarenessEventType, AwarenessFork,
+    ConversationScenario, CorrelationId, CycleId, DialogueEvent, DialogueEventType, EnvelopeHead,
+    EventId, HumanId, InvariantCheck, LiveFilters, LiveSubscribe, MessageId, MessagePointer,
+    SemanticEdgeKind, SessionId, Snapshot, Subject, SyncPointKind, TenantId, TraceId,
 };
 
 fn planner_env(vector_available: bool) -> (Planner, MockExecutor) {
@@ -54,6 +54,7 @@ fn sample_event() -> DialogueEvent {
         time_window: None,
         trigger_event_id: None,
         temporal_pattern_id: None,
+        causal_links: Vec::new(),
         reasoning_trace: None,
         reasoning_confidence: None,
         reasoning_strategy: None,
@@ -68,6 +69,10 @@ fn sample_event() -> DialogueEvent {
         real_time_priority: None,
         notification_targets: None,
         live_stream_id: None,
+        growth_stage: None,
+        processing_latency_ms: None,
+        influence_score: None,
+        community_impact: None,
         evidence_pointer: None,
         content_digest_sha256: None,
         blob_ref: None,
@@ -80,6 +85,8 @@ fn sample_event() -> DialogueEvent {
         tool_result: None,
         self_reflection: None,
         metadata: serde_json::json!({}),
+        #[cfg(feature = "vectors-extra")]
+        vectors: soulseed_agi_core_models::ExtraVectors::default(),
     }
 }
 
@@ -93,7 +100,10 @@ fn awareness_query_base() -> AwarenessQuery {
             barrier_id: None,
             env_mode: None,
             inference_cycle_sequence: Some(1),
-            event_types: Some(vec![AwarenessEventType::AcStarted, AwarenessEventType::IcEnded]),
+            event_types: Some(vec![
+                AwarenessEventType::AcStarted,
+                AwarenessEventType::IcEnded,
+            ]),
             degradation_reasons: None,
             sync_point_kinds: None,
         },
@@ -147,6 +157,12 @@ fn causal_depth_truncates_and_exposes_reason() {
     let (plan, _, degr) = planner.plan_causal(&query).unwrap();
     let resp = exec.execute_causal(plan, &query, degr.clone()).unwrap();
     assert_eq!(resp.degradation_reason, degr.map(|d| d.reason));
+    assert!(!resp.concept_nodes.is_empty());
+    assert!(!resp.semantic_edges.is_empty());
+    assert_eq!(
+        resp.semantic_edges[0].kind,
+        SemanticEdgeKind::EventToConcept
+    );
 }
 
 #[test]
@@ -287,13 +303,18 @@ fn live_plan_clamps_rate_and_validates_scene() {
             priority: Some("high".into()),
         },
         max_rate: Some(999),
+        heartbeat_ms: Some(200),
+        idle_timeout_ms: None,
+        max_buffer: Some(800),
+        backpressure_mode: Some("drop_tail".into()),
     };
-    let (plan, _, _) = planner.plan_live(&subscribe).unwrap();
+    let (plan, _, degr) = planner.plan_live(&subscribe).unwrap();
     if let Plan::Live { rate, .. } = &plan.plan {
         assert_eq!(*rate, 60);
     } else {
         panic!("expected live plan");
     }
+    assert_eq!(degr.map(|d| d.reason), Some("rate_clamped".into()));
 
     let exec = MockExecutor::new(Capabilities {
         allowed_tenants: [1u64].into_iter().collect(),
@@ -310,13 +331,25 @@ fn live_plan_clamps_rate_and_validates_scene() {
 }
 
 #[test]
+fn scenario_rule_provides_expected_event_types() {
+    let rule = scenario_rule(&ConversationScenario::HumanToAi);
+    assert!(rule
+        .primary_event_types
+        .iter()
+        .any(|ty| matches!(ty, DialogueEventType::Message)));
+}
+
+#[test]
 fn awareness_cycle_query_uses_cycle_index() {
     let planner = Planner::new(PlannerConfig::default());
     let query = awareness_query_base();
     let (plan, hash, degr) = planner.plan_awareness(&query).unwrap();
     assert!(hash.starts_with("awareness:tenant=1"));
     assert!(degr.is_none());
-    assert_eq!(plan.indices_used, vec!["ix_awareness_cycle_time".to_string()]);
+    assert_eq!(
+        plan.indices_used,
+        vec!["ix_awareness_cycle_time".to_string()]
+    );
 
     let exec = MockExecutor::new(Capabilities {
         allowed_tenants: [1u64].into_iter().collect(),
@@ -365,7 +398,10 @@ fn awareness_parent_scope_mismatch_rejected() {
     let mut mismatched = query.clone();
     mismatched.filters.collab_scope_id = Some("scope-B".into());
     let err = exec.execute_awareness(plan, &mismatched).unwrap_err();
-    assert!(matches!(err, GraphError::InvalidQuery("collab_scope_mismatch")));
+    assert!(matches!(
+        err,
+        GraphError::InvalidQuery("collab_scope_mismatch")
+    ));
 }
 
 #[test]
@@ -387,8 +423,13 @@ fn awareness_hitl_filters_require_subset() {
     let (plan_mismatch, _, _) = planner.plan_awareness(&query).unwrap();
     let mut mismatch = query.clone();
     mismatch.filters.degradation_reasons = Some(vec![AwarenessDegradationReason::BudgetTokens]);
-    let err = exec.execute_awareness(plan_mismatch, &mismatch).unwrap_err();
-    assert!(matches!(err, GraphError::InvalidQuery("degradation_mismatch")));
+    let err = exec
+        .execute_awareness(plan_mismatch, &mismatch)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        GraphError::InvalidQuery("degradation_mismatch")
+    ));
 }
 
 #[test]
@@ -409,7 +450,10 @@ fn awareness_late_receipt_filters_enforced() {
     let mut mismatch = query.clone();
     mismatch.filters.event_types = Some(vec![AwarenessEventType::Finalized]);
     let err = exec.execute_awareness(plan, &mismatch).unwrap_err();
-    assert!(matches!(err, GraphError::InvalidQuery("event_type_mismatch")));
+    assert!(matches!(
+        err,
+        GraphError::InvalidQuery("event_type_mismatch")
+    ));
 }
 
 #[test]
@@ -462,6 +506,9 @@ fn explain_replay_executor_surfaces_degradation_reason() {
     let resp = exec
         .execute_explain_replay(plan, &query, degradation)
         .unwrap();
-    assert_eq!(resp.degradation_reason.as_deref(), Some("fork_filter_not_supported"));
+    assert_eq!(
+        resp.degradation_reason.as_deref(),
+        Some("fork_filter_not_supported")
+    );
     assert!(resp.segments.is_empty());
 }

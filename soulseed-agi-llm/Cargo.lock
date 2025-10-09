@@ -1835,7 +1835,6 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "rand",
- "reqwest",
  "serde",
  "serde_json",
  "soulseed-agi-core-models",

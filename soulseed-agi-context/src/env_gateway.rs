@@ -17,6 +17,8 @@ fn convert_anchor(anchor: &Anchor) -> EnvAnchor {
         access_class: anchor.access_class,
         provenance: anchor.provenance.clone(),
         schema_v: anchor.schema_v,
+        supersedes: anchor.supersedes,
+        superseded_by: anchor.superseded_by,
     }
 }
 

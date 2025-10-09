@@ -3,6 +3,7 @@ pub mod errors;
 pub mod mock;
 pub mod plan;
 pub mod planner;
+pub mod scenario;
 pub mod types;
 pub mod validate;
 
@@ -11,5 +12,6 @@ pub use errors::*;
 pub use mock::*;
 pub use plan::*;
 pub use planner::*;
+pub use scenario::*;
 pub use types::*;
 pub use validate::*;

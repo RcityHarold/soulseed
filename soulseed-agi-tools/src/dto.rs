@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub use soulseed_agi_core_models::{
     AIId, AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
-    EnvelopeHead, EnvelopeId, EventId, GroupId, HumanId, MessageId, Provenance, SessionId,
-    Snapshot, Subject, SubjectRef, TenantId, TraceId,
+    EnvelopeHead, EnvelopeId, EventId, EvidencePointer, GroupId, HumanId, MessageId, Provenance,
+    SessionId, Snapshot, Subject, SubjectRef, TenantId, TraceId,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -20,6 +20,10 @@ pub struct Anchor {
     pub schema_v: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<ConversationScenario>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<EnvelopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<EnvelopeId>,
 }
 
 fn default_restricted() -> AccessClass {
@@ -109,9 +113,20 @@ impl Anchor {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PlanLineage {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolPlan {
     pub plan_id: String,
     pub anchor: Anchor,
+    pub schema_v: u16,
+    pub lineage: PlanLineage,
     pub subject: Option<Subject>,
     pub items: Vec<ToolCallSpec>,
     pub strategy: OrchestrationStrategy,
@@ -270,6 +285,10 @@ pub struct ToolCallSpec {
     pub cacheable: bool,
     pub stream: bool,
     pub idem_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,21 +344,23 @@ pub struct Budget {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvidencePointer {
-    pub uri: String,
-    pub blob_ref: Option<String>,
-    pub span: Option<(u32, u32)>,
-    pub checksum: String,
-    pub access_policy: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ToolResultSummary {
     pub tool_id: String,
     pub schema_v: u16,
     pub summary: serde_json::Value,
-    pub evidence_pointer: Option<EvidencePointer>,
+    pub evidence_pointer: EvidencePointer,
     pub result_digest: String,
+    #[serde(default)]
+    pub lineage: SummaryLineage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct SummaryLineage {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -352,6 +373,7 @@ pub struct CandidateScore {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExplainPlan {
+    pub schema_v: u16,
     pub candidates: Vec<CandidateScore>,
     pub excluded: Vec<(String, String)>,
     pub weights: serde_json::Value,
@@ -370,6 +392,7 @@ pub struct RunStage {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ExplainRun {
+    pub schema_v: u16,
     pub stages: Vec<RunStage>,
     pub degradation_reason: Option<String>,
     pub indices_used: Option<Vec<String>>,
@@ -407,6 +430,7 @@ pub struct PlannerContext {
     pub anchor: Anchor,
     pub ranked: Vec<CandidateScore>,
     pub policy_digest: Option<String>,
+    pub excluded: Vec<(String, String)>,
     pub scene: String,
     pub capability_hints: Vec<String>,
     pub request_context: serde_json::Value,

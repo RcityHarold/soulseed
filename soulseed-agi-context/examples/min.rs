@@ -5,12 +5,13 @@ use soulseed_agi_context::engine::ContextEngine;
 use soulseed_agi_context::obs::NoopObs;
 use soulseed_agi_context::planner::DeterministicPlanner;
 use soulseed_agi_context::pointer::PointerValidatorMock;
-use soulseed_agi_context::qgate::QualityGateMock;
-use soulseed_agi_context::score::ScoreAdapterSimple;
+use soulseed_agi_context::qgate::QualityGateStrict;
+use soulseed_agi_context::score::ScoreAdapterHalfLife;
 use soulseed_agi_context::store::InMemoryStore;
 use soulseed_agi_context::types::{
-    AccessClass, Anchor, ContextItem, ConversationScenario, EventId, EvidencePointer, FeatureVec,
-    GraphExplain, MessageId, Partition, Provenance, RunInput, SessionId, TenantId,
+    AccessClass, Anchor, ContextItem, ContextItemDigests, ContextItemLinks, ConversationScenario,
+    EventId, EvidencePointer, FeatureVec, GraphExplain, MessageId, Partition, Provenance, RunInput,
+    SessionId, TenantId,
 };
 use soulseed_agi_envctx as envctx;
 use time::OffsetDateTime;
@@ -27,6 +28,8 @@ fn build_env_context(anchor: &Anchor) -> envctx::EnvironmentContext {
         access_class: anchor.access_class,
         provenance: anchor.provenance.clone(),
         schema_v: anchor.schema_v,
+        supersedes: anchor.supersedes,
+        superseded_by: anchor.superseded_by,
     };
 
     let mut ctx = envctx::EnvironmentContext {
@@ -41,10 +44,7 @@ fn build_env_context(anchor: &Anchor) -> envctx::EnvironmentContext {
                 goal: "demo_goal".into(),
                 constraints: vec!["latency<=250".into()],
             },
-            latency_window: envctx::LatencyWindow {
-                p50_ms: 80,
-                p95_ms: 210,
-            },
+            latency_window: envctx::LatencyWindow::new(80, 210),
             risk_flag: envctx::RiskLevel::Low,
         },
         external_systems: envctx::ExternalSystems {
@@ -92,10 +92,21 @@ fn build_env_context(anchor: &Anchor) -> envctx::EnvironmentContext {
                 digest: "policy:v1".into(),
                 at: Some(OffsetDateTime::now_utc()),
             },
+            tool_catalog_snapshot: Some(envctx::VersionPointer {
+                digest: "tools:v1".into(),
+                at: Some(OffsetDateTime::now_utc()),
+            }),
+            authz_snapshot: Some(envctx::VersionPointer {
+                digest: "authz:v1".into(),
+                at: Some(OffsetDateTime::now_utc()),
+            }),
+            quota_snapshot: None,
             observe_watermark: None,
+            monitoring_snapshot: None,
         },
         context_digest: String::new(),
         degradation_reason: None,
+        lite_mode: false,
     };
     ctx.context_digest = envctx::compute_digest(&ctx).expect("digest");
     ctx
@@ -118,14 +129,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         schema_v: 1,
         scenario: Some(ConversationScenario::HumanToAi),
+        supersedes: None,
+        superseded_by: None,
     };
 
     let item = ContextItem {
         anchor: anchor.clone(),
         id: "ci-1".into(),
+        partition: Partition::P4Dialogue,
         partition_hint: Some(Partition::P4Dialogue),
         source_event_id: EventId(100),
         source_message_id: Some(MessageId(55)),
+        observed_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({"text": "Hello world"}),
         tokens: 150,
         features: FeatureVec {
@@ -139,13 +154,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             risk: 0.2,
         },
         policy_tags: json!({"scene": "chat"}),
-        evidence: Some(EvidencePointer {
-            uri: "s3://demo/context/ci-1.json".into(),
-            blob_ref: None,
-            span: Some((0, 10)),
-            checksum: "sha256:abcdef".into(),
-            access_policy: "restricted".into(),
-        }),
+        typ: Some("dialogue".into()),
+        digests: ContextItemDigests {
+            content: Some("sha256:dialogue".into()),
+            ..Default::default()
+        },
+        links: ContextItemLinks {
+            evidence_ptrs: vec![EvidencePointer {
+                uri: "s3://demo/context/ci-1.json".into(),
+                digest_sha256: Some("sha256:abcdef".into()),
+                media_type: Some("application/json".into()),
+                blob_ref: None,
+                span: Some((0, 10)),
+                access_policy: Some("restricted".into()),
+            }],
+            supersedes: None,
+        },
     };
 
     let env_context = build_env_context(&anchor);
@@ -157,10 +181,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.plan_seed = 42;
 
     let engine = ContextEngine {
-        scorer: &ScoreAdapterSimple,
+        scorer: &ScoreAdapterHalfLife,
         planner: &DeterministicPlanner,
         compressor: &CompressorMock,
-        qgate: &QualityGateMock::default(),
+        qgate: &QualityGateStrict::default(),
         pointer: &PointerValidatorMock,
         store: &InMemoryStore::default(),
         obs: &NoopObs,
@@ -177,6 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             query_hash: Some("timeline:tenant:42".into()),
             degradation_reason: Some("graph_sparse_only".into()),
         }),
+        previous_manifest: None,
     })?;
 
     println!("plan_id: {}", output.plan.plan_id);

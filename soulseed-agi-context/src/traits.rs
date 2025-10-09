@@ -2,7 +2,8 @@ use crate::{
     config::ContextConfig,
     errors::{ContextError, QualityFailure},
     types::{
-        Anchor, ContextItem, ContextScore, PlanAction, RunInput, RunOutput, ScoredItem, SummaryUnit,
+        Anchor, ContextEvent, ContextItem, ContextScore, PlanAction, RedactionReport, RunInput,
+        RunOutput, ScoredItem, SummaryUnit,
     },
 };
 
@@ -29,7 +30,7 @@ pub trait Compressor: Send + Sync {
 }
 
 pub trait QualityGate: Send + Sync {
-    fn evaluate(&self, summary: &SummaryUnit) -> Result<(), QualityFailure>;
+    fn evaluate(&self, summary: &SummaryUnit, cfg: &ContextConfig) -> Result<(), QualityFailure>;
 }
 
 pub trait PointerValidator: Send + Sync {
@@ -40,6 +41,8 @@ pub trait ContextStore: Send + Sync {
     fn record_plan(&self, plan: &crate::types::CompressionPlan);
     fn record_report(&self, report: &crate::types::CompressionReport);
     fn record_summary(&self, summary: &SummaryUnit);
+    fn record_redaction(&self, report: &RedactionReport);
+    fn record_event(&self, event: &ContextEvent);
 }
 
 pub trait Observability: Send + Sync {

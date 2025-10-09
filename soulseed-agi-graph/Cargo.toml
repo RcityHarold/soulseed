@@ -13,6 +13,7 @@ path = "src/lib.rs"
 default = ["strict-privacy", "uuidv7"]
 strict-privacy = ["soulseed-agi-core-models/strict-privacy"]
 uuidv7 = ["soulseed-agi-core-models/uuidv7"]
+vectors-extra = ["soulseed-agi-core-models/vectors-extra"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

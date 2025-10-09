@@ -1,11 +1,13 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use soulseed_agi_envctx::dto::SourceVersions;
 
 pub use soulseed_agi_core_models::{
-    AIId, AccessClass, ConversationScenario, EnvelopeId, EventId, GroupId, HumanId, MessageId,
-    Provenance, SessionId, TenantId,
+    AIId, AccessClass, ConversationScenario, DeltaPatch, EnvelopeId, EventId, EvidencePointer,
+    GroupId, HumanId, MessageId, Provenance, SessionId, TenantId,
 };
 
 pub type EnvContext = soulseed_agi_envctx::EnvironmentContext;
@@ -24,10 +26,18 @@ pub struct Anchor {
     pub schema_v: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scenario: Option<ConversationScenario>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<EnvelopeId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<EnvelopeId>,
 }
 
 fn default_restricted() -> AccessClass {
     AccessClass::Restricted
+}
+
+fn default_partition_dialogue() -> Partition {
+    Partition::P4Dialogue
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -45,15 +55,6 @@ pub enum Level {
     L1,
     L2,
     L3,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct EvidencePointer {
-    pub uri: String,
-    pub blob_ref: Option<String>,
-    pub span: Option<(u32, u32)>,
-    pub checksum: String,
-    pub access_policy: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -86,14 +87,46 @@ impl FeatureVec {
 pub struct ContextItem {
     pub anchor: Anchor,
     pub id: String,
+    #[serde(default = "default_partition_dialogue")]
+    pub partition: Partition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_hint: Option<Partition>,
     pub source_event_id: EventId,
     pub source_message_id: Option<MessageId>,
+    pub observed_at: OffsetDateTime,
     pub content: serde_json::Value,
     pub tokens: u32,
     pub features: FeatureVec,
     pub policy_tags: serde_json::Value,
-    pub evidence: Option<EvidencePointer>,
+    #[serde(
+        rename = "typ",
+        alias = "item_type",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub typ: Option<String>,
+    #[serde(default)]
+    pub digests: ContextItemDigests,
+    #[serde(default)]
+    pub links: ContextItemLinks,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ContextItemDigests {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct ContextItemLinks {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ptrs: Vec<EvidencePointer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -103,6 +136,7 @@ pub struct ContextScore {
     pub compressibility: f32,
     pub final_score: f32,
     pub partition_affinity: Partition,
+    pub utility_density: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -123,11 +157,14 @@ pub struct QualityStats {
 pub struct Lineage {
     pub version: u32,
     pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SummaryUnit {
     pub anchor: Anchor,
+    pub schema_v: u16,
     pub su_id: String,
     pub from_ids: Vec<String>,
     pub level: Level,
@@ -136,6 +173,8 @@ pub struct SummaryUnit {
     pub quality: QualityStats,
     pub lineage: Lineage,
     pub evidence: Option<EvidencePointer>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -154,6 +193,22 @@ pub struct PlanItem {
     pub base_tokens: u32,
     pub action: PlanAction,
     pub tokens_after: u32,
+    pub estimated_tokens_saved: i32,
+    pub utility_delta: f32,
+    #[serde(default)]
+    pub trace: PlanDecisionTrace,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PlanDecisionTrace {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_keep: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_drop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_compress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_consent: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -173,31 +228,80 @@ pub struct BudgetSummary {
 pub struct CompressionPlan {
     pub plan_id: String,
     pub anchor: Anchor,
+    pub schema_v: u16,
+    pub lineage: PlanLineage,
     pub items: Vec<PlanItem>,
     pub partitions: Vec<PartitionUsage>,
     pub budget: BudgetSummary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PlanLineage {
+    pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CompressionReport {
     pub anchor: Anchor,
+    pub schema_v: u16,
     pub plan_id: String,
     pub tokens_saved: i64,
     pub rolled_back: Vec<(String, String)>,
     pub quality_stats: Vec<(String, QualityStats)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct BundleScoreStats {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub factors: BTreeMap<String, f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BundleItem {
     pub ci_id: String,
+    pub partition: Partition,
     pub summary_level: Option<Level>,
     pub tokens: u32,
+    pub score_scaled: i32,
+    pub ts_ms: i64,
+    #[serde(default)]
+    pub digests: ContextItemDigests,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typ: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why_included: Option<String>,
+    #[serde(default)]
+    pub score_stats: BundleScoreStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_ptrs: Vec<EvidencePointer>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct BundleSegment {
     pub partition: Partition,
     pub items: Vec<BundleItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+pub struct PromptBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub system: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instructions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dialogue: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -215,16 +319,22 @@ pub struct ExplainBundle {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ContextBundle {
     pub anchor: Anchor,
+    pub schema_v: u16,
+    pub version: u32,
     pub segments: Vec<BundleSegment>,
     pub explain: ExplainBundle,
     pub budget: BudgetSummary,
+    #[serde(default)]
+    pub prompt: PromptBundle,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EnvironmentSnapshotEvent {
     pub anchor: Anchor,
+    pub schema_v: u16,
     pub context_digest: String,
     pub snapshot_digest: String,
+    pub lite_mode: bool,
     pub environment: String,
     pub region: String,
     pub scene: Option<String>,
@@ -253,6 +363,7 @@ pub struct RedactionEntry {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RedactionReport {
     pub anchor: Anchor,
+    pub schema_v: u16,
     pub manifest_digest: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<RedactionEntry>,
@@ -273,6 +384,7 @@ pub struct RunInput {
     pub config: crate::config::ContextConfig,
     pub items: Vec<ContextItem>,
     pub graph_explain: Option<GraphExplain>,
+    pub previous_manifest: Option<crate::assembly::ContextManifest>,
 }
 
 #[derive(Clone, Debug)]
@@ -280,7 +392,47 @@ pub struct RunOutput {
     pub plan: CompressionPlan,
     pub report: CompressionReport,
     pub bundle: ContextBundle,
+    pub delta_patch: DeltaPatch,
     pub manifest: crate::assembly::ContextManifest,
     pub env_snapshot: EnvironmentSnapshotEvent,
     pub redaction: RedactionReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum ContextEvent {
+    ContextBuilt {
+        anchor: Anchor,
+        schema_v: u16,
+        plan_id: String,
+        manifest_digest: String,
+        at: OffsetDateTime,
+    },
+    DeltaMerged {
+        anchor: Anchor,
+        schema_v: u16,
+        patch_id: String,
+        manifest_digest: String,
+        at: OffsetDateTime,
+    },
+    ContextCompacted {
+        anchor: Anchor,
+        schema_v: u16,
+        from_version: u32,
+        to_version: u32,
+        manifest_digest: String,
+        at: OffsetDateTime,
+    },
+    RedactionReported {
+        anchor: Anchor,
+        schema_v: u16,
+        manifest_digest: String,
+        at: OffsetDateTime,
+    },
+    PromptIssued {
+        anchor: Anchor,
+        schema_v: u16,
+        manifest_digest: String,
+        prompt_digest: String,
+        at: OffsetDateTime,
+    },
 }

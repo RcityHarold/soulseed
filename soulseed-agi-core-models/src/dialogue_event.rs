@@ -1,7 +1,9 @@
+#[cfg(feature = "vectors-extra")]
+use crate::vectors_ext::ExtraVectors;
 use crate::{
-    AccessClass, ConversationScenario, DialogueEventType, EmbeddingMeta, EnvelopeHead, EventId,
-    MessageId, ModelError, Provenance, RealTimePriority, SessionId, Snapshot, Subject, SubjectRef,
-    TenantId,
+    common::EvidencePointer, AccessClass, ConversationScenario, DialogueEventType, EmbeddingMeta,
+    EnvelopeHead, EventId, MessageId, ModelError, Provenance, RealTimePriority, SessionId,
+    Snapshot, Subject, SubjectRef, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -30,6 +32,8 @@ pub struct DialogueEvent {
     pub trigger_event_id: Option<EventId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_pattern_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causal_links: Vec<CausalLink>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_trace: Option<String>,
@@ -61,9 +65,17 @@ pub struct DialogueEvent {
     pub notification_targets: Option<Vec<SubjectRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_stream_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub growth_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_latency_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub influence_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub community_impact: Option<f32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_pointer: Option<String>,
+    pub evidence_pointer: Option<EvidencePointer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_digest_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +96,9 @@ pub struct DialogueEvent {
 
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
+    #[cfg(feature = "vectors-extra")]
+    #[serde(default)]
+    pub vectors: ExtraVectors,
 }
 
 impl DialogueEvent {
@@ -147,6 +162,16 @@ impl DialogueEvent {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CausalLink {
+    pub from_event: EventId,
+    pub relation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

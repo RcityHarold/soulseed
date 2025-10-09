@@ -35,10 +35,7 @@ impl EnvironmentDataProvider for FakeProvider {
                 goal: "answer question".into(),
                 constraints: vec!["token<=800".into()],
             },
-            latency_window: LatencyWindow {
-                p50_ms: 80,
-                p95_ms: 220,
-            },
+            latency_window: LatencyWindow::new(80, 220),
             risk_flag: RiskLevel::Low,
         })
     }
@@ -114,7 +111,17 @@ impl EnvironmentDataProvider for FakeProvider {
                 digest: "policy:v1".into(),
                 at: Some(OffsetDateTime::now_utc()),
             },
+            tool_catalog_snapshot: Some(VersionPointer {
+                digest: "tools:v1".into(),
+                at: Some(OffsetDateTime::now_utc()),
+            }),
+            authz_snapshot: Some(VersionPointer {
+                digest: "authz:v1".into(),
+                at: Some(OffsetDateTime::now_utc()),
+            }),
+            quota_snapshot: None,
             observe_watermark: None,
+            monitoring_snapshot: None,
         })
     }
 }
@@ -149,6 +156,8 @@ fn anchor() -> Anchor {
             content_digest_sha256: None,
         }),
         schema_v: 1,
+        supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -160,6 +169,7 @@ fn assemble_success() {
     let ctx = engine.assemble(anchor()).expect("envctx");
     assert!(ctx.context_digest.starts_with("sha256:"));
     assert!(ctx.degradation_reason.is_none());
+    assert!(!ctx.lite_mode);
     assert!(reporter.entries.lock().unwrap().is_empty());
 }
 
@@ -171,6 +181,7 @@ fn assemble_with_external_fallback() {
     let ctx = engine.assemble(anchor()).expect("envctx fallback");
     assert_eq!(ctx.external_systems.environment, "unknown");
     assert!(ctx.degradation_reason.is_some());
+    assert!(ctx.lite_mode);
     let entries = reporter.entries.lock().unwrap();
     assert_eq!(entries[0].0, "envctx.external_systems");
 }
@@ -184,4 +195,19 @@ fn reject_invalid_anchor() {
     bad.config_snapshot_hash.clear();
     let err = engine.assemble(bad).unwrap_err();
     assert!(matches!(err, EnvCtxError::Missing("config_snapshot_hash")));
+}
+
+#[test]
+fn snapshot_event_contains_pointer() {
+    let provider = FakeProvider::new();
+    let reporter = CollectingReporter::default();
+    let engine = EnvironmentEngine::new(provider, reporter);
+    let ctx = engine.assemble(anchor()).expect("envctx snapshot");
+    let event = build_snapshot_event(&ctx);
+    assert_eq!(event.anchor.envelope_id, ctx.anchor.envelope_id);
+    assert_eq!(event.context_digest, ctx.context_digest);
+    assert_eq!(event.snapshot_digest, ctx.context_digest);
+    assert!(!event.evidence.is_empty());
+    assert_eq!(event.evidence[0].uri, format!("env://snapshot/{}", ctx.anchor.envelope_id));
+    assert_eq!(event.lite_mode, ctx.lite_mode);
 }

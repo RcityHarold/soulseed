@@ -26,6 +26,10 @@ pub struct BudgetSnapshot {
     pub tokens_spent: u32,
     pub walltime_ms_allowed: u64,
     pub walltime_ms_used: u64,
+    #[serde(default)]
+    pub external_cost_allowed: f32,
+    #[serde(default)]
+    pub external_cost_spent: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +41,10 @@ pub struct CycleSchedule {
     pub llm_plan: Option<Value>,
     pub budget: BudgetSnapshot,
     pub created_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_events: Vec<AwarenessEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,6 +54,8 @@ pub struct CycleRequest {
     pub tool_plan: Option<ToolPlan>,
     pub llm_plan: Option<Value>,
     pub budget: BudgetSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_explain: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,8 +81,14 @@ pub struct SyncPointReport {
     pub metrics: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injections: Vec<InjectionDecision>,
+    pub applied: u32,
+    pub missing: u32,
+    pub ignored: u32,
+    pub budget_snapshot: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta_patch_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +106,8 @@ pub struct CycleEmission {
     pub awareness_events: Vec<AwarenessEvent>,
     pub budget: BudgetSnapshot,
     pub anchor: AwarenessAnchor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +115,8 @@ pub struct ScheduleOutcome {
     pub accepted: bool,
     pub reason: Option<String>,
     pub cycle: Option<CycleSchedule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awareness_events: Vec<AwarenessEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +127,8 @@ pub struct AggregationOutcome {
     pub delta_patch: Option<DeltaPatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injections: Vec<InjectionDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +137,8 @@ pub struct BudgetDecision {
     pub allowed: bool,
     pub reason: Option<String>,
     pub snapshot: BudgetSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

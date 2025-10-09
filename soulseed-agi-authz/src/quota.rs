@@ -147,6 +147,19 @@ impl QuotaClient for ScenarioQuotaClient {
             guard.insert(idem);
         }
 
+        if request
+            .context
+            .get("requires_consent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return QuotaDecision {
+                effect: Effect::AskConsent,
+                reason: "consent_required".into(),
+                detail: json!({"reason": "consent_required"}),
+            };
+        }
+
         if Self::is_self_reflection(&request.resource, &request.action, &request.context) {
             return QuotaDecision {
                 effect: Effect::Allow,
