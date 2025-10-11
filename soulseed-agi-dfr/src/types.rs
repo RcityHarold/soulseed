@@ -2,13 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use soulseed_agi_context::types::ContextBundle;
 use soulseed_agi_core_models::{
-    ConversationScenario, CycleId,
+    ConversationScenario, AwarenessCycleId,
     awareness::{
         AwarenessAnchor, AwarenessDegradationReason, AwarenessFork, DecisionPath, DecisionPlan,
     },
 };
 use time::OffsetDateTime;
-use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssessmentEntry {
@@ -278,7 +277,7 @@ pub struct RouteExplain {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RoutePlan {
-    pub cycle_id: CycleId,
+    pub cycle_id: AwarenessCycleId,
     pub anchor: AwarenessAnchor,
     pub fork: AwarenessFork,
     pub decision_plan: DecisionPlan,
@@ -306,8 +305,8 @@ pub fn fork_key(fork: AwarenessFork) -> &'static str {
     }
 }
 
-pub fn new_cycle_id() -> CycleId {
-    CycleId(Uuid::now_v7().as_u128() as u64)
+pub fn new_cycle_id() -> AwarenessCycleId {
+    AwarenessCycleId::generate()
 }
 
 pub fn map_degradation(reason: &str) -> Option<AwarenessDegradationReason> {
@@ -322,9 +321,9 @@ pub fn map_degradation(reason: &str) -> Option<AwarenessDegradationReason> {
             "clarify_exhausted" => Some(AwarenessDegradationReason::ClarifyExhausted),
             "clarify_timeout" => Some(AwarenessDegradationReason::ClarifyExhausted),
             "clarify_conflict" => Some(AwarenessDegradationReason::ClarifyExhausted),
-            "timeout_fallback" => Some(AwarenessDegradationReason::ClarifyExhausted),
-            "requires_follow_up" => Some(AwarenessDegradationReason::ClarifyExhausted),
-            "llm_timeout_recovered" => Some(AwarenessDegradationReason::ClarifyExhausted),
+            "timeout_fallback" => Some(AwarenessDegradationReason::BudgetWalltime),
+            "requires_follow_up" => None,
+            "llm_timeout_recovered" => Some(AwarenessDegradationReason::BudgetWalltime),
             "graph_degraded" => Some(AwarenessDegradationReason::GraphDegraded),
             "stale_fact" => Some(AwarenessDegradationReason::GraphDegraded),
             "envctx_degraded" => Some(AwarenessDegradationReason::EnvctxDegraded),

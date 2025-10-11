@@ -55,7 +55,7 @@ impl ScenarioQuotaClient {
         request
             .idem_key
             .clone()
-            .unwrap_or_else(|| format!("{}:{}", request.tenant_id.0, request.envelope_id))
+            .unwrap_or_else(|| format!("{}:{}", request.tenant_id.as_u64(), request.envelope_id))
     }
 
     fn parse_dialogue<'a>(urn: &'a ResourceUrn) -> Option<(u64, Option<&'a str>, Vec<&'a str>)> {

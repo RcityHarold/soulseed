@@ -60,7 +60,7 @@ impl ResourceUrn {
     }
 
     pub fn dialogue_session(session_id: SessionId) -> Self {
-        Self(format!("urn:soulseed:dialogue:session:{}", session_id.0))
+        Self(format!("urn:soulseed:dialogue:session:{}", session_id.as_u64()))
     }
 
     pub fn dialogue_scenario(
@@ -117,7 +117,7 @@ impl ResourceUrn {
     pub fn envctx_snapshot(tenant_id: TenantId) -> Self {
         Self(format!(
             "urn:soulseed:envctx:tenant:{}:snapshot",
-            tenant_id.0
+            tenant_id.as_u64()
         ))
     }
 
@@ -126,7 +126,7 @@ impl ResourceUrn {
     }
 
     pub fn ace_cycle(tenant_id: TenantId) -> Self {
-        Self(format!("urn:soulseed:ace:tenant:{}:cycle", tenant_id.0))
+        Self(format!("urn:soulseed:ace:tenant:{}:cycle", tenant_id.as_u64()))
     }
 
     pub fn ace_cycle_pattern() -> Self {
@@ -134,7 +134,7 @@ impl ResourceUrn {
     }
 
     pub fn dfr_router(tenant_id: TenantId) -> Self {
-        Self(format!("urn:soulseed:dfr:tenant:{}:router", tenant_id.0))
+        Self(format!("urn:soulseed:dfr:tenant:{}:router", tenant_id.as_u64()))
     }
 
     pub fn dfr_router_pattern() -> Self {
@@ -144,7 +144,7 @@ impl ResourceUrn {
     pub fn context_assembly(tenant_id: TenantId) -> Self {
         Self(format!(
             "urn:soulseed:context:tenant:{}:assembly",
-            tenant_id.0
+            tenant_id.as_u64()
         ))
     }
 
@@ -153,7 +153,7 @@ impl ResourceUrn {
     }
 
     pub fn hitl_queue(tenant_id: TenantId) -> Self {
-        Self(format!("urn:soulseed:hitl:tenant:{}:queue", tenant_id.0))
+        Self(format!("urn:soulseed:hitl:tenant:{}:queue", tenant_id.as_u64()))
     }
 
     pub fn hitl_queue_pattern() -> Self {
@@ -161,7 +161,7 @@ impl ResourceUrn {
     }
 
     pub fn llm_router(tenant_id: TenantId) -> Self {
-        Self(format!("urn:soulseed:llm:tenant:{}:router", tenant_id.0))
+        Self(format!("urn:soulseed:llm:tenant:{}:router", tenant_id.as_u64()))
     }
 
     pub fn llm_router_pattern() -> Self {

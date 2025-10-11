@@ -1,44 +1,83 @@
-use crate::dto::{LlmInput, LlmPlan, LlmResult, ModelProfile, PromptBundle};
+use crate::dto::{
+    ExecutionContext, LlmExecutionIntent, LlmInput, LlmPlan, LlmResult, ModelProfile, PromptBundle,
+    ReasoningVisibility,
+};
 use crate::errors::EngineError;
-use crate::tw_client::ThinWaistClient;
-
-#[derive(Clone, Debug)]
-pub struct ExecutionOutcome {
-    pub result: LlmResult,
-    pub degradation_chain: Option<String>,
-    pub indices_used: Option<Vec<String>>,
-    pub query_hash: Option<String>,
-}
+use time::OffsetDateTime;
+use uuid::Uuid;
 
 #[derive(Clone, Default)]
 pub struct LlmOrchestrator;
 
 impl LlmOrchestrator {
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute<C: ThinWaistClient>(
+    pub fn prepare_intent(
         &self,
-        client: &C,
         input: &LlmInput,
         plan: &LlmPlan,
         model: &ModelProfile,
         prompt: &PromptBundle,
-    ) -> Result<ExecutionOutcome, EngineError> {
-        let _ = plan;
-        let result = client.execute(&input.anchor, prompt, model)?;
-        client.reconcile(&input.anchor, &result)?;
+    ) -> LlmExecutionIntent {
+        LlmExecutionIntent {
+            intent_id: format!("llm-intent-{}", Uuid::now_v7()),
+            anchor: plan.anchor.clone(),
+            schema_v: plan.schema_v,
+            lineage: plan.lineage.clone(),
+            model: model.clone(),
+            prompt: prompt.clone(),
+            privacy: input.privacy.clone(),
+            degrade_hint: input.degrade_hint.clone(),
+            tool_indices: input.tool_indices.clone(),
+            tool_query_hash: input.tool_query_hash.clone(),
+            issued_at: OffsetDateTime::now_utc(),
+        }
+    }
 
-        let degradation_chain = match (
-            input.degrade_hint.as_ref(),
-            result.degradation_reason.as_ref(),
-        ) {
-            (Some(tool), Some(llm)) => Some(format!("{}|{}", tool, llm)),
-            (Some(tool), None) => Some(tool.clone()),
-            (None, Some(llm)) => Some(llm.clone()),
-            (None, None) => None,
+    pub fn compose_context(
+        &self,
+        intent: &LlmExecutionIntent,
+        mut result: LlmResult,
+    ) -> Result<ExecutionContext, EngineError> {
+        if result.evidence_pointer.is_none() {
+            return Err(EngineError::MissingEvidencePointer);
+        }
+
+        let ticket_provided = intent
+            .privacy
+            .ticket_id
+            .as_ref()
+            .map(|id| !id.trim().is_empty())
+            .unwrap_or(false);
+        let allow_sensitive = intent.privacy.allow_sensitive || ticket_provided;
+        let can_keep_full = match result.reasoning_visibility {
+            ReasoningVisibility::Full => allow_sensitive,
+            ReasoningVisibility::TicketRequired => ticket_provided,
+            _ => false,
         };
 
-        let mut merged_indices = input.tool_indices.clone().unwrap_or_default();
-        if let Some(llm_indices) = result.indices_used.clone() {
+        if !can_keep_full {
+            if result.summary.is_none() {
+                result.summary = Some(result.completion.clone());
+            }
+            result.completion = result.summary.clone().unwrap_or_default();
+            result.reasoning.clear();
+            result.reasoning_visibility = ReasoningVisibility::SummaryOnly;
+            result.redacted = true;
+        } else {
+            result.redacted = false;
+        }
+
+        let degradation_chain = match (
+            intent.degrade_hint.as_ref(),
+            result.degradation_reason.as_ref(),
+        ) {
+            (Some(tool), Some(llm)) if tool != llm => Some(format!("{tool}|{llm}")),
+            (Some(tool), _) => Some(tool.clone()),
+            (None, Some(llm)) => Some(llm.clone()),
+            _ => None,
+        };
+
+        let mut merged_indices = intent.tool_indices.clone().unwrap_or_default();
+        if let Some(llm_indices) = result.indices_used.take() {
             for idx in llm_indices {
                 if !merged_indices.iter().any(|existing| existing == &idx) {
                     merged_indices.push(idx);
@@ -51,15 +90,18 @@ impl LlmOrchestrator {
             Some(merged_indices)
         };
 
-        let query_hash = match (input.tool_query_hash.clone(), result.query_hash.clone()) {
-            (Some(tool), Some(llm)) if tool != llm => Some(format!("{}|{}", tool, llm)),
+        let query_hash = match (intent.tool_query_hash.clone(), result.query_hash.take()) {
+            (Some(tool), Some(llm)) if tool != llm => Some(format!("{tool}|{llm}")),
             (Some(tool), Some(_)) => Some(tool),
             (Some(tool), None) => Some(tool),
             (None, Some(llm)) => Some(llm),
-            (None, None) => None,
+            _ => None,
         };
 
-        Ok(ExecutionOutcome {
+        result.lineage = intent.lineage.clone();
+
+        Ok(ExecutionContext {
+            intent: intent.clone(),
             result,
             degradation_chain,
             indices_used,

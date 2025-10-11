@@ -349,9 +349,11 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "sha2",
  "soulseed-agi-authz",
  "soulseed-agi-context",
  "soulseed-agi-core-models",
+ "soulseed-agi-dfr",
  "soulseed-agi-tools",
  "thiserror",
  "time",
@@ -374,8 +376,10 @@ dependencies = [
 name = "soulseed-agi-context"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "soulseed-agi-core-models",
  "soulseed-agi-envctx",
  "thiserror",
@@ -390,6 +394,22 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "soulseed-agi-dfr"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "soulseed-agi-authz",
+ "soulseed-agi-context",
+ "soulseed-agi-core-models",
+ "soulseed-agi-tools",
  "thiserror",
  "time",
  "uuid",

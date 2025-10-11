@@ -20,10 +20,10 @@ fn mk_snapshot() -> Snapshot {
 
 fn mk_base_event() -> DialogueEvent {
     DialogueEvent {
-        tenant_id: TenantId::new(1),
-        event_id: EventId::new(1),
-        session_id: SessionId::new(1),
-        subject: Subject::Human(HumanId::new(1)),
+        tenant_id: TenantId::from_raw_unchecked(1),
+        event_id: EventId::from_raw_unchecked(1),
+        session_id: SessionId::from_raw_unchecked(1),
+        subject: Subject::Human(HumanId::from_raw_unchecked(1)),
         participants: vec![],
         head: mk_head(),
         snapshot: Snapshot {
@@ -73,7 +73,7 @@ fn mk_base_event() -> DialogueEvent {
         supersedes: None,
         superseded_by: None,
         message_ref: Some(MessagePointer {
-            message_id: MessageId::new(1),
+            message_id: MessageId::from_raw_unchecked(1),
         }),
         tool_invocation: None,
         tool_result: None,
@@ -86,11 +86,11 @@ fn mk_base_event() -> DialogueEvent {
 
 fn mk_awareness_anchor() -> AwarenessAnchor {
     AwarenessAnchor {
-        tenant_id: TenantId::new(9),
+        tenant_id: TenantId::from_raw_unchecked(9),
         envelope_id: uuid::Uuid::nil(),
         config_snapshot_hash: "cfg-anchor".into(),
         config_snapshot_version: 1,
-        session_id: Some(SessionId::new(3)),
+        session_id: Some(SessionId::from_raw_unchecked(3)),
         sequence_number: Some(1),
         access_class: AccessClass::Internal,
         provenance: None,
@@ -104,10 +104,10 @@ fn mk_awareness_event(
 ) -> AwarenessEvent {
     AwarenessEvent {
         anchor: mk_awareness_anchor(),
-        event_id: EventId::new(700 + event_type as u64),
+        event_id: EventId::from_raw_unchecked(700 + event_type as u64),
         event_type,
         occurred_at_ms: 99,
-        awareness_cycle_id: CycleId::new(321),
+        awareness_cycle_id: AwarenessCycleId::from_raw_unchecked(321),
         parent_cycle_id: None,
         collab_scope_id: None,
         barrier_id: None,
@@ -115,6 +115,82 @@ fn mk_awareness_event(
         inference_cycle_sequence: 1,
         degradation_reason: None,
         payload,
+    }
+}
+
+fn mk_human_profile() -> HumanProfile {
+    HumanProfile {
+        tenant_id: TenantId::from_raw_unchecked(1),
+        user_id: HumanId::from_raw_unchecked(1),
+        access_class: AccessClass::Restricted,
+        provenance: Some(Provenance {
+            source: "seed".into(),
+            method: "import".into(),
+            model: None,
+            content_digest_sha256: None,
+        }),
+        username: "user-1".into(),
+        nickname: "nickname".into(),
+        avatar_url: None,
+        gender: None,
+        age: None,
+        region: None,
+        race: None,
+        religion: None,
+        profession: None,
+        industry: None,
+        phone: None,
+        signature: None,
+        qr_code: None,
+        interests: vec![],
+        extras: serde_json::Value::Null,
+        membership_level: MembershipLevel::Free,
+        subscription_status: SubscriptionStatus::None,
+        subscription_renew_at: None,
+        quotas: None,
+        point_balance: None,
+        light_coin_balance: None,
+        voucher_inventory: None,
+        relationship_status: None,
+        last_active_at: None,
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
+    }
+}
+
+fn mk_ai_profile() -> AIProfile {
+    AIProfile {
+        tenant_id: TenantId::from_raw_unchecked(1),
+        ai_id: AIId::from_raw_unchecked(1),
+        access_class: AccessClass::Restricted,
+        provenance: Some(Provenance {
+            source: "seed".into(),
+            method: "synthesis".into(),
+            model: None,
+            content_digest_sha256: None,
+        }),
+        social_name: None,
+        origin_name: None,
+        source_name: None,
+        core_tags: vec![],
+        core_personality: None,
+        mission: None,
+        values: None,
+        self_narrative: None,
+        meaning_narrative: None,
+        capabilities: None,
+        relationships_summary: None,
+        external_identity: None,
+        soul_signature: None,
+        ai_birthday: None,
+        awakener_id: None,
+        value_frequency: None,
+        source_frequency_code: None,
+        gender_frequency: None,
+        soul_state: SoulState::Active,
+        extras: serde_json::Value::Null,
+        #[cfg(feature = "vectors-extra")]
+        vectors: ExtraVectors::default(),
     }
 }
 
@@ -146,7 +222,7 @@ fn awareness_event_contract_samples() {
         AwarenessEventType::AcStarted,
         json!({"routing_seed": 42, "ic_start": 1}),
     );
-    ac_started.parent_cycle_id = Some(CycleId::new(123));
+    ac_started.parent_cycle_id = Some(AwarenessCycleId::from_raw_unchecked(123));
 
     let mut ic_ended = mk_awareness_event(
         AwarenessEventType::IcEnded,
@@ -194,7 +270,7 @@ fn awareness_event_contract_samples() {
         AwarenessEventType::LateReceiptObserved,
         json!({"related_event_id": 512, "received_at_ms": 120, "action": "audit"}),
     );
-    late_receipt.parent_cycle_id = Some(CycleId::new(111));
+    late_receipt.parent_cycle_id = Some(AwarenessCycleId::from_raw_unchecked(111));
 
     for evt in [
         ac_started,
@@ -215,13 +291,13 @@ fn message_contract_fields() {
     let head = mk_head();
     let snapshot = mk_snapshot();
     let msg = Message {
-        tenant_id: TenantId::new(1),
-        message_id: MessageId::new(22),
-        session_id: SessionId::new(5),
+        tenant_id: TenantId::from_raw_unchecked(1),
+        message_id: MessageId::from_raw_unchecked(22),
+        session_id: SessionId::from_raw_unchecked(5),
         head,
         snapshot,
         timestamp_ms: 99,
-        sender: Subject::Human(HumanId::new(7)),
+        sender: Subject::Human(HumanId::from_raw_unchecked(7)),
         content_type: "text/plain".into(),
         content: serde_json::json!({"text": "hello"}),
         metadata: serde_json::json!({"channel": "chat"}),
@@ -232,9 +308,9 @@ fn message_contract_fields() {
             model: None,
             content_digest_sha256: Some("sha256:msg".into()),
         }),
-        sequence_number: Some(1),
+        sequence_number: 1,
         participants: vec![SubjectRef {
-            kind: Subject::AI(AIId::new(9)),
+            kind: Subject::AI(AIId::from_raw_unchecked(9)),
             role: Some("assistant".into()),
         }],
         supersedes: None,
@@ -258,15 +334,18 @@ fn message_contract_fields() {
 
 #[test]
 fn session_requires_provenance_when_restricted() {
+    let head = mk_head();
     let session = Session {
-        tenant_id: TenantId::new(2),
-        session_id: SessionId::new(77),
-        subject: Subject::Human(HumanId::new(4)),
+        tenant_id: TenantId::from_raw_unchecked(2),
+        session_id: SessionId::from_raw_unchecked(77),
+        trace_id: head.trace_id.clone(),
+        correlation_id: head.correlation_id.clone(),
+        subject: Subject::Human(HumanId::from_raw_unchecked(4)),
         participants: vec![SubjectRef {
-            kind: Subject::AI(AIId::new(5)),
+            kind: Subject::AI(AIId::from_raw_unchecked(5)),
             role: Some("assistant".into()),
         }],
-        head: mk_head(),
+        head,
         snapshot: mk_snapshot(),
         created_at: 1_700_000_000,
         scenario: Some(ConversationScenario::HumanToAi),
@@ -293,4 +372,62 @@ fn awareness_event_parent_cycle_must_differ() {
         err,
         ModelError::Invariant("parent_cycle_id cannot equal awareness_cycle_id")
     ));
+}
+
+#[test]
+fn human_profile_sensitive_requires_restricted_access() {
+    let mut profile = mk_human_profile();
+    profile.access_class = AccessClass::Public;
+    profile.provenance = None;
+    profile.race = Some("human".into());
+
+    let err = profile.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ModelError::Invariant("sensitive human profile fields require restricted access_class")
+    ));
+
+    profile.access_class = AccessClass::Restricted;
+    profile.provenance = None;
+    let err = profile.validate().unwrap_err();
+    assert!(matches!(err, ModelError::Missing("provenance")));
+
+    profile.provenance = Some(Provenance {
+        source: "seed".into(),
+        method: "sync".into(),
+        model: Some("profile-sync".into()),
+        content_digest_sha256: None,
+    });
+    assert!(profile.validate().is_ok());
+}
+
+#[test]
+fn ai_profile_sensitive_requires_restricted_access() {
+    let mut profile = mk_ai_profile();
+    profile.access_class = AccessClass::Internal;
+    profile.value_frequency = Some(ValueFrequencyInscription {
+        components: vec![],
+        dominant: Some("kindness".into()),
+    });
+    assert!(profile.value_frequency.is_some());
+    assert!(matches!(profile.access_class, AccessClass::Internal));
+
+    let err = profile.validate().unwrap_err();
+    assert!(matches!(
+        err,
+        ModelError::Invariant("sensitive AI profile fields require restricted access_class")
+    ));
+
+    profile.access_class = AccessClass::Restricted;
+    profile.provenance = None;
+    let err = profile.validate().unwrap_err();
+    assert!(matches!(err, ModelError::Missing("provenance")));
+
+    profile.provenance = Some(Provenance {
+        source: "seed".into(),
+        method: "sync".into(),
+        model: Some("profile-sync".into()),
+        content_digest_sha256: None,
+    });
+    assert!(profile.validate().is_ok());
 }

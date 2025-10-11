@@ -1,6 +1,6 @@
 use crate::{
-    AccessClass, CycleId, EnvelopeId, EventId, InferenceCycleId, ModelError, Provenance, SessionId,
-    Snapshot, Subject, TenantId,
+    AccessClass, AwarenessCycleId, EnvelopeId, EventId, InferenceCycleId, ModelError, Provenance,
+    SessionId, Snapshot, Subject, TenantId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,6 +103,8 @@ pub enum AwarenessEventType {
     InjectionDeferred,
     InjectionIgnored,
     DeltaPatchGenerated,
+    ContextBuilt,
+    DeltaMerged,
     SyncPointReported,
     Finalized,
     Rejected,
@@ -117,9 +119,9 @@ pub struct AwarenessEvent {
     pub event_id: EventId,
     pub event_type: AwarenessEventType,
     pub occurred_at_ms: i64,
-    pub awareness_cycle_id: CycleId,
+    pub awareness_cycle_id: AwarenessCycleId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_cycle_id: Option<CycleId>,
+    pub parent_cycle_id: Option<AwarenessCycleId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collab_scope_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -351,7 +353,7 @@ pub enum AwarenessDegradationReason {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DecisionPath {
     pub anchor: AwarenessAnchor,
-    pub awareness_cycle_id: CycleId,
+    pub awareness_cycle_id: AwarenessCycleId,
     pub inference_cycle_sequence: u32,
     pub fork: AwarenessFork,
     pub plan: DecisionPlan,
@@ -386,7 +388,7 @@ pub struct DeltaPatch {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SyncPointReport {
     pub anchor: AwarenessAnchor,
-    pub awareness_cycle_id: CycleId,
+    pub awareness_cycle_id: AwarenessCycleId,
     pub inference_cycle_sequence: u32,
     pub kind: SyncPointKind,
     #[serde(default)]
@@ -408,7 +410,7 @@ pub struct SyncPointReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AwarenessCycleRecord {
     pub tenant_id: TenantId,
-    pub cycle_id: CycleId,
+    pub cycle_id: AwarenessCycleId,
     pub session_id: SessionId,
     pub subject: Subject,
     pub cycle_sequence: u64,
@@ -457,11 +459,11 @@ mod tests {
     #[test]
     fn decision_path_roundtrip() {
         let anchor = AwarenessAnchor {
-            tenant_id: TenantId(1),
+            tenant_id: TenantId::from_raw_unchecked(1),
             envelope_id: uuid::Uuid::nil(),
             config_snapshot_hash: "cfg".into(),
             config_snapshot_version: 1,
-            session_id: Some(SessionId(7)),
+            session_id: Some(SessionId::from_raw_unchecked(7)),
             sequence_number: Some(3),
             access_class: AccessClass::Internal,
             provenance: None,
@@ -470,7 +472,7 @@ mod tests {
 
         let decision = DecisionPath {
             anchor,
-            awareness_cycle_id: CycleId(11),
+            awareness_cycle_id: AwarenessCycleId::from_raw_unchecked(11),
             inference_cycle_sequence: 2,
             fork: AwarenessFork::ToolPath,
             plan: DecisionPlan::Tool {
@@ -542,11 +544,11 @@ mod tests {
     #[test]
     fn awareness_event_validate_roundtrip() {
         let anchor = AwarenessAnchor {
-            tenant_id: TenantId(42),
+            tenant_id: TenantId::from_raw_unchecked(42),
             envelope_id: uuid::Uuid::nil(),
             config_snapshot_hash: "cfg-hash".into(),
             config_snapshot_version: 3,
-            session_id: Some(SessionId(11)),
+            session_id: Some(SessionId::from_raw_unchecked(11)),
             sequence_number: Some(5),
             access_class: AccessClass::Internal,
             provenance: None,
@@ -555,11 +557,11 @@ mod tests {
 
         let event = AwarenessEvent {
             anchor: anchor.clone(),
-            event_id: EventId(999),
+            event_id: EventId::from_raw_unchecked(999),
             event_type: AwarenessEventType::DecisionRouted,
             occurred_at_ms: 123_456,
-            awareness_cycle_id: CycleId(77),
-            parent_cycle_id: Some(CycleId(21)),
+            awareness_cycle_id: AwarenessCycleId::from_raw_unchecked(77),
+            parent_cycle_id: Some(AwarenessCycleId::from_raw_unchecked(21)),
             collab_scope_id: Some("scope-1".into()),
             barrier_id: Some("barrier-A".into()),
             env_mode: Some("turbo".into()),
@@ -579,7 +581,7 @@ mod tests {
     #[test]
     fn anchor_validation_rejects_missing_provenance() {
         let anchor = AwarenessAnchor {
-            tenant_id: TenantId(1),
+            tenant_id: TenantId::from_raw_unchecked(1),
             envelope_id: uuid::Uuid::nil(),
             config_snapshot_hash: "cfg".into(),
             config_snapshot_version: 1,

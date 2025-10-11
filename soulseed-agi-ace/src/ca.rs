@@ -1,15 +1,27 @@
-use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use soulseed_agi_core_models::{
-    CycleId,
-    awareness::{AwarenessAnchor, AwarenessEvent, AwarenessEventType, DeltaPatch, SyncPointKind},
+use sha2::{Digest, Sha256};
+use soulseed_agi_context::{
+    ContextConfig,
+    assembly::ContextManifest,
+    thinwaist::{ContextRuntimeInput, LocalContextRuntime},
+    types::{
+        Anchor as ContextAnchor, ContextItem, ContextItemDigests, ContextItemLinks, FeatureVec,
+        Partition,
+    },
 };
-use std::collections::HashMap;
-use time::OffsetDateTime;
+use soulseed_agi_core_models::{
+    AccessClass, ConversationScenario, AwarenessCycleId, DialogueEvent, DialogueEventType, EventId,
+    awareness::{
+        AwarenessAnchor, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
+        DeltaPatch, SyncPointKind,
+    },
+};
+use std::sync::Mutex;
+use time::{Duration, OffsetDateTime};
 
 use crate::errors::AceError;
-use crate::hitl::HitlInjection;
+use crate::hitl::{HitlInjection, HitlPriority};
 use crate::types::{BudgetSnapshot, SyncPointInput};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,7 +44,7 @@ pub struct InjectionDecision {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeDeltaRequest {
-    pub cycle_id: CycleId,
+    pub cycle_id: AwarenessCycleId,
     pub anchor: AwarenessAnchor,
     pub kind: SyncPointKind,
     pub timeframe: (OffsetDateTime, OffsetDateTime),
@@ -67,117 +79,484 @@ pub struct MergeDeltaResponse {
     pub awareness_events: Vec<AwarenessEvent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injections: Vec<InjectionDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_manifest: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_bundle: Option<soulseed_agi_context::types::ContextBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_bundle: Option<soulseed_agi_context::types::PromptBundle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain_bundle: Option<soulseed_agi_context::types::ExplainBundle>,
 }
 
 pub trait CaService: Send + Sync {
     fn merge_delta(&self, request: MergeDeltaRequest) -> Result<MergeDeltaResponse, AceError>;
 }
 
-#[derive(Default)]
-pub struct CaServiceDefault;
+pub struct CaServiceDefault {
+    runtime: Mutex<LocalContextRuntime>,
+}
+
+impl Default for CaServiceDefault {
+    fn default() -> Self {
+        Self {
+            runtime: Mutex::new(LocalContextRuntime::default()),
+        }
+    }
+}
 
 impl CaService for CaServiceDefault {
     fn merge_delta(&self, request: MergeDeltaRequest) -> Result<MergeDeltaResponse, AceError> {
-        let mut added: Vec<String> = Vec::new();
-        let mut pointers = Vec::new();
-        for event in &request.events {
-            added.push(format!("event:{}", event.event_id.0));
-            if let Some(ptr) = event.evidence_pointer.as_ref() {
-                pointers.push(json!({
-                    "event_id": event.event_id.0,
-                    "evidence": ptr,
-                }));
-            }
+        let MergeDeltaRequest {
+            cycle_id,
+            anchor,
+            kind,
+            timeframe,
+            events,
+            pending_injections,
+            budget_snapshot,
+            context_manifest,
+        } = request;
+
+        if events.is_empty() {
+            return Err(AceError::InvalidRequest(
+                "sync point requires events".into(),
+            ));
         }
 
-        let mut hasher = Hasher::new();
-        hasher.update(&request.cycle_id.0.to_le_bytes());
-        hasher.update(format!("{:?}", request.kind).as_bytes());
-        hasher.update(
-            request
-                .anchor
-                .tenant_id
-                .into_inner()
-                .to_le_bytes()
-                .as_slice(),
-        );
-        for id in &added {
-            hasher.update(id.as_bytes());
-        }
-        let patch_digest = format!("blake3:{}", hasher.finalize().to_hex());
+        let scenario = events.first().map(|event| event.scenario.clone());
+        let context_anchor = to_context_anchor(&anchor, scenario);
 
-        let delta_patch = if added.is_empty() {
-            None
-        } else {
-            Some(DeltaPatch {
-                patch_id: format!("ace-patch-{}-{}", request.cycle_id.0, request.kind as u32),
-                added,
-                updated: Vec::new(),
-                removed: Vec::new(),
-                score_stats: HashMap::new(),
-                why_included: None,
-                pointers: if pointers.is_empty() {
-                    None
-                } else {
-                    Some(Value::Array(pointers))
-                },
-                patch_digest,
+        let mut config = ContextConfig::default();
+        config.snapshot_hash = anchor.config_snapshot_hash.clone();
+        config.snapshot_version = anchor.config_snapshot_version;
+        config.target_tokens = budget_snapshot
+            .tokens_allowed
+            .max(256)
+            .max(budget_snapshot.tokens_spent);
+        config.plan_seed = cycle_id.as_u64() as u64;
+        config.scoring_reference = timeframe.1;
+
+        let mut items: Vec<ContextItem> = Vec::new();
+        for event in &events {
+            items.push(context_item_from_event(event, &context_anchor, kind));
+        }
+        for injection in &pending_injections {
+            items.push(context_item_from_injection(injection, &context_anchor));
+        }
+
+        let previous_manifest = parse_manifest(&context_manifest);
+
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| AceError::Ca("ca_runtime_poisoned".into()))?;
+
+        let output = runtime
+            .run(ContextRuntimeInput {
+                anchor: context_anchor.clone(),
+                config,
+                items,
+                graph_explain: None,
+                previous_manifest,
             })
-        };
+            .map_err(|err| AceError::Ca(format!("context_engine:{err}")))?;
 
-        let mut awareness_events: Vec<AwarenessEvent> = Vec::new();
-        let base_event_id = request.cycle_id.0 + 1;
-        if let Some(patch) = delta_patch.as_ref() {
-            awareness_events.push(AwarenessEvent {
-                anchor: request.anchor.clone(),
-                event_id: soulseed_agi_core_models::EventId(base_event_id),
-                event_type: map_syncpoint_event(&request.kind),
-                occurred_at_ms: request.timeframe.1.unix_timestamp() * 1000,
-                awareness_cycle_id: request.cycle_id,
-                parent_cycle_id: None,
-                collab_scope_id: None,
-                barrier_id: None,
-                env_mode: None,
-                inference_cycle_sequence: 1,
-                degradation_reason: None,
-                payload: json!({
-                    "patch_id": patch.patch_id,
-                    "digest": patch.patch_digest,
-                }),
-            });
-        }
+        let delta_patch = output.delta_patch.clone();
+        let prompt_bundle = output.bundle.prompt.clone();
+        let explain_bundle = output.bundle.explain.clone();
+        let context_manifest_value = serde_json::to_value(&output.manifest)
+            .map_err(|err| AceError::Ca(format!("manifest_serialize:{err}")))?;
 
-        let injections: Vec<InjectionDecision> = request
-            .pending_injections
-            .into_iter()
-            .enumerate()
-            .map(|(idx, inj)| {
-                let action = match inj.priority {
-                    crate::hitl::HitlPriority::P0Critical => InjectionAction::Applied,
-                    crate::hitl::HitlPriority::P1High if idx == 0 => InjectionAction::Applied,
-                    crate::hitl::HitlPriority::P1High => InjectionAction::Deferred,
-                    crate::hitl::HitlPriority::P2Medium => InjectionAction::Deferred,
-                    crate::hitl::HitlPriority::P3Low => InjectionAction::Ignored,
-                };
-                InjectionDecision {
-                    injection_id: inj.injection_id,
-                    action,
-                    reason: Some(match action {
-                        InjectionAction::Applied => "hitl_applied".into(),
-                        InjectionAction::Deferred => "hitl_deferred".into(),
-                        InjectionAction::Ignored => "hitl_ignored".into(),
-                    }),
-                    fingerprint: Some(format!("fp:{}", inj.injection_id)),
-                }
-            })
-            .collect();
+        let awareness_events =
+            build_awareness_events(&anchor, cycle_id, kind, timeframe, &output, &delta_patch);
+
+        let injections = build_injection_decisions(pending_injections);
 
         Ok(MergeDeltaResponse {
-            delta_patch,
+            delta_patch: Some(delta_patch),
             awareness_events,
             injections,
+            context_manifest: Some(context_manifest_value),
+            context_bundle: Some(output.bundle.clone()),
+            prompt_bundle: Some(prompt_bundle),
+            explain_bundle: Some(explain_bundle),
         })
     }
+}
+
+fn parse_manifest(value: &Value) -> Option<ContextManifest> {
+    if value.is_null() {
+        None
+    } else {
+        serde_json::from_value(value.clone()).ok()
+    }
+}
+
+fn to_context_anchor(
+    anchor: &AwarenessAnchor,
+    scenario: Option<ConversationScenario>,
+) -> ContextAnchor {
+    ContextAnchor {
+        tenant_id: anchor.tenant_id,
+        envelope_id: anchor.envelope_id,
+        config_snapshot_hash: anchor.config_snapshot_hash.clone(),
+        config_snapshot_version: anchor.config_snapshot_version,
+        session_id: anchor.session_id,
+        sequence_number: anchor.sequence_number,
+        access_class: anchor.access_class,
+        provenance: anchor.provenance.clone(),
+        schema_v: anchor.schema_v,
+        scenario,
+        supersedes: None,
+        superseded_by: None,
+    }
+}
+
+fn to_offset_date_time(ts_ms: i64) -> OffsetDateTime {
+    let seconds = ts_ms.div_euclid(1_000);
+    let millis = ts_ms.rem_euclid(1_000);
+    let base = OffsetDateTime::from_unix_timestamp(seconds).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    base + Duration::milliseconds(millis)
+}
+
+fn visibility_tag(access_class: AccessClass) -> &'static str {
+    match access_class {
+        AccessClass::Restricted => "minimal_sharing",
+        AccessClass::Internal => "task_context",
+        _ => "full_group",
+    }
+}
+
+fn estimate_tokens(text: &str) -> u32 {
+    let chars = text.chars().count() as u32;
+    ((chars / 4).max(1)).min(8192)
+}
+
+fn estimate_tokens_from_value(value: &Value) -> u32 {
+    serde_json::to_string(value)
+        .map(|s| estimate_tokens(&s))
+        .unwrap_or(16)
+}
+
+fn hash_json(value: &Value) -> String {
+    let payload = serde_json::to_vec(value).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("sha256-{:x}", hasher.finalize())
+}
+
+fn partition_for_event(event_type: DialogueEventType) -> Partition {
+    match event_type {
+        DialogueEventType::Message => Partition::P4Dialogue,
+        DialogueEventType::ToolCall
+        | DialogueEventType::ToolResult
+        | DialogueEventType::SelfReflection => Partition::P3WorkingDelta,
+        DialogueEventType::Decision => Partition::P1TaskFacts,
+        DialogueEventType::Lifecycle | DialogueEventType::System => Partition::P0Policy,
+    }
+}
+
+fn base_features_for_event(event: &DialogueEvent, tokens: u32) -> FeatureVec {
+    FeatureVec {
+        rel: match event.event_type {
+            DialogueEventType::ToolResult => 0.88,
+            DialogueEventType::ToolCall | DialogueEventType::SelfReflection => 0.74,
+            DialogueEventType::Decision => 0.76,
+            DialogueEventType::Lifecycle | DialogueEventType::System => 0.65,
+            DialogueEventType::Message => 0.72,
+        },
+        cau: match event.event_type {
+            DialogueEventType::Decision => 0.7,
+            DialogueEventType::ToolResult => 0.68,
+            DialogueEventType::Message => 0.52,
+            _ => 0.6,
+        },
+        rec: 0.58,
+        auth: if matches!(event.access_class, AccessClass::Public) {
+            0.45
+        } else {
+            0.62
+        },
+        stab: 0.55,
+        dup: 0.08,
+        len: (tokens as f32 / 2048.0).min(1.0),
+        risk: match event.access_class {
+            AccessClass::Restricted => 0.82,
+            AccessClass::Internal => 0.32,
+            _ => 0.18,
+        },
+    }
+    .clamp()
+}
+
+fn base_features_for_injection(priority: HitlPriority, tokens: u32) -> FeatureVec {
+    let (rel, cau) = match priority {
+        HitlPriority::P0Critical => (0.95, 0.85),
+        HitlPriority::P1High => (0.88, 0.78),
+        HitlPriority::P2Medium => (0.74, 0.62),
+        HitlPriority::P3Low => (0.6, 0.5),
+    };
+    FeatureVec {
+        rel,
+        cau,
+        rec: 0.55,
+        auth: 0.6,
+        stab: 0.48,
+        dup: 0.05,
+        len: (tokens as f32 / 1024.0).min(1.0),
+        risk: if matches!(priority, HitlPriority::P0Critical | HitlPriority::P1High) {
+            0.35
+        } else {
+            0.25
+        },
+    }
+    .clamp()
+}
+
+fn context_item_from_event(
+    event: &DialogueEvent,
+    anchor: &ContextAnchor,
+    kind: SyncPointKind,
+) -> ContextItem {
+    let content = serde_json::to_value(event).unwrap_or(Value::Null);
+    let tokens = estimate_tokens_from_value(&content);
+    let features = base_features_for_event(event, tokens);
+    let partition = partition_for_event(event.event_type.clone());
+    let mut digests = ContextItemDigests::default();
+    digests.content = event
+        .content_digest_sha256
+        .clone()
+        .map(|digest| format!("sha256-{}", digest))
+        .or_else(|| Some(hash_json(&content)));
+    let mut links = ContextItemLinks::default();
+    if let Some(pointer) = &event.evidence_pointer {
+        links.evidence_ptrs.push(pointer.clone());
+        if let Some(digest) = pointer.digest_sha256.clone() {
+            digests.evidence = Some(digest);
+        }
+    }
+    links.supersedes = event.supersedes.map(|id| id.as_u64().to_string());
+
+    ContextItem {
+        anchor: anchor.clone(),
+        id: format!("evt:{}", event.event_id.as_u64()),
+        partition,
+        partition_hint: Some(partition),
+        source_event_id: event.event_id,
+        source_message_id: event.message_ref.as_ref().map(|ptr| ptr.message_id),
+        observed_at: to_offset_date_time(event.timestamp_ms),
+        content,
+        tokens,
+        features,
+        policy_tags: json!({
+            "visibility": visibility_tag(event.access_class),
+            "syncpoint": format!("{:?}", kind).to_lowercase(),
+        }),
+        typ: Some(format!("dialogue::{:?}", event.event_type)),
+        digests,
+        links,
+    }
+}
+
+fn context_item_from_injection(injection: &HitlInjection, anchor: &ContextAnchor) -> ContextItem {
+    let content = injection.payload.clone();
+    let tokens = estimate_tokens_from_value(&content);
+    let features = base_features_for_injection(injection.priority, tokens);
+    let mut digests = ContextItemDigests::default();
+    digests.content = Some(hash_json(&content));
+
+    ContextItem {
+        anchor: anchor.clone(),
+        id: format!("inj:{}", injection.injection_id),
+        partition: Partition::P3WorkingDelta,
+        partition_hint: Some(Partition::P3WorkingDelta),
+        source_event_id: EventId::from_raw_unchecked(injection.injection_id.as_u128() as u64),
+        source_message_id: None,
+        observed_at: injection.submitted_at,
+        content,
+        tokens,
+        features,
+        policy_tags: json!({
+            "visibility": "task_context",
+            "author_role": injection.author_role,
+        }),
+        typ: Some("hitl_injection".into()),
+        digests,
+        links: ContextItemLinks::default(),
+    }
+}
+
+fn build_injection_decisions(pending: Vec<HitlInjection>) -> Vec<InjectionDecision> {
+    pending
+        .into_iter()
+        .enumerate()
+        .map(|(idx, inj)| {
+            let action = match inj.priority {
+                HitlPriority::P0Critical => InjectionAction::Applied,
+                HitlPriority::P1High if idx == 0 => InjectionAction::Applied,
+                HitlPriority::P1High => InjectionAction::Deferred,
+                HitlPriority::P2Medium => InjectionAction::Deferred,
+                HitlPriority::P3Low => InjectionAction::Ignored,
+            };
+            let reason = match action {
+                InjectionAction::Applied => "hitl_applied",
+                InjectionAction::Deferred => "hitl_deferred",
+                InjectionAction::Ignored => "hitl_ignored",
+            }
+            .to_string();
+            InjectionDecision {
+                injection_id: inj.injection_id,
+                action,
+                reason: Some(reason),
+                fingerprint: Some(format!("fp:{}", inj.injection_id)),
+            }
+        })
+        .collect()
+}
+
+fn map_degradation_reason(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
+    let reason = reason?;
+    for token in reason.split(|c| c == ';' || c == '|') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if token.contains("budget_tokens") {
+            return Some(AwarenessDegradationReason::BudgetTokens);
+        }
+        if token.contains("budget_walltime") {
+            return Some(AwarenessDegradationReason::BudgetWalltime);
+        }
+        if token.contains("budget_external_cost") {
+            return Some(AwarenessDegradationReason::BudgetExternalCost);
+        }
+        if token.contains("privacy") {
+            return Some(AwarenessDegradationReason::PrivacyBlocked);
+        }
+        if token.contains("graph") {
+            return Some(AwarenessDegradationReason::GraphDegraded);
+        }
+        if token.contains("envctx") {
+            return Some(AwarenessDegradationReason::EnvctxDegraded);
+        }
+        if token.contains("clarify") {
+            return Some(AwarenessDegradationReason::ClarifyExhausted);
+        }
+    }
+    None
+}
+
+fn build_awareness_event(
+    anchor: &AwarenessAnchor,
+    cycle_id: AwarenessCycleId,
+    event_id: u64,
+    event_type: AwarenessEventType,
+    occurred_at_ms: i64,
+    degradation: Option<AwarenessDegradationReason>,
+    payload: Value,
+) -> AwarenessEvent {
+    AwarenessEvent {
+        anchor: anchor.clone(),
+        event_id: EventId::from_raw_unchecked(event_id),
+        event_type,
+        occurred_at_ms,
+        awareness_cycle_id: cycle_id,
+        parent_cycle_id: None,
+        collab_scope_id: None,
+        barrier_id: None,
+        env_mode: None,
+        inference_cycle_sequence: 1,
+        degradation_reason: degradation,
+        payload,
+    }
+}
+
+fn build_awareness_events(
+    anchor: &AwarenessAnchor,
+    cycle_id: AwarenessCycleId,
+    kind: SyncPointKind,
+    timeframe: (OffsetDateTime, OffsetDateTime),
+    output: &soulseed_agi_context::types::RunOutput,
+    delta_patch: &DeltaPatch,
+) -> Vec<AwarenessEvent> {
+    let degrade = output
+        .bundle
+        .explain
+        .degradation_reason
+        .clone()
+        .or(output.report.degradation_reason.clone());
+    let degradation_reason = map_degradation_reason(degrade.as_deref());
+    let occurred_at_ms = timeframe.1.unix_timestamp() * 1000;
+    let mut events = Vec::new();
+    let mut next_event_id = cycle_id.as_u64() + 1;
+
+    let summary_payload = json!({
+        "manifest_digest": output.manifest.manifest_digest,
+        "bundle_version": output.bundle.version,
+        "tokens": output.plan.budget.projected_tokens,
+        "patch_digest": delta_patch.patch_digest,
+    });
+    events.push(build_awareness_event(
+        anchor,
+        cycle_id,
+        next_event_id,
+        map_syncpoint_event(&kind),
+        occurred_at_ms,
+        degradation_reason,
+        summary_payload,
+    ));
+    next_event_id += 1;
+
+    let snapshot_payload = serde_json::to_value(&output.env_snapshot).unwrap_or_else(|_| json!({}));
+    events.push(build_awareness_event(
+        anchor,
+        cycle_id,
+        next_event_id,
+        AwarenessEventType::EnvironmentSnapshotRecorded,
+        occurred_at_ms,
+        degradation_reason,
+        snapshot_payload,
+    ));
+    next_event_id += 1;
+
+    let context_payload = json!({
+        "plan_id": output.plan.plan_id,
+        "manifest_digest": output.manifest.manifest_digest,
+        "target_tokens": output.plan.budget.target_tokens,
+        "projected_tokens": output.plan.budget.projected_tokens,
+        "tokens_saved": output.report.tokens_saved,
+        "degradation_reason": output.report.degradation_reason,
+    });
+    events.push(build_awareness_event(
+        anchor,
+        cycle_id,
+        next_event_id,
+        AwarenessEventType::ContextBuilt,
+        occurred_at_ms,
+        degradation_reason,
+        context_payload,
+    ));
+    next_event_id += 1;
+
+    events.push(build_awareness_event(
+        anchor,
+        cycle_id,
+        next_event_id,
+        AwarenessEventType::DeltaMerged,
+        occurred_at_ms,
+        degradation_reason,
+        json!({
+            "patch_id": delta_patch.patch_id,
+            "manifest_digest": output.manifest.manifest_digest,
+            "added": delta_patch.added,
+            "updated": delta_patch.updated,
+            "removed": delta_patch.removed,
+            "score_stats": delta_patch.score_stats,
+        }),
+    ));
+
+    events
 }
 
 fn map_syncpoint_event(kind: &SyncPointKind) -> AwarenessEventType {
@@ -222,7 +601,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         DialogueEvent {
             tenant_id: soulseed_agi_core_models::TenantId::new(1),
-            event_id: EventId(1),
+            event_id: EventId::from_raw_unchecked(1),
             session_id: SessionId::new(1),
             subject: Subject::Human(HumanId::new(1)),
             participants: vec![SubjectRef {
@@ -288,7 +667,7 @@ mod tests {
     #[test]
     fn default_service_applies_high_priority() {
         let request = MergeDeltaRequest {
-            cycle_id: CycleId(1),
+            cycle_id: AwarenessCycleId::from_raw_unchecked(1),
             anchor: dummy_anchor(),
             kind: SyncPointKind::HitlAbsorb,
             timeframe: (OffsetDateTime::now_utc(), OffsetDateTime::now_utc()),
@@ -313,12 +692,15 @@ mod tests {
         let service = CaServiceDefault::default();
         let response = service.merge_delta(request).expect("merge");
         assert!(response.delta_patch.is_some());
-        assert_eq!(response.awareness_events.len(), 1);
+        assert!(response.awareness_events.len() >= 2);
         assert_eq!(response.injections.len(), 1);
         assert_eq!(response.injections[0].action, InjectionAction::Applied);
         assert_eq!(
             response.injections[0].reason.as_deref(),
             Some("hitl_applied")
         );
+        assert!(response.context_manifest.is_some());
+        assert!(response.prompt_bundle.is_some());
+        assert!(response.explain_bundle.is_some());
     }
 }

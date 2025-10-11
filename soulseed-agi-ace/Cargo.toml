@@ -25,10 +25,12 @@ thiserror = "1"
 time = "0.3"
 uuid = { version = "1", features = ["v7", "serde"] }
 blake3 = "1"
+sha2 = "0.10"
 soulseed-agi-core-models = { path = "../soulseed-agi-core-models" }
 soulseed-agi-tools = { path = "../soulseed-agi-tools" }
 soulseed-agi-context = { path = "../soulseed-agi-context" }
 soulseed-agi-authz = { path = "../soulseed-agi-authz" }
+soulseed-agi-dfr = { path = "../soulseed-agi-dfr" }
 
 [dev-dependencies]
 once_cell = "1"

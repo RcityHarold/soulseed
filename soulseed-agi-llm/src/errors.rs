@@ -10,4 +10,6 @@ pub enum EngineError {
     MissingToolSummary,
     #[error("final event requires session identifier")]
     MissingSessionId,
+    #[error("llm result missing evidence pointer")]
+    MissingEvidencePointer,
 }

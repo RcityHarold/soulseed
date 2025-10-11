@@ -379,6 +379,10 @@ impl HitlService {
         }
     }
 
+    pub fn resolve_injection(&self, injection_id: Uuid) -> Option<HitlInjection> {
+        self.queue.remove(injection_id)
+    }
+
     pub fn abort_history(&self) -> Vec<ClarifyAbortRecord> {
         self.abort_records
             .lock()

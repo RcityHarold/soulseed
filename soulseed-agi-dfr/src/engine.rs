@@ -29,7 +29,7 @@ impl<'a> DfrEngine<'a> {
             .into_iter()
             .next()
             .expect("non-empty plans");
-        let mut rejected = evaluation.rejected.clone();
+        let rejected = evaluation.rejected.clone();
         plan.explain.rejected = rejected.clone();
 
         let issued_at = OffsetDateTime::now_utc();
@@ -39,7 +39,7 @@ impl<'a> DfrEngine<'a> {
 
         let mut decision_path =
             self.planner
-                .build_decision_path(&input, &plan, 1, &evaluation.fork_scores);
+                .build_decision_path(&input, &plan, 1, &evaluation.fork_scores, &rejected);
         if oscillation > 0 {
             decision_path
                 .rationale

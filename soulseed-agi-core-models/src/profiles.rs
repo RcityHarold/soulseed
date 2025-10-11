@@ -1,7 +1,7 @@
 #[cfg(feature = "vectors-extra")]
 use crate::vectors_ext::ExtraVectors;
 use crate::{
-    enums::{MembershipLevel, RelationshipStatus, SubscriptionStatus},
+    enums::{CorePersonalityKind, MembershipLevel, RelationshipStatus, SubscriptionStatus},
     resources::PointBalance,
     AIId, AccessClass, HumanId, ModelError, Provenance, SoulState, TenantId,
 };
@@ -83,7 +83,7 @@ pub struct PersonalityFacet {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CorePersonalityProfile {
-    pub primary: String,
+    pub primary: CorePersonalityKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facets: Vec<PersonalityFacet>,
 }
@@ -181,8 +181,12 @@ pub struct AIProfile {
     pub mission: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub narrative: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "narrative"
+    )]
+    pub self_narrative: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meaning_narrative: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,12 +216,27 @@ pub struct AIProfile {
 }
 
 impl HumanProfile {
+    fn has_sensitive_attributes(&self) -> bool {
+        self.race.is_some()
+            || self.religion.is_some()
+            || self.qr_code.is_some()
+            || self.profession.is_some()
+            || self.industry.is_some()
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
         if self.username.trim().is_empty() {
             return Err(ModelError::Missing("username"));
         }
         if self.nickname.trim().is_empty() {
             return Err(ModelError::Missing("nickname"));
+        }
+        if self.has_sensitive_attributes()
+            && !matches!(self.access_class, AccessClass::Restricted)
+        {
+            return Err(ModelError::Invariant(
+                "sensitive human profile fields require restricted access_class",
+            ));
         }
         if matches!(self.access_class, AccessClass::Restricted) && self.provenance.is_none() {
             return Err(ModelError::Missing("provenance"));
@@ -227,10 +246,77 @@ impl HumanProfile {
 }
 
 impl AIProfile {
+    fn has_sensitive_attributes(&self) -> bool {
+        self.value_frequency.is_some()
+            || self.core_personality.is_some()
+            || self.source_frequency_code.is_some()
+            || self.gender_frequency.is_some()
+            || self.awakener_id.is_some()
+            || self.social_name.is_some()
+            || self.origin_name.is_some()
+            || self.source_name.is_some()
+    }
+
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.has_sensitive_attributes()
+            && !matches!(self.access_class, AccessClass::Restricted)
+        {
+            return Err(ModelError::Invariant(
+                "sensitive AI profile fields require restricted access_class",
+            ));
+        }
         if matches!(self.access_class, AccessClass::Restricted) && self.provenance.is_none() {
             return Err(ModelError::Missing("provenance"));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_profile_detects_sensitive_attributes() {
+        let mut profile = AIProfile {
+            tenant_id: TenantId::from_raw_unchecked(1),
+            ai_id: AIId::from_raw_unchecked(1),
+            access_class: AccessClass::Restricted,
+            provenance: Some(Provenance {
+                source: "seed".into(),
+                method: "import".into(),
+                model: None,
+                content_digest_sha256: None,
+            }),
+            social_name: None,
+            origin_name: None,
+            source_name: None,
+            core_tags: Vec::new(),
+            core_personality: None,
+            mission: None,
+            values: None,
+            self_narrative: None,
+            meaning_narrative: None,
+            capabilities: None,
+            relationships_summary: None,
+            external_identity: None,
+            soul_signature: None,
+            ai_birthday: None,
+            awakener_id: None,
+            value_frequency: None,
+            source_frequency_code: None,
+            gender_frequency: None,
+            soul_state: SoulState::Active,
+            extras: serde_json::Value::Null,
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
+        };
+
+        assert!(!profile.has_sensitive_attributes());
+        profile.value_frequency = Some(ValueFrequencyInscription {
+            components: vec![],
+            dominant: Some("kindness".into()),
+        });
+        assert!(profile.has_sensitive_attributes());
     }
 }

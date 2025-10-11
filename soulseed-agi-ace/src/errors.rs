@@ -6,6 +6,8 @@ pub enum AceError {
     AuthDenied(String),
     #[error("quota depleted: {0}")]
     Quota(String),
+    #[error("dfr error: {0}")]
+    Dfr(String),
     #[error("schedule conflict: {0}")]
     ScheduleConflict(String),
     #[error("invalid request: {0}")]

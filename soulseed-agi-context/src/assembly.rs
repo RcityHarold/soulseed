@@ -344,7 +344,7 @@ fn map_to_segments(map: HashMap<Partition, Vec<BundleItem>>) -> Vec<BundleSegmen
         .collect()
 }
 
-fn sort_segments(segments: &mut Vec<BundleSegment>) {
+pub(crate) fn sort_segments(segments: &mut Vec<BundleSegment>) {
     for seg in segments.iter_mut() {
         for item in &mut seg.items {
             item.partition = seg.partition;
@@ -356,7 +356,7 @@ fn sort_segments(segments: &mut Vec<BundleSegment>) {
     });
 }
 
-fn manifest_item_cmp(a: &BundleItem, b: &BundleItem) -> Ordering {
+pub(crate) fn manifest_item_cmp(a: &BundleItem, b: &BundleItem) -> Ordering {
     manifest_partition_priority(b.partition)
         .cmp(&manifest_partition_priority(a.partition))
         .then_with(|| b.score_scaled.cmp(&a.score_scaled))
@@ -364,7 +364,7 @@ fn manifest_item_cmp(a: &BundleItem, b: &BundleItem) -> Ordering {
         .then_with(|| a.ci_id.cmp(&b.ci_id))
 }
 
-fn manifest_partition_priority(partition: Partition) -> u8 {
+pub(crate) fn manifest_partition_priority(partition: Partition) -> u8 {
     match partition {
         P0Policy => 5,
         P1TaskFacts => 4,

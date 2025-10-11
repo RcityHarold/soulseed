@@ -1,8 +1,9 @@
 use blake3::Hasher;
 use serde_json::{Map, Value, json};
 use soulseed_agi_core_models::awareness::{
-    AwarenessFork, ClarifyLimits, ClarifyPlan, DecisionBudgetEstimate, DecisionExplain,
-    DecisionPath, DecisionPlan, DecisionRationale, SelfPlan,
+    AwarenessFork, ClarifyLimits, ClarifyPlan, DecisionBlockReason, DecisionBudgetEstimate,
+    DecisionExplain, DecisionInvalidReason, DecisionPath, DecisionPlan, DecisionRationale,
+    SelfPlan,
 };
 
 use crate::scorer::ScoreBreakdown;
@@ -10,7 +11,10 @@ use crate::types::{
     BudgetEstimate, RouteExplain, RoutePlan, RouterCandidate, RouterInput, fork_key,
     map_degradation, new_cycle_id,
 };
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap},
+};
 
 pub struct RoutePlanner;
 
@@ -170,6 +174,7 @@ impl RoutePlanner {
         plan: &RoutePlan,
         sequence: u32,
         fork_scores: &HashMap<AwarenessFork, ScoreBreakdown>,
+        rejected: &[(String, String)],
     ) -> DecisionPath {
         let mut budget_plan = DecisionBudgetEstimate::default();
         if plan.budget.tokens > 0 {
@@ -213,6 +218,14 @@ impl RoutePlanner {
             ));
         } else if let Some(top) = ranked.first() {
             rationale.tradeoff = Some(format!("{} {:.2} selected", fork_key(*top.0), top.1.score));
+        }
+
+        let (blocked, invalid) = partition_rejections(rejected);
+        if !blocked.is_empty() {
+            rationale.blocked = blocked;
+        }
+        if !invalid.is_empty() {
+            rationale.invalid = invalid;
         }
 
         let mut fork_feature_map = Map::new();
@@ -336,6 +349,73 @@ impl RoutePlanner {
         }
         plan
     }
+}
+
+fn partition_rejections(
+    rejected: &[(String, String)],
+) -> (Vec<DecisionBlockReason>, Vec<DecisionInvalidReason>) {
+    let mut blocked_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut invalid_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for (code, label) in rejected {
+        let code_lower = code.to_ascii_lowercase();
+        if code_lower.contains("invalid") {
+            invalid_map
+                .entry(label.clone())
+                .or_insert_with(BTreeSet::new)
+                .insert(code.clone());
+            continue;
+        }
+
+        let reason = if let Some((prefix, detail)) = code.split_once(':') {
+            if prefix.eq_ignore_ascii_case("budget_exceeded") && !detail.is_empty() {
+                detail.to_string()
+            } else {
+                code.clone()
+            }
+        } else {
+            code.clone()
+        };
+
+        blocked_map
+            .entry(label.clone())
+            .or_insert_with(BTreeSet::new)
+            .insert(reason);
+    }
+
+    let mut blocked = Vec::new();
+    for (label, reasons) in blocked_map {
+        if reasons.is_empty() {
+            blocked.push(DecisionBlockReason {
+                id: label,
+                reason: None,
+            });
+        } else {
+            for reason in reasons {
+                let reason_opt = if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                };
+                blocked.push(DecisionBlockReason {
+                    id: label.clone(),
+                    reason: reason_opt,
+                });
+            }
+        }
+    }
+
+    let mut invalid = Vec::new();
+    for (label, reasons) in invalid_map {
+        for reason in reasons {
+            invalid.push(DecisionInvalidReason {
+                id: label.clone(),
+                reason,
+            });
+        }
+    }
+
+    (blocked, invalid)
 }
 
 fn clamp_priority(value: f32) -> f32 {

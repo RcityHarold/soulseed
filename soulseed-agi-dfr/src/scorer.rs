@@ -177,11 +177,7 @@ fn budget_pressure(candidate: &RouterCandidate, budget: &BudgetTarget) -> f32 {
         0.0
     };
     let pressure = token_ratio.max(wall_ratio).max(cost_ratio);
-    if pressure > 1.0 {
-        -(pressure - 1.0)
-    } else {
-        0.0
-    }
+    if pressure > 1.0 { pressure - 1.0 } else { 0.0 }
 }
 
 fn deterministic_jitter(

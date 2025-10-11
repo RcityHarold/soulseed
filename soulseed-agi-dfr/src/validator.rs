@@ -92,7 +92,7 @@ fn validate_tool_plan(plan: &ToolPlan) -> Result<(), String> {
 
 fn validate_barrier(barrier: &ToolPlanBarrier) -> Result<(), String> {
     if let Some(mode) = barrier.mode.as_deref() {
-        const VALID: [&str; 4] = ["all", "any", "sequence", "quorum"];
+        const VALID: [&str; 5] = ["all", "any", "sequence", "quorum", "parallel"];
         if !VALID.contains(&mode) {
             return Err(format!("tool_barrier_mode_invalid:{}", mode));
         }

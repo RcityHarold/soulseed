@@ -113,7 +113,7 @@ impl Policy {
         let mut missing_consent = None;
         let mut quota_hint = None;
         let subject_owner = match subject {
-            Subject::Human(h) => Some(h.0),
+            Subject::Human(h) => Some(h.as_u64()),
             _ => None,
         };
         let context_owner = context.get("owner_id").and_then(|v| v.as_u64());
@@ -132,7 +132,7 @@ impl Policy {
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>())
                         .unwrap_or_default();
-                    (format!("MemberOf({})", group.0), groups.contains(&group.0))
+                    (format!("MemberOf({})", group.as_u64()), groups.contains(&group.as_u64()))
                 }
                 Predicate::SceneIn(list) => {
                     let scene = context.get("scene").and_then(|v| v.as_str()).unwrap_or("");

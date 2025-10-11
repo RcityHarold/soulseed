@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     api::{AuthzRequest, AuthzResponse},
-    cache::{resource_scope_specificity, PolicyStore},
+    cache::{resource_scope_specificity, PolicyStore, TicketStore},
     errors::AuthzError,
     policy::{Policy, PredicateEvaluation},
     quota::{QuotaClient, QuotaRequest},
@@ -13,20 +13,30 @@ use crate::{
 pub struct Evaluator {
     policies: Arc<dyn PolicyStore>,
     quota: Arc<dyn QuotaClient>,
+    tickets: Option<Arc<dyn TicketStore>>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Evaluator {
-    pub fn new(policies: Arc<dyn PolicyStore>, quota: Arc<dyn QuotaClient>) -> Self {
+    pub fn new(
+        policies: Arc<dyn PolicyStore>,
+        quota: Arc<dyn QuotaClient>,
+    ) -> Self {
         Self {
             policies,
             quota,
+            tickets: None,
             clock: Arc::new(|| time::OffsetDateTime::now_utc().unix_timestamp() * 1000),
         }
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    pub fn with_ticket_store(mut self, store: Arc<dyn TicketStore>) -> Self {
+        self.tickets = Some(store);
         self
     }
 
@@ -51,7 +61,7 @@ impl Evaluator {
         let mut chosen_policy: Option<Policy> = None;
         let mut obligations: Vec<String> = Vec::new();
         let mut chosen_priority = i32::MIN;
-        let mut chosen_specificity = 0usize;
+        let mut chosen_specificity = None;
         let mut ask_consent_reasons: Vec<String> = Vec::new();
         let mut quota_hints: Vec<String> = Vec::new();
 
@@ -109,11 +119,14 @@ impl Evaluator {
                     break;
                 }
                 let specificity = resource_scope_specificity(&policy.resource_urn);
-                if policy.priority > chosen_priority
-                    || (policy.priority == chosen_priority && specificity > chosen_specificity)
+                let prefer_new = policy.priority > chosen_priority
+                    || (policy.priority == chosen_priority
+                        && chosen_specificity
+                            .map_or(true, |current| specificity > current));
+                if prefer_new
                 {
                     chosen_priority = policy.priority;
-                    chosen_specificity = specificity;
+                    chosen_specificity = Some(specificity);
                     chosen_effect = Some(policy.effect.clone());
                     obligations = policy.obligations.iter().map(|o| o.as_label()).collect();
                     chosen_policy = Some(policy.clone());
@@ -173,20 +186,26 @@ impl Evaluator {
                 .as_ref()
                 .map(|p| p.policy_digest.clone())
                 .unwrap_or_default();
-            let ticket_valid = request
-                .access_ticket
-                .as_ref()
-                .map(|ticket| {
-                    ticket.tenant_id == request.anchor.tenant_id
-                        && ticket.is_valid(
+            let ticket_valid = if let Some(ticket) = request.access_ticket.as_ref() {
+                let tenant = request.anchor.tenant_id;
+                let ticket = if let Some(store) = &self.tickets {
+                    store.ticket_for(tenant, &ticket.ticket_id)
+                } else {
+                    Some(ticket.clone())
+                };
+                ticket.map(|stored| {
+                    stored.tenant_id == tenant
+                        && stored.is_valid(
                             now_ms,
                             &request.subject,
                             &request.resource,
                             &request.action,
                             &policy_digest,
                         )
-                })
-                .unwrap_or(false);
+                }).unwrap_or(false)
+            } else {
+                false
+            };
             if !ticket_valid {
                 effect = Effect::Deny;
                 obligations.push("reason=TRACE_FORBIDDEN".into());

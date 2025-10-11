@@ -77,11 +77,58 @@ pub struct EnvironmentContext {
     pub tool_permission: ToolPermission,
     pub life_journey: LifeJourney,
     pub source_versions: SourceVersions,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environment_vectors: Vec<EnvironmentVector>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation_path: Option<NavigationPath>,
     pub context_digest: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<DegradationReason>,
     #[serde(default)]
     pub lite_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentVector {
+    pub vector_id: String,
+    pub namespace: String,
+    pub model: String,
+    pub dim: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_locator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub computed_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NavigationPath {
+    pub path_id: String,
+    pub current: NavigationWaypoint,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breadcrumbs: Vec<NavigationWaypoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub predictions: Vec<NavigationWaypoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NavigationWaypoint {
+    pub node: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduled_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -163,7 +163,8 @@ fn filter_rejects_restricted_without_provenance() {
     };
 
     let evaluation = router.evaluate(&input, vec![candidate]).expect("evaluate");
-    assert!(evaluation.plans.is_empty());
+    assert_eq!(evaluation.plans.len(), 1);
+    assert_eq!(evaluation.plans[0].fork, AwarenessFork::Clarify);
     assert_eq!(evaluation.rejected.len(), 1);
     assert_eq!(evaluation.rejected[0].0, "privacy_restricted");
 }
@@ -384,6 +385,13 @@ fn policy_denied_candidate_triggers_fallback() {
             .iter()
             .any(|(code, _)| code == "policy_denied")
     );
+    let blocked = &decision.decision_path.rationale.blocked;
+    assert!(
+        blocked
+            .iter()
+            .any(|entry| entry.id == "policy_tool"
+                && entry.reason.as_deref() == Some("policy_denied"))
+    );
 }
 
 #[test]
@@ -551,6 +559,12 @@ fn budget_exceed_clarify_degrades_to_self() {
     );
     let rationale_scores = &decision.decision_path.rationale.scores;
     assert!(rationale_scores.contains_key("self"));
+    let blocked = &decision.decision_path.rationale.blocked;
+    assert!(
+        blocked
+            .iter()
+            .any(|entry| entry.id == "clarify" && entry.reason.as_deref() == Some("budget_tokens"))
+    );
 }
 
 #[test]
@@ -685,7 +699,6 @@ fn tool_plan_barrier_preserved_and_timeout_mapped() {
     };
 
     let decision = engine.route(input, vec![candidate]).expect("route tool");
-
     assert_eq!(decision.plan.fork, AwarenessFork::ToolPath);
     assert_eq!(
         decision.plan.explain.degradation_reason.as_deref(),
@@ -1023,6 +1036,12 @@ fn plan_validation_fallbacks_to_clarify() {
             .iter()
             .any(|(code, reason)| code == "plan_invalid" && reason == "tool_schema_error")
     );
+    let invalid = &decision.decision_path.rationale.invalid;
+    assert!(
+        invalid
+            .iter()
+            .any(|entry| entry.id == "tool_schema_error" && entry.reason == "plan_invalid")
+    );
 }
 
 #[test]
@@ -1087,14 +1106,13 @@ fn collab_plan_routing() {
             },
         },
         fork: AwarenessFork::ToolPath,
-        priority: 0.6,
+        priority: 0.4,
         metadata: json!({ "label": "tool" }),
     };
 
     let decision = engine
         .route(input, vec![tool_candidate, collab_candidate])
         .expect("route collab");
-
     assert_eq!(decision.plan.fork, AwarenessFork::Collab);
     assert!(matches!(
         decision.decision_path.plan,

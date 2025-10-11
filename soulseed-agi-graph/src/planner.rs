@@ -27,7 +27,7 @@ impl Planner {
         &self,
         query: &TimelineQuery,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if query.tenant_id.0 == 0 {
+        if query.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
         let scenario_event_types = query
@@ -56,7 +56,7 @@ impl Planner {
                     .or_else(|| query.event_types.clone()),
             }
         };
-        let hash = format!("timeline:tenant={}:limit={}", query.tenant_id.0, limit);
+        let hash = format!("timeline:tenant={}:limit={}", query.tenant_id.as_u64(), limit);
         Ok((
             PreparedPlan {
                 plan,
@@ -71,7 +71,7 @@ impl Planner {
         &self,
         query: &CausalQuery,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if query.tenant_id.0 == 0 {
+        if query.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
         let scenario_event_types = query
@@ -105,7 +105,7 @@ impl Planner {
         };
         let hash = format!(
             "causal:tenant={}:root={}:depth={}",
-            query.tenant_id.0, query.root_event.0, depth
+            query.tenant_id.as_u64(), query.root_event.as_u64(), depth
         );
         Ok((
             PreparedPlan {
@@ -123,7 +123,7 @@ impl Planner {
         vector_available: bool,
         dim: u16,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if query.tenant_id.0 == 0 {
+        if query.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
         let mut indices = Vec::new();
@@ -151,10 +151,10 @@ impl Planner {
         }
         let hash = match &query.query {
             RecallQueryTextOrVec::Text(_) => {
-                format!("recall:text:tenant={}:k={}", query.tenant_id.0, query.k)
+                format!("recall:text:tenant={}:k={}", query.tenant_id.as_u64(), query.k)
             }
             RecallQueryTextOrVec::Vec(_) => {
-                format!("recall:vec:tenant={}:k={}", query.tenant_id.0, query.k)
+                format!("recall:vec:tenant={}:k={}", query.tenant_id.as_u64(), query.k)
             }
         };
         Ok((
@@ -178,7 +178,7 @@ impl Planner {
         &self,
         subscribe: &LiveSubscribe,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if subscribe.tenant_id.0 == 0 {
+        if subscribe.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
         let requested_rate = subscribe
@@ -221,7 +221,7 @@ impl Planner {
         };
         let hash = format!(
             "live:tenant={}:scene={:?}:participants={}:rate={}:heartbeat={}:buffer={}:bp={}",
-            subscribe.tenant_id.0,
+            subscribe.tenant_id.as_u64(),
             subscribe.filters.scene,
             subscribe
                 .filters
@@ -248,7 +248,7 @@ impl Planner {
         &self,
         query: &AwarenessQuery,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if query.tenant_id.0 == 0 {
+        if query.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
 
@@ -280,7 +280,7 @@ impl Planner {
 
         let hash = format!(
             "awareness:tenant={}:cycle={:?}:parent={:?}:scope={:?}:barrier={:?}:env={:?}:limit={}",
-            query.tenant_id.0,
+            query.tenant_id.as_u64(),
             query.filters.awareness_cycle_id,
             query.filters.parent_cycle_id,
             query.filters.collab_scope_id,
@@ -303,7 +303,7 @@ impl Planner {
         &self,
         query: &ExplainReplayQuery,
     ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
-        if query.tenant_id.0 == 0 {
+        if query.tenant_id.as_u64() == 0 {
             return Err(GraphError::AuthForbidden);
         }
 

@@ -12,7 +12,7 @@ pub struct Checkpointer {
 
 impl Checkpointer {
     pub fn record(&self, state: CheckpointState) {
-        let key = (state.tenant_id.into_inner(), state.cycle_id.0);
+        let key = (state.tenant_id.into_inner(), state.cycle_id.as_u64());
         self.inner.lock().unwrap().insert(key, state);
     }
 

@@ -3,10 +3,10 @@ use time::OffsetDateTime;
 
 pub use soulseed_agi_core_models::components::{
     AIView, ConversationSummary, DegradationReason, EnvironmentAnchor, EnvironmentContext,
-    EnvironmentSoulState, ExternalSystems, FreshnessState, GroupView, HumanView, InteractionObject,
-    InternalScene, LatencyBand, LatencyWindow, LifeJourney, LifeMilestone, NetworkQuality,
-    RiskLevel, ServiceFreshness, SourceVersions, ToolDefLite, ToolPermission, VersionPointer,
-    TaskSummary,
+    EnvironmentSoulState, EnvironmentVector, ExternalSystems, FreshnessState, GroupView, HumanView,
+    InteractionObject, InternalScene, LatencyBand, LatencyWindow, LifeJourney, LifeMilestone,
+    NavigationPath, NavigationWaypoint, NetworkQuality, RiskLevel, ServiceFreshness,
+    SourceVersions, TaskSummary, ToolDefLite, ToolPermission, VersionPointer,
 };
 pub use soulseed_agi_core_models::EvidencePointer;
 

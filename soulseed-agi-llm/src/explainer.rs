@@ -1,7 +1,9 @@
-use crate::dto::{LlmExplain, LlmInput, ModelProfile, build_final_event};
-use crate::orchestrator::ExecutionOutcome;
+use crate::dto::{
+    ExecutionContext, LlmExplain, LlmPlanExplain, LlmRunExplain, ModelCandidate, PlannedLlm,
+    build_final_event,
+};
+use serde_json::{Value, json};
 use soulseed_agi_core_models::DialogueEvent;
-use serde_json::json;
 
 #[derive(Clone, Debug)]
 pub struct ExplainPackage {
@@ -13,47 +15,68 @@ pub struct ExplainPackage {
 pub struct LlmExplainer;
 
 impl LlmExplainer {
-    pub fn build(
-        &self,
-        input: &LlmInput,
-        model: &ModelProfile,
-        outcome: &ExecutionOutcome,
-    ) -> ExplainPackage {
+    pub fn build(&self, planned: &PlannedLlm, context: &ExecutionContext) -> ExplainPackage {
+        let model = &context.intent.model;
+        let result = &context.result;
+        let degradation_chain = context.degradation_chain.clone();
+        let indices_used = context.indices_used.clone();
+        let query_hash = context.query_hash.clone();
+        let decision = &planned.model_decision;
+
+        let mut candidates = Vec::with_capacity(decision.candidates.len() + 1);
+        candidates.push(ModelCandidate::selected(model.clone()));
+        for candidate in &decision.candidates {
+            if candidate.profile.model_id != model.model_id {
+                candidates.push(candidate.clone());
+            }
+        }
+
+        let policy_trace: Value = if decision.policy_trace.is_null() {
+            json!({
+                "source": "llm_router",
+                "scene": planned.input.scene,
+                "planner_hint": planned.plan.model_hint,
+            })
+        } else {
+            decision.policy_trace.clone()
+        };
+
+        let run_provider = if result.provider_metadata.is_null() {
+            json!({
+                "source": "llm_thin_waist",
+                "reasoning_visibility": result.reasoning_visibility,
+                "redacted": result.redacted,
+            })
+        } else {
+            result.provider_metadata.clone()
+        };
+
         let explain = LlmExplain {
-            model_id: model.model_id.clone(),
-            policy_digest: model.policy_digest.clone(),
-            degradation_reason: outcome.degradation_chain.clone(),
-            indices_used: outcome.indices_used.clone(),
-            query_hash: outcome.query_hash.clone(),
-            usage_rank: model.selection_rank,
-            usage_score: model.selection_score,
-            estimated_cost_usd: model
-                .estimated_cost_usd
-                .or(outcome.result.usage.total_cost_usd),
-            usage_band: model.usage_band.clone(),
-            should_use_factors: if !model.should_use_factors.is_null() {
-                model.should_use_factors.clone()
-            } else {
-                json!({
-                    "source": "llm_engine",
-                    "reasoning_visibility": outcome.result.reasoning_visibility,
-                    "usage_tokens": {
-                        "prompt": outcome.result.usage.prompt_tokens,
-                        "completion": outcome.result.usage.completion_tokens,
-                    },
-                    "degradation_chain": outcome.degradation_chain
-                })
+            schema_v: planned.plan.schema_v,
+            lineage: planned.plan.lineage.clone(),
+            anchor: planned.plan.anchor.clone(),
+            plan: LlmPlanExplain {
+                selected: model.clone(),
+                candidates,
+                policy_trace,
+            },
+            run: LlmRunExplain {
+                degradation_reason: degradation_chain.clone(),
+                indices_used: indices_used.clone(),
+                query_hash: query_hash.clone(),
+                usage: result.usage.clone(),
+                provider_metadata: run_provider,
             },
         };
 
         let final_event = build_final_event(
-            &input.anchor,
-            &input.scene,
-            &outcome.result,
+            &context.intent.anchor,
+            &planned.input.scene,
+            result,
             model,
-            outcome.degradation_chain.clone(),
-            outcome.indices_used.clone(),
-            outcome.query_hash.clone(),
+            degradation_chain.clone(),
+            indices_used.clone(),
+            query_hash.clone(),
         );
 
         ExplainPackage {

@@ -28,7 +28,7 @@ impl BudgetManager {
 
     pub fn evaluate(
         &self,
-        cycle_id: soulseed_agi_core_models::CycleId,
+        cycle_id: soulseed_agi_core_models::AwarenessCycleId,
         lane: &CycleLane,
         snapshot: BudgetSnapshot,
     ) -> Result<BudgetDecision, AceError> {

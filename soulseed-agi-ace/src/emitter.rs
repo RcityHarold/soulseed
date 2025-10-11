@@ -34,7 +34,7 @@ impl Emitter {
                 inference_cycle_sequence: 1,
                 degradation_reason: None,
                 payload: json!({
-                    "final_event_id": emission.final_event.event_id.0,
+                    "final_event_id": emission.final_event.event_id.as_u64(),
                     "lane": format!("{:?}", emission.lane),
                 }),
             },

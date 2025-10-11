@@ -89,7 +89,7 @@ impl RouterService {
             });
         }
 
-        let mut filtered = self.filter.filter(input, gate_outcome.accepted);
+        let filtered = self.filter.filter(input, gate_outcome.accepted);
         rejected.extend(filtered.rejected.clone());
 
         if filtered.accepted.is_empty() {

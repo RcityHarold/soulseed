@@ -1,4 +1,4 @@
-use crate::dto::LlmInput;
+use crate::dto::{LlmInput, PlanLineage, PrivacyDirective};
 use crate::errors::EngineError;
 use serde_json::Value;
 use soulseed_agi_core_models::awareness::{
@@ -15,6 +15,7 @@ pub struct LlmIntegrationOptions {
     pub tool_summary: Option<ToolResultSummary>,
     pub tool_indices: Option<Vec<String>>,
     pub tool_query_hash: Option<String>,
+    pub privacy: PrivacyDirective,
 }
 
 impl LlmIntegrationOptions {
@@ -26,6 +27,7 @@ impl LlmIntegrationOptions {
             tool_summary: None,
             tool_indices: None,
             tool_query_hash: None,
+            privacy: PrivacyDirective::default(),
         }
     }
 
@@ -51,6 +53,21 @@ impl LlmIntegrationOptions {
 
     pub fn tool_query_hash(mut self, hash: Option<String>) -> Self {
         self.tool_query_hash = hash;
+        self
+    }
+
+    pub fn allow_sensitive(mut self, allow: bool) -> Self {
+        self.privacy.allow_sensitive = allow;
+        self
+    }
+
+    pub fn privacy_ticket(
+        mut self,
+        ticket_id: Option<String>,
+        approved_by: Option<String>,
+    ) -> Self {
+        self.privacy.ticket_id = ticket_id;
+        self.privacy.approved_by = approved_by;
         self
     }
 }
@@ -104,12 +121,31 @@ pub fn build_llm_input(
         DecisionPlan::SelfReason { .. } => "self_reason_llm",
     };
 
+    let anchor_converted = convert_anchor(&decision.plan.anchor);
+    let lineage = PlanLineage {
+        version: anchor_converted
+            .sequence_number
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        supersedes: anchor_converted
+            .supersedes
+            .as_ref()
+            .map(|id| id.to_string()),
+        superseded_by: anchor_converted
+            .superseded_by
+            .as_ref()
+            .map(|id| id.to_string()),
+    };
+
     Ok(LlmInput {
-        anchor: convert_anchor(&decision.plan.anchor),
+        anchor: anchor_converted,
+        schema_v: decision.plan.anchor.schema_v,
+        lineage,
         scene: scene.into(),
         clarify_prompt: opts.clarify_prompt,
         tool_summary: opts.tool_summary,
         user_prompt: opts.user_prompt,
+        privacy: opts.privacy,
         context_tags: opts.context_tags,
         degrade_hint,
         tool_indices,

@@ -6,18 +6,21 @@ use soulseed_agi_core_models::awareness::{
     CollabPlan, DecisionBudgetEstimate, DecisionExplain, DecisionPath as AwarenessDecisionPath,
     DecisionPlan as AwarenessDecisionPlan, DecisionRationale, SelfPlan, ToolPlan, ToolPlanBarrier,
 };
+use soulseed_agi_core_models::common::EvidencePointer;
 use soulseed_agi_core_models::{
     AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
     EnvelopeHead, EventId, Provenance, RealTimePriority, Snapshot, Subject, SubjectRef, TraceId,
 };
-use soulseed_agi_core_models::common::EvidencePointer;
 use soulseed_agi_dfr::types::{BudgetEstimate, RouteExplain, RoutePlan, RouterDecision};
 use soulseed_agi_llm::{
     dto::{
-        LlmInput, LlmResult, ModelProfile, PromptSegment, ReasoningVisibility, TokenUsage,
+        LlmExecutionIntent, LlmInput, LlmResult, ModelCandidate, ModelProfile,
+        ModelRoutingDecision, PlanLineage, PrivacyDirective, PromptBundle, PromptSegment,
+        ReasoningVisibility, TokenUsage,
     },
     engine::{LlmConfig, LlmEngine},
     integrator::{LlmIntegrationOptions, build_llm_input},
+    orchestrator::LlmOrchestrator,
     tw_client::MockThinWaistClient,
 };
 use soulseed_agi_tools::dto::{
@@ -57,7 +60,7 @@ fn clarify_event(anchor: &Anchor, text: &str) -> DialogueEvent {
         .unwrap_or(ConversationScenario::HumanToAi);
     DialogueEvent {
         tenant_id: anchor.tenant_id,
-        event_id: EventId(now.unix_timestamp_nanos() as u64),
+        event_id: EventId::from_raw_unchecked(now.unix_timestamp_nanos() as u64),
         session_id: anchor.session_id.unwrap(),
         subject: Subject::Human(soulseed_agi_core_models::HumanId(777)),
         participants: vec![SubjectRef {
@@ -154,7 +157,10 @@ fn clarify_tool_llm_pipeline() {
         tool_event(&anchor, DialogueEventType::ToolResult, tool_meta.clone()),
     ];
 
-    let call_meta = tool_dialogue_events[0].metadata.as_object().expect("call meta");
+    let call_meta = tool_dialogue_events[0]
+        .metadata
+        .as_object()
+        .expect("call meta");
     assert_eq!(
         call_meta
             .get("degradation_reason")
@@ -236,8 +242,27 @@ fn clarify_tool_llm_pipeline() {
         estimated_cost_usd: Some(0.0032),
         should_use_factors: json!({"quality": 0.9, "latency_ms": 820}),
     };
-    let llm_client = MockThinWaistClient::new(model.clone());
-    llm_client.push_result(Ok(LlmResult {
+    let decision = ModelRoutingDecision {
+        selected: model.clone(),
+        candidates: vec![ModelCandidate {
+            profile: ModelProfile {
+                model_id: "llm.soulseed.backup".into(),
+                policy_digest: "sha256:llm-policy-backup".into(),
+                safety_tier: "standard".into(),
+                max_output_tokens: 2048,
+                selection_rank: Some(2),
+                selection_score: Some(0.54),
+                usage_band: Some("standard".into()),
+                estimated_cost_usd: Some(0.0025),
+                should_use_factors: json!({"quality": 0.6, "latency_ms": 620}),
+            },
+            exclusion_reason: Some("usage_budget".into()),
+            diagnostics: json!({"score": 0.54}),
+        }],
+        policy_trace: json!({"router_digest": "blake3:router", "trace_id": "route-1"}),
+    };
+    let llm_client = MockThinWaistClient::with_decision(decision);
+    let sample_result = LlmResult {
         completion: "工具已成功执行，结果简介如下：...".into(),
         summary: Some("工具执行成功，返回经压缩的最终答复".into()),
         evidence_pointer: Some(EvidencePointer {
@@ -248,11 +273,13 @@ fn clarify_tool_llm_pipeline() {
             span: None,
             access_policy: Some("summary_only".into()),
         }),
+        provider_metadata: json!({"provider": "mock", "latency_ms": 350}),
         reasoning: vec![PromptSegment {
             role: "assistant".into(),
             content: "综合工具结果生成最终答复".into(),
         }],
         reasoning_visibility: ReasoningVisibility::TicketRequired,
+        redacted: false,
         degradation_reason: Some("llm_timeout_recovered".into()),
         indices_used: Some(vec!["llm_cache_v1".into()]),
         query_hash: Some("llm#clarify".into()),
@@ -261,22 +288,35 @@ fn clarify_tool_llm_pipeline() {
             completion_tokens: 64,
             ..Default::default()
         },
-    }));
+        lineage: Default::default(),
+    };
+    llm_client.push_result(Ok(sample_result.clone()));
 
     let llm_engine = LlmEngine::new(&llm_client, LlmConfig::default());
     let llm_input = LlmInput {
         anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        lineage: soulseed_agi_llm::dto::PlanLineage {
+            version: anchor.sequence_number.unwrap_or(0) as u32,
+            supersedes: anchor.supersedes.as_ref().map(|id| id.to_string()),
+            superseded_by: anchor.superseded_by.as_ref().map(|id| id.to_string()),
+        },
         scene: "clarify_tool".into(),
         clarify_prompt: Some(clarify.into()),
         tool_summary: tool_summary.clone(),
         user_prompt: "请生成最终结论".into(),
+        privacy: Default::default(),
         context_tags: json!({"clarify": true}),
         degrade_hint: tool_degrade.clone(),
         tool_indices: tool_indices.clone(),
         tool_query_hash: tool_query_hash.clone(),
     };
 
-    let llm_output = llm_engine.run(llm_input).expect("llm run");
+    let planned = llm_engine.plan(llm_input).expect("llm plan");
+    let context = llm_engine
+        .compose_execution(&planned, sample_result)
+        .expect("compose execution");
+    let llm_output = llm_engine.finalize(planned, context).expect("llm finalize");
     let final_event = llm_output.final_event.clone();
 
     let mut pipeline = vec![clarify_event(&anchor, clarify)];
@@ -319,6 +359,13 @@ fn clarify_tool_llm_pipeline() {
     assert_eq!(
         final_event
             .metadata
+            .get("redacted")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        final_event
+            .metadata
             .get("model_rank")
             .and_then(|v| v.as_u64())
             .unwrap(),
@@ -337,18 +384,32 @@ fn clarify_tool_llm_pipeline() {
         "soulbase://llm/result/123"
     );
     assert_eq!(
-        llm_output.explain.usage_rank,
+        llm_output.explain.plan.selected.selection_rank,
         Some(1),
         "should propagate rank into explain"
     );
-    assert_eq!(llm_output.explain.usage_score, Some(0.82));
-    assert_eq!(llm_output.explain.usage_band.as_deref(), Some("standard"));
+    assert_eq!(llm_output.explain.plan.selected.selection_score, Some(0.82));
+    assert_eq!(
+        llm_output.explain.plan.selected.usage_band.as_deref(),
+        Some("standard")
+    );
     assert!(
         llm_output
             .explain
+            .plan
+            .selected
             .should_use_factors
             .get("quality")
             .is_some()
+    );
+    assert_eq!(
+        llm_output.explain.plan.candidates[0].profile.model_id,
+        "llm.soulseed.v1"
+    );
+    assert_eq!(
+        llm_output.explain.plan.candidates.len(),
+        2,
+        "should include selected + backup candidate"
     );
     assert_eq!(
         llm_output
@@ -358,13 +419,27 @@ fn clarify_tool_llm_pipeline() {
             .expect("summary returned"),
         "工具执行成功，返回经压缩的最终答复"
     );
+    assert!(
+        llm_output.result.redacted,
+        "result should be redacted without ticket approval"
+    );
+    assert_eq!(
+        llm_output.result.completion,
+        llm_output.result.summary.clone().unwrap()
+    );
 
-    let explain_reason = llm_output.explain.degradation_reason.as_deref().unwrap();
+    let explain_reason = llm_output
+        .explain
+        .run
+        .degradation_reason
+        .as_deref()
+        .unwrap();
     assert!(explain_reason.contains("timeout_fallback"));
     assert!(explain_reason.contains("llm_timeout_recovered"));
     assert_eq!(
         llm_output
             .explain
+            .run
             .indices_used
             .as_ref()
             .expect("indices used"),
@@ -373,10 +448,20 @@ fn clarify_tool_llm_pipeline() {
     assert_eq!(
         llm_output
             .explain
+            .run
             .query_hash
             .as_deref()
             .expect("query hash"),
         "timeline#clarify|llm#clarify"
+    );
+    assert_eq!(
+        llm_output
+            .explain
+            .run
+            .provider_metadata
+            .get("provider")
+            .and_then(|v| v.as_str()),
+        Some("mock")
     );
 
     let final_meta = final_event.metadata.as_object().expect("final metadata");
@@ -398,8 +483,6 @@ fn clarify_tool_llm_pipeline() {
         "timeline#clarify|llm#clarify"
     );
 
-    let reconciles = llm_client.take_reconciles();
-    assert!(!reconciles.is_empty());
 }
 
 #[test]
@@ -422,7 +505,7 @@ fn build_llm_input_from_dfr_decision() {
     };
 
     let route_plan = RoutePlan {
-        cycle_id: soulseed_agi_core_models::CycleId(1),
+        cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(1),
         anchor: awareness_anchor.clone(),
         fork: AwarenessFork::ToolPath,
         decision_plan: AwarenessDecisionPlan::Tool {
@@ -452,7 +535,7 @@ fn build_llm_input_from_dfr_decision() {
 
     let decision_path = AwarenessDecisionPath {
         anchor: awareness_anchor.clone(),
-        awareness_cycle_id: soulseed_agi_core_models::CycleId(1),
+        awareness_cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(1),
         inference_cycle_sequence: 1,
         fork: AwarenessFork::ToolPath,
         plan: AwarenessDecisionPlan::Tool {
@@ -493,7 +576,9 @@ fn build_llm_input_from_dfr_decision() {
             .clarify_prompt(Some("请输出最终答案".into()))
             .tool_summary(None)
             .tool_indices(Some(vec!["tool_idx".into()]))
-            .tool_query_hash(Some("tool#hash".into())),
+            .tool_query_hash(Some("tool#hash".into()))
+            .allow_sensitive(true)
+            .privacy_ticket(Some("ticket-approval-1".into()), Some("sec_officer".into())),
     )
     .expect("build llm input");
 
@@ -510,6 +595,12 @@ fn build_llm_input_from_dfr_decision() {
     assert_eq!(input.degrade_hint.as_deref(), Some("graph_degraded"));
     assert_eq!(input.user_prompt, "请总结工具执行");
     assert!(input.context_tags.is_object());
+    assert!(input.privacy.allow_sensitive);
+    assert_eq!(
+        input.privacy.ticket_id.as_deref(),
+        Some("ticket-approval-1")
+    );
+    assert_eq!(input.privacy.approved_by.as_deref(), Some("sec_officer"));
 }
 #[test]
 fn build_llm_input_scene_variants() {
@@ -535,7 +626,7 @@ fn build_llm_input_scene_variants() {
                      path_degrade: Option<AwarenessDegradationReason>| {
         RouterDecision {
             plan: RoutePlan {
-                cycle_id: soulseed_agi_core_models::CycleId(10),
+                cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(10),
                 anchor: awareness_anchor.clone(),
                 fork,
                 decision_plan: match fork {
@@ -587,7 +678,7 @@ fn build_llm_input_scene_variants() {
             },
             decision_path: AwarenessDecisionPath {
                 anchor: awareness_anchor.clone(),
-                awareness_cycle_id: soulseed_agi_core_models::CycleId(10),
+                awareness_cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(10),
                 inference_cycle_sequence: 1,
                 fork,
                 plan: match fork {
@@ -653,6 +744,8 @@ fn build_llm_input_scene_variants() {
         clarify_input.degrade_hint.as_deref(),
         Some("clarify_pending")
     );
+    assert!(!clarify_input.privacy.allow_sensitive);
+    assert!(clarify_input.privacy.ticket_id.is_none());
 
     let self_input = build_llm_input(
         &make_plan(
@@ -663,7 +756,9 @@ fn build_llm_input_scene_variants() {
         LlmIntegrationOptions::new("self reflection".into())
             .context_tags(json!({"mode": "self"}))
             .tool_indices(Some(vec!["ctx_idx".into()]))
-            .tool_query_hash(Some("ctx_hash".into())),
+            .tool_query_hash(Some("ctx_hash".into()))
+            .allow_sensitive(true)
+            .privacy_ticket(Some("ctx_ticket".into()), None),
     )
     .expect("self input");
     assert_eq!(self_input.scene, "self_reason_llm");
@@ -676,6 +771,8 @@ fn build_llm_input_scene_variants() {
         self_input.tool_query_hash.as_deref().expect("query hash"),
         "route_hash|ctx_hash"
     );
+    assert!(self_input.privacy.allow_sensitive);
+    assert_eq!(self_input.privacy.ticket_id.as_deref(), Some("ctx_ticket"));
 
     let collab_input = build_llm_input(
         &make_plan(
@@ -690,5 +787,86 @@ fn build_llm_input_scene_variants() {
     assert_eq!(
         collab_input.degrade_hint.as_deref(),
         Some("privacy_blocked")
+    );
+    assert!(!collab_input.privacy.allow_sensitive);
+}
+
+#[test]
+fn compose_context_keeps_full_content_with_ticket() {
+    let orchestrator = LlmOrchestrator::default();
+    let anchor = anchor();
+    let model = ModelProfile {
+        model_id: "llm.soulseed.v1".into(),
+        policy_digest: "sha256:policy".into(),
+        safety_tier: "standard".into(),
+        max_output_tokens: 2048,
+        selection_rank: Some(1),
+        selection_score: Some(0.9),
+        usage_band: Some("standard".into()),
+        estimated_cost_usd: Some(0.0032),
+        should_use_factors: json!({"quality": 0.9}),
+    };
+    let intent = LlmExecutionIntent {
+        intent_id: "intent-keep-full".into(),
+        anchor: anchor.clone(),
+        schema_v: anchor.schema_v,
+        lineage: PlanLineage::default(),
+        model: model.clone(),
+        prompt: PromptBundle {
+            system: "sys".into(),
+            conversation: vec![],
+            tool_summary: None,
+            metadata: json!({}),
+        },
+        privacy: PrivacyDirective {
+            allow_sensitive: false,
+            ticket_id: Some("ticket-keep".into()),
+            approved_by: Some("sec_officer".into()),
+        },
+        degrade_hint: None,
+        tool_indices: None,
+        tool_query_hash: None,
+        issued_at: OffsetDateTime::now_utc(),
+    };
+
+    let result = LlmResult {
+        completion: "full completion payload".into(),
+        summary: Some("summary view".into()),
+        evidence_pointer: Some(EvidencePointer {
+            uri: "soulbase://llm/result/full".into(),
+            digest_sha256: Some("sha256:full".into()),
+            media_type: Some("text/plain".into()),
+            blob_ref: None,
+            span: None,
+            access_policy: Some("ticket_required".into()),
+        }),
+        provider_metadata: json!({"provider": "mock", "latency_ms": 220}),
+        reasoning: vec![PromptSegment {
+            role: "assistant".into(),
+            content: "reasoning steps".into(),
+        }],
+        reasoning_visibility: ReasoningVisibility::TicketRequired,
+        redacted: false,
+        degradation_reason: None,
+        indices_used: None,
+        query_hash: None,
+        usage: TokenUsage {
+            prompt_tokens: 12,
+            completion_tokens: 7,
+            total_cost_usd: Some(0.0012),
+            currency: Some("USD".into()),
+        },
+        lineage: PlanLineage::default(),
+    };
+
+    let context = orchestrator
+        .compose_context(&intent, result)
+        .expect("compose context");
+    assert!(!context.result.redacted);
+    assert_eq!(context.result.completion, "full completion payload");
+    assert_eq!(context.result.reasoning.len(), 1);
+    assert_eq!(
+        context.result.summary.as_deref().expect("summary remains"),
+        "summary view"
     );
 }

@@ -1,5 +1,6 @@
 use serde_json::json;
 use soulseed_agi_authz::api::AuthzRequest;
+use soulseed_agi_authz::AccessTicket;
 use soulseed_agi_authz::errors::AuthzError;
 use soulseed_agi_authz::mock::InMemoryEnv;
 use soulseed_agi_authz::policy::{Obligation, Policy, Predicate};
@@ -182,6 +183,66 @@ fn view_trace_full_requires_ticket() {
 }
 
 #[test]
+fn view_trace_full_with_valid_ticket_allows() {
+    let mut env = InMemoryEnv::default();
+    env.set_fixed_time(1_000_000);
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.trace.full".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 50,
+            subject_roles: vec![Role::Owner],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn("urn:soulseed:model:trace:*".into()),
+            actions: vec![Action::ViewTraceFull],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![],
+            policy_digest: "sha256:t".into(),
+        },
+    );
+
+    let ticket = AccessTicket {
+        ticket_id: "ticket-1".into(),
+        tenant_id: TenantId(1),
+        subject: Subject::Human(HumanId(1001)),
+        approver: Subject::Human(HumanId(2000)),
+        purpose: "trace_audit".into(),
+        scope: ResourceUrn("urn:soulseed:model:trace:*".into()),
+        actions: vec![Action::ViewTraceFull],
+        policy_digest: "sha256:t".into(),
+        issued_at_ms: 900_000,
+        ttl_ms: 200_000,
+    };
+    env.insert_ticket(ticket.clone());
+
+    let req = AuthzRequest {
+        anchor: default_anchor(),
+        subject: Subject::Human(HumanId(1001)),
+        roles: vec![Role::Owner],
+        resource: ResourceUrn("urn:soulseed:model:trace:evt-902".into()),
+        action: Action::ViewTraceFull,
+        context: json!({}),
+        want_trace_full: true,
+        access_ticket: Some(ticket),
+        quota_cost: None,
+        idem_key: None,
+    };
+    let resp = env.evaluator().authorize(req).unwrap();
+    assert_eq!(resp.decision.effect, Effect::Allow);
+    assert!(
+        !resp
+            .decision
+            .obligations
+            .iter()
+            .any(|o| o.contains("TRACE_FORBIDDEN"))
+    );
+}
+
+#[test]
 fn consent_missing_triggers_ask_consent() {
     let env = InMemoryEnv::default();
     env.push_policy(
@@ -227,6 +288,76 @@ fn consent_missing_triggers_ask_consent() {
         .obligations
         .iter()
         .any(|o| o.contains("consent_required")));
+}
+
+#[test]
+fn more_specific_resource_policy_wins_at_equal_priority() {
+    let env = InMemoryEnv::default();
+    let session = SessionId(42);
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.global".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 30,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn("urn:soulseed:dialogue:session:*".into()),
+            actions: vec![Action::Read],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![Obligation::Custom("global".into())],
+            policy_digest: "sha256:global".into(),
+        },
+    );
+    env.push_policy(
+        TenantId(1),
+        Policy {
+            id: "allow.session".into(),
+            schema_v: 1,
+            version: 1,
+            parent: None,
+            priority: 30,
+            subject_roles: vec![Role::Member],
+            subject_attrs: json!({}),
+            resource_urn: ResourceUrn::dialogue_session(session),
+            actions: vec![Action::Read],
+            effect: Effect::Allow,
+            conditions: vec![Predicate::TenantEq],
+            obligations: vec![Obligation::Custom("session".into())],
+            policy_digest: "sha256:session".into(),
+        },
+    );
+
+    let resp = env
+        .evaluator()
+        .authorize(AuthzRequest {
+            anchor: default_anchor(),
+            subject: Subject::Human(HumanId(7)),
+            roles: vec![Role::Member],
+            resource: ResourceUrn::dialogue_session(session),
+            action: Action::Read,
+            context: json!({"scene": scenario_slug(ConversationScenario::HumanToAi)}),
+            want_trace_full: false,
+            access_ticket: None,
+            quota_cost: None,
+            idem_key: None,
+        })
+        .unwrap();
+
+    assert_eq!(resp.decision.effect, Effect::Allow);
+    assert!(resp
+        .decision
+        .obligations
+        .iter()
+        .any(|o| o == "custom:session"));
+    assert!(resp
+        .decision
+        .matched_policies
+        .iter()
+        .any(|(id, _, _)| id == "allow.session"));
 }
 
 #[test]
@@ -487,7 +618,7 @@ fn anchor_echoes_in_decision() {
             idem_key: None,
         })
         .unwrap();
-    assert_eq!(resp.decision.anchor.tenant_id.0, anchor.tenant_id.0);
+    assert_eq!(resp.decision.anchor.tenant_id.as_u64(), anchor.tenant_id.as_u64());
     assert_eq!(
         resp.decision.anchor.config_snapshot_hash,
         anchor.config_snapshot_hash

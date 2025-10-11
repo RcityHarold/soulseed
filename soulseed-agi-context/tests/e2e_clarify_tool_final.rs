@@ -37,7 +37,7 @@ fn mk_item(anchor: &Anchor, id: &str, partition: Partition, tokens: u32) -> Cont
         id: id.into(),
         partition,
         partition_hint: Some(partition),
-        source_event_id: EventId(100 + u64::from(tokens)),
+        source_event_id: EventId::from_raw_unchecked(100 + u64::from(tokens)),
         source_message_id: Some(MessageId(u64::from(tokens))),
         observed_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({
@@ -116,6 +116,7 @@ fn e2e_clarify_tool_final_flow() {
                 query_hash: Some("timeline#9#clarify".into()),
                 degradation_reason: Some("clarify_exhausted".into()),
             }),
+            previous_manifest: None,
         })
         .expect("runtime run succeeds");
 

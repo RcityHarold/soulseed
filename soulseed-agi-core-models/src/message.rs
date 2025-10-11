@@ -22,8 +22,7 @@ pub struct Message {
     pub access_class: AccessClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sequence_number: Option<u64>,
+    pub sequence_number: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<SubjectRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,10 +51,8 @@ impl Message {
         if matches!(self.access_class, AccessClass::Restricted) && self.provenance.is_none() {
             return Err(ModelError::Missing("provenance"));
         }
-        if let Some(seq) = self.sequence_number {
-            if seq == 0 {
-                return Err(ModelError::Invariant("sequence_number must be >= 1"));
-            }
+        if self.sequence_number == 0 {
+            return Err(ModelError::Invariant("sequence_number must be >= 1"));
         }
         Ok(())
     }

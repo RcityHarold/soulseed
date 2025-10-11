@@ -619,5 +619,5 @@ fn build_dialogue_events(
 }
 
 fn new_event_id(plan_id: &str, kind: &str, key: &str) -> crate::dto::EventId {
-    crate::dto::EventId(xxh3_64(format!("{plan_id}:{kind}:{key}").as_bytes()))
+    crate::dto::EventId::from_raw_unchecked(xxh3_64(format!("{plan_id}:{kind}:{key}").as_bytes()))
 }

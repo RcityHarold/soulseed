@@ -55,11 +55,11 @@ mod tests {
 
     fn anchor() -> AwarenessAnchor {
         AwarenessAnchor {
-            tenant_id: TenantId::new(7),
+            tenant_id: TenantId::from_raw_unchecked(7),
             envelope_id: Uuid::now_v7(),
             config_snapshot_hash: "cfg".into(),
             config_snapshot_version: 1,
-            session_id: Some(soulseed_agi_core_models::SessionId::new(5)),
+            session_id: Some(soulseed_agi_core_models::SessionId::from_raw_unchecked(5)),
             sequence_number: Some(3),
             access_class: AccessClass::Internal,
             provenance: None,
@@ -71,11 +71,11 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         DialogueEvent {
             tenant_id: anchor.tenant_id,
-            event_id: EventId(now.unix_timestamp_nanos() as u64),
+            event_id: EventId::generate(),
             session_id: anchor.session_id.unwrap(),
-            subject: Subject::AI(soulseed_agi_core_models::AIId::new(9)),
+            subject: Subject::AI(soulseed_agi_core_models::AIId::from_raw_unchecked(9)),
             participants: vec![SubjectRef {
-                kind: Subject::Human(soulseed_agi_core_models::HumanId::new(1)),
+                kind: Subject::Human(soulseed_agi_core_models::HumanId::from_raw_unchecked(1)),
                 role: Some("user".into()),
             }],
             head: EnvelopeHead {
@@ -158,6 +158,10 @@ mod tests {
                 reason: Some("hitl_priority".into()),
                 fingerprint: Some("fp-1".into()),
             }],
+            context_manifest: None,
+            context_bundle: None,
+            prompt_bundle: None,
+            explain_bundle: None,
         };
 
         let ca: Arc<dyn CaService> = Arc::new(StubCa { response });
@@ -182,7 +186,7 @@ mod tests {
         );
 
         let input = SyncPointInput {
-            cycle_id: soulseed_agi_core_models::CycleId(88),
+            cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(88),
             kind: SyncPointKind::ClarifyAnswered,
             anchor: anchor.clone(),
             events: vec![dialogue_event(&anchor)],
@@ -257,16 +261,20 @@ impl SyncPointAggregator {
         }
 
         let mut events = input.events.clone();
-        events.sort_by_key(|ev| (ev.timestamp_ms, ev.event_id.0));
+        events.sort_by_key(|ev| (ev.timestamp_ms, ev.event_id.as_u64()));
         let mut seen = std::collections::HashSet::new();
-        events.retain(|ev| seen.insert(ev.event_id.0));
+        events.retain(|ev| seen.insert(ev.event_id.as_u64()));
 
         let mut missing = 0u32;
+        let mut missing_sequences = Vec::new();
         let mut last_seq: Option<u64> = None;
         for ev in &events {
             let seq = ev.sequence_number;
             if let Some(prev) = last_seq {
                 if seq > prev + 1 {
+                    for missing_seq in (prev + 1)..seq {
+                        missing_sequences.push(missing_seq);
+                    }
                     missing = missing.saturating_add((seq - prev - 1) as u32);
                 }
             }
@@ -289,7 +297,15 @@ impl SyncPointAggregator {
             delta_patch,
             awareness_events,
             injections,
+            context_manifest,
+            context_bundle,
+            prompt_bundle,
+            explain_bundle,
         } = response;
+
+        let manifest_value = context_manifest
+            .clone()
+            .unwrap_or_else(|| input.context_manifest.clone());
 
         let summary = format!(
             "syncpoint:{:?} events={} budget_spent={}",
@@ -311,26 +327,35 @@ impl SyncPointAggregator {
                 injections
                     .iter()
                     .find_map(|decision| decision.reason.clone())
+            })
+            .or_else(|| {
+                explain_bundle
+                    .as_ref()
+                    .and_then(|bundle| bundle.degradation_reason.clone())
             });
 
-        let manifest_entries = input
-            .context_manifest
-            .get("entries")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.len())
-            .unwrap_or_default();
+        let manifest_entries = count_manifest_items(&manifest_value);
 
-        let (applied, deferred, ignored) =
-            injections
-                .iter()
-                .fold((0u32, 0u32, 0u32), |mut acc, decision| {
-                    match decision.action {
-                        InjectionAction::Applied => acc.0 += 1,
-                        InjectionAction::Deferred => acc.1 += 1,
-                        InjectionAction::Ignored => acc.2 += 1,
-                    }
-                    acc
-                });
+        let mut applied = 0u32;
+        let mut deferred = 0u32;
+        let mut ignored = 0u32;
+        let mut applied_ids = Vec::new();
+        let mut ignored_ids = Vec::new();
+        for decision in &injections {
+            match decision.action {
+                InjectionAction::Applied => {
+                    applied += 1;
+                    applied_ids.push(decision.injection_id.to_string());
+                }
+                InjectionAction::Deferred => {
+                    deferred += 1;
+                }
+                InjectionAction::Ignored => {
+                    ignored += 1;
+                    ignored_ids.push(decision.injection_id.to_string());
+                }
+            }
+        }
 
         let window_ms = (input.timeframe.1 - input.timeframe.0).whole_milliseconds();
         let metrics = json!({
@@ -350,12 +375,6 @@ impl SyncPointAggregator {
         });
 
         let mut awareness_events = awareness_events;
-        let mut next_event_id = awareness_events
-            .iter()
-            .map(|event| event.event_id.0)
-            .max()
-            .unwrap_or(input.cycle_id.0)
-            + 1;
         let occurred_at_ms = input.timeframe.1.unix_timestamp() * 1000;
 
         for decision in &injections {
@@ -374,7 +393,7 @@ impl SyncPointAggregator {
 
             awareness_events.push(AwarenessEvent {
                 anchor: input.anchor.clone(),
-                event_id: soulseed_agi_core_models::EventId(next_event_id),
+                event_id: soulseed_agi_core_models::EventId::generate(),
                 event_type,
                 occurred_at_ms,
                 awareness_cycle_id: input.cycle_id,
@@ -386,13 +405,12 @@ impl SyncPointAggregator {
                 degradation_reason: map_degradation(decision.reason.as_deref()),
                 payload,
             });
-            next_event_id += 1;
         }
 
         if let Some(patch) = delta_patch.as_ref() {
             awareness_events.push(AwarenessEvent {
                 anchor: input.anchor.clone(),
-                event_id: soulseed_agi_core_models::EventId(next_event_id),
+                event_id: soulseed_agi_core_models::EventId::generate(),
                 event_type: AwarenessEventType::DeltaPatchGenerated,
                 occurred_at_ms,
                 awareness_cycle_id: input.cycle_id,
@@ -409,7 +427,6 @@ impl SyncPointAggregator {
                     "removed": patch.removed,
                 }),
             });
-            next_event_id += 1;
         }
 
         let mut summary_payload = json!({
@@ -422,7 +439,7 @@ impl SyncPointAggregator {
 
         awareness_events.push(AwarenessEvent {
             anchor: input.anchor.clone(),
-            event_id: soulseed_agi_core_models::EventId(next_event_id),
+            event_id: soulseed_agi_core_models::EventId::generate(),
             event_type: AwarenessEventType::SyncPointReported,
             occurred_at_ms,
             awareness_cycle_id: input.cycle_id,
@@ -436,9 +453,17 @@ impl SyncPointAggregator {
         });
 
         let delta_digest = delta_patch.as_ref().map(|patch| patch.patch_digest.clone());
+        let (delta_added, delta_updated, delta_removed) = match delta_patch.as_ref() {
+            Some(patch) => (
+                patch.added.clone(),
+                patch.updated.clone(),
+                patch.removed.clone(),
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
 
         let mut hasher = Hasher::new();
-        hasher.update(&input.cycle_id.0.to_le_bytes());
+        hasher.update(&input.cycle_id.as_u64().to_le_bytes());
         hasher.update(format!("{:?}", input.kind).as_bytes());
         hasher.update(&input.anchor.tenant_id.into_inner().to_le_bytes());
         hasher.update(metrics.to_string().as_bytes());
@@ -457,6 +482,12 @@ impl SyncPointAggregator {
             applied,
             missing,
             ignored,
+            applied_ids,
+            ignored_ids,
+            missing_sequences,
+            delta_added,
+            delta_updated,
+            delta_removed,
             budget_snapshot: input.budget.clone(),
             delta_patch_digest: delta_digest.clone(),
             explain_fingerprint: explain_fingerprint.clone(),
@@ -468,21 +499,30 @@ impl SyncPointAggregator {
             delta_patch,
             injections,
             explain_fingerprint,
+            context_manifest: if manifest_value.is_null() {
+                None
+            } else {
+                Some(manifest_value)
+            },
+            context_bundle,
+            prompt_bundle,
+            explain_bundle,
+            router_decision: None,
         })
     }
 }
 
 fn map_degradation(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
     match reason.unwrap_or_default() {
-        "clarify_high_priority"
-        | "clarify_conflict"
-        | "timeout_fallback"
-        | "llm_timeout_recovered"
-        | "requires_follow_up" => Some(AwarenessDegradationReason::ClarifyExhausted),
+        "clarify_high_priority" | "clarify_conflict" => {
+            Some(AwarenessDegradationReason::ClarifyExhausted)
+        }
+        "timeout_fallback" | "llm_timeout_recovered" | "timeout" | "budget_walltime" => {
+            Some(AwarenessDegradationReason::BudgetWalltime)
+        }
+        "requires_follow_up" => None,
         "stale_fact" => Some(AwarenessDegradationReason::GraphDegraded),
-        "timeout" => Some(AwarenessDegradationReason::BudgetWalltime),
         "budget_tokens" => Some(AwarenessDegradationReason::BudgetTokens),
-        "budget_walltime" => Some(AwarenessDegradationReason::BudgetWalltime),
         "budget_external_cost" => Some(AwarenessDegradationReason::BudgetExternalCost),
         "graph_degraded" => Some(AwarenessDegradationReason::GraphDegraded),
         "envctx_degraded" => Some(AwarenessDegradationReason::EnvctxDegraded),
@@ -491,4 +531,26 @@ fn map_degradation(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
         "empty_catalog" => Some(AwarenessDegradationReason::EmptyCatalog),
         _ => None,
     }
+}
+
+fn count_manifest_items(manifest: &Value) -> usize {
+    if manifest.is_null() {
+        return 0;
+    }
+    if let Some(entries) = manifest.get("entries").and_then(|v| v.as_array()) {
+        return entries.len();
+    }
+    if let Some(segments) = manifest.get("segments").and_then(|v| v.as_array()) {
+        return segments
+            .iter()
+            .map(|segment| {
+                segment
+                    .get("items")
+                    .and_then(|items| items.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or_default()
+            })
+            .sum();
+    }
+    0
 }

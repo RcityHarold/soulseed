@@ -38,6 +38,8 @@ impl LlmPlanner {
         LlmPlan {
             plan_id: new_plan_id(&input.anchor),
             anchor: input.anchor.clone(),
+            schema_v: input.schema_v,
+            lineage: input.lineage.clone(),
             steps,
             model_hint: planner_hint.cloned(),
         }

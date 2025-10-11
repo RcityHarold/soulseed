@@ -118,6 +118,8 @@ fn env_ctx(anchor: &Anchor) -> envctx::EnvironmentContext {
             observe_watermark: None,
             monitoring_snapshot: None,
         },
+        environment_vectors: Vec::new(),
+        navigation_path: None,
         context_digest: String::new(),
         degradation_reason: None,
         lite_mode: false,
@@ -150,7 +152,7 @@ fn mk_item(
         id: id.into(),
         partition,
         partition_hint: Some(partition),
-        source_event_id: EventId(10),
+        source_event_id: EventId::from_raw_unchecked(10),
         source_message_id: Some(MessageId(11)),
         observed_at: OffsetDateTime::UNIX_EPOCH,
         content: json!({"text": id}),
@@ -550,7 +552,7 @@ fn six_anchor_consistency_and_privacy_redline() {
             previous_manifest: None,
         })
         .unwrap();
-    assert_eq!(out.bundle.anchor.tenant_id.0, anchor.tenant_id.0);
+    assert_eq!(out.bundle.anchor.tenant_id.as_u64(), anchor.tenant_id.as_u64());
 
     let mut anchor_bad = anchor.clone();
     anchor_bad.provenance = None;
@@ -612,6 +614,105 @@ fn env_snapshot_event_contains_scene() {
         .entries
         .iter()
         .all(|entry| entry.reason.contains("fallback") || entry.reason.contains("quality")));
+}
+
+#[test]
+fn dedup_removes_lower_scoring_duplicates() {
+    let anchor = default_anchor();
+    let mut cfg = cfg_for(&anchor);
+    cfg.target_tokens = 400;
+    let qgate = QualityGateStrict::default();
+    let store = InMemoryStore::default();
+    let engine = make_engine(&qgate, &store);
+
+    let mut item_primary = mk_item(&anchor, "dup_a", Partition::P2Evidence, 120, true);
+    item_primary.digests.content = Some("sha256:dedup".into());
+    item_primary.features.rel = 0.9;
+
+    let mut item_duplicate = mk_item(&anchor, "dup_b", Partition::P2Evidence, 110, true);
+    item_duplicate.digests.content = Some("sha256:dedup".into());
+    item_duplicate.features.rel = 0.2;
+
+    let env_context = env_ctx(&anchor);
+    let out = engine
+        .run(RunInput {
+            anchor,
+            env_context,
+            config: cfg,
+            items: vec![item_primary, item_duplicate],
+            graph_explain: None,
+            previous_manifest: None,
+        })
+        .unwrap();
+
+    let evidence_items: Vec<String> = out
+        .bundle
+        .segments
+        .iter()
+        .find(|seg| seg.partition == Partition::P2Evidence)
+        .map(|seg| seg.items.iter().map(|item| item.ci_id.clone()).collect())
+        .unwrap_or_default();
+
+    assert!(evidence_items.len() <= 1);
+    assert!(
+        !evidence_items.iter().any(|entry| entry == "dup_b"),
+        "lower scoring duplicate should be removed"
+    );
+    assert!(out
+        .redaction
+        .entries
+        .iter()
+        .any(|entry| entry.ci_id == "dup_b" && entry.reason.contains("dedup")));
+    assert!(out
+        .bundle
+        .explain
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("ctx_dedup")));
+}
+
+#[test]
+fn privacy_removes_evidence_without_pointer() {
+    let anchor = default_anchor();
+    let mut cfg = cfg_for(&anchor);
+    cfg.target_tokens = 200;
+    let qgate = QualityGateStrict::default();
+    let store = InMemoryStore::default();
+    let engine = make_engine(&qgate, &store);
+
+    let item = mk_item(&anchor, "no_ptr", Partition::P2Evidence, 120, false);
+    let env_context = env_ctx(&anchor);
+
+    let out = engine
+        .run(RunInput {
+            anchor,
+            env_context,
+            config: cfg,
+            items: vec![item],
+            graph_explain: None,
+            previous_manifest: None,
+        })
+        .unwrap();
+
+    let evidence_count = out
+        .bundle
+        .segments
+        .iter()
+        .find(|seg| seg.partition == Partition::P2Evidence)
+        .map(|seg| seg.items.len())
+        .unwrap_or(0);
+    assert_eq!(evidence_count, 0);
+    assert!(out
+        .redaction
+        .entries
+        .iter()
+        .any(|entry| entry.ci_id == "no_ptr" && entry.reason.contains("privacy")));
+    assert!(out
+        .bundle
+        .explain
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("ctx_privacy:no_ptr")));
 }
 
 #[test]

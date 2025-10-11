@@ -1,5 +1,6 @@
 use crate::aggregator::SyncPointAggregator;
 use crate::budget::BudgetManager;
+use crate::ca::InjectionAction;
 use crate::checkpointer::Checkpointer;
 use crate::emitter::Emitter;
 use crate::errors::AceError;
@@ -12,11 +13,13 @@ use crate::types::{
     SyncPointInput,
 };
 use serde_json::{Map, Value, json};
-use soulseed_agi_core_models::CycleId;
+use soulseed_agi_core_models::AwarenessCycleId;
 use soulseed_agi_core_models::awareness::AwarenessEventType;
 use soulseed_agi_core_models::common::EvidencePointer;
+use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use time::{Duration, OffsetDateTime};
 
 pub struct AceEngine<'a> {
@@ -28,6 +31,8 @@ pub struct AceEngine<'a> {
     pub emitter: &'a Emitter,
     pub hitl: &'a HitlService,
     pub metrics: &'a dyn AceMetrics,
+    pub router: &'a RouterService,
+    pub route_planner: &'a RoutePlanner,
     pub lane_cooldown: Duration,
     finalized: Arc<Mutex<HashSet<u64>>>,
 }
@@ -43,6 +48,8 @@ impl<'a> AceEngine<'a> {
         emitter: &'a Emitter,
         hitl: &'a HitlService,
         metrics: &'a dyn AceMetrics,
+        router: &'a RouterService,
+        route_planner: &'a RoutePlanner,
     ) -> Self {
         Self {
             scheduler,
@@ -53,23 +60,35 @@ impl<'a> AceEngine<'a> {
             emitter,
             hitl,
             metrics,
+            router,
+            route_planner,
             lane_cooldown: Duration::seconds(2),
             finalized: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     pub fn schedule_cycle(&self, request: CycleRequest) -> Result<ScheduleOutcome, AceError> {
-        let tenant_raw = request.anchor.tenant_id.into_inner();
+        let decide_start = Instant::now();
+        let dfr = DfrEngine::new(self.router, self.route_planner);
+        let decision = dfr
+            .route(request.router_input.clone(), request.candidates.clone())
+            .map_err(|err| AceError::Dfr(err.to_string()))?;
+        let lane: CycleLane = decision.plan.fork.into();
+        let anchor = decision.plan.anchor.clone();
+        let tenant_raw = anchor.tenant_id.into_inner();
         self.checkpointer
-            .ensure_lane_idle(tenant_raw, &request.lane, self.lane_cooldown)?;
+            .ensure_lane_idle(tenant_raw, &lane, self.lane_cooldown)?;
 
-        let outcome = self.scheduler.schedule(
-            request.anchor.clone(),
-            request.lane.clone(),
-            request.tool_plan.clone(),
-            request.llm_plan.clone(),
-            request.budget.clone(),
-        )?;
+        let decide_latency_ms = decide_start.elapsed().as_secs_f64() * 1000.0;
+        self.metrics.gauge(
+            "ace.decide.latency_ms",
+            decide_latency_ms,
+            &[("lane", format!("{:?}", lane))],
+        );
+
+        let outcome = self
+            .scheduler
+            .schedule(decision, request.budget.clone())?;
 
         if let Some(cycle) = &outcome.cycle {
             self.checkpointer.record(crate::types::CheckpointState {
@@ -82,10 +101,16 @@ impl<'a> AceEngine<'a> {
             if matches!(cycle.lane, CycleLane::Clarify) {
                 self.hitl.mark_cycle_active(cycle.anchor.tenant_id);
             }
-            let labels = vec![("lane", format!("{:?}", cycle.lane))];
+            let labels = vec![
+                ("lane", format!("{:?}", cycle.lane)),
+                (
+                    "fork",
+                    format!("{:?}", cycle.router_decision.plan.fork),
+                ),
+            ];
             self.metrics.counter("ace.schedule.accepted", 1.0, &labels);
         } else {
-            let mut labels = vec![("lane", format!("{:?}", request.lane))];
+            let mut labels = vec![("lane", format!("{:?}", lane))];
             if let Some(reason) = outcome.reason.clone() {
                 labels.push(("reason", reason));
             }
@@ -96,7 +121,7 @@ impl<'a> AceEngine<'a> {
 
     pub fn evaluate_budget(
         &self,
-        cycle_id: CycleId,
+        cycle_id: AwarenessCycleId,
         lane: &CycleLane,
         budget: BudgetSnapshot,
     ) -> Result<crate::types::BudgetDecision, AceError> {
@@ -145,9 +170,17 @@ impl<'a> AceEngine<'a> {
             }
         }
         let outcome = self.aggregator.aggregate(input)?;
+        for decision in &outcome.injections {
+            if matches!(
+                decision.action,
+                InjectionAction::Applied | InjectionAction::Ignored
+            ) {
+                self.hitl.resolve_injection(decision.injection_id);
+            }
+        }
         let labels = vec![
             ("kind", format!("{:?}", outcome.report.kind)),
-            ("cycle_id", outcome.report.cycle_id.0.to_string()),
+            ("cycle_id", outcome.report.cycle_id.as_u64().to_string()),
         ];
         self.metrics.counter("ace.syncpoint.absorbed", 1.0, &labels);
         Ok(outcome)
@@ -157,19 +190,9 @@ impl<'a> AceEngine<'a> {
         let tenant_id = emission.anchor.tenant_id.into_inner();
         emission.final_event = sanitize_final_event(&emission.lane, &emission.final_event);
 
+        let cycle_key = emission.cycle_id.as_u64();
         let mut registry = self.finalized.lock().unwrap();
-        if registry.insert(emission.cycle_id.0) {
-            drop(registry);
-            let envelope = self.emitter.emit(emission.clone())?;
-            self.outbox.enqueue(envelope)?;
-            self.checkpointer.finish(tenant_id);
-            self.scheduler.finish(tenant_id);
-            if matches!(emission.lane, CycleLane::Clarify) {
-                self.hitl.clear_cycle_active(emission.anchor.tenant_id);
-            }
-            let labels = vec![("lane", format!("{:?}", emission.lane))];
-            self.metrics.counter("ace.cycle.finalized", 1.0, &labels);
-        } else {
+        if registry.contains(&cycle_key) {
             drop(registry);
             let late_event = soulseed_agi_core_models::awareness::AwarenessEvent {
                 anchor: emission.anchor.clone(),
@@ -184,7 +207,7 @@ impl<'a> AceEngine<'a> {
                 inference_cycle_sequence: 1,
                 degradation_reason: None,
                 payload: json!({
-                    "late_event_id": emission.final_event.event_id.0,
+                    "late_event_id": emission.final_event.event_id.as_u64(),
                     "original_timestamp": emission.final_event.timestamp_ms,
                 }),
             };
@@ -199,6 +222,30 @@ impl<'a> AceEngine<'a> {
             };
             self.outbox.enqueue(envelope)?;
             self.metrics.counter("ace.cycle.late_receipt", 1.0, &[]);
+            return Ok(());
+        }
+
+        registry.insert(cycle_key);
+        drop(registry);
+
+        let result = (|| -> Result<(), AceError> {
+            let envelope = self.emitter.emit(emission.clone())?;
+            let mut reservation = self.outbox.reserve(envelope);
+            reservation.commit()?;
+            self.checkpointer.finish(tenant_id);
+            self.scheduler.finish(tenant_id);
+            if matches!(emission.lane, CycleLane::Clarify) {
+                self.hitl.clear_cycle_active(emission.anchor.tenant_id);
+            }
+            let labels = vec![("lane", format!("{:?}", emission.lane))];
+            self.metrics.counter("ace.cycle.finalized", 1.0, &labels);
+            Ok(())
+        })();
+
+        if let Err(err) = result {
+            let mut registry = self.finalized.lock().unwrap();
+            registry.remove(&cycle_key);
+            return Err(err);
         }
         Ok(())
     }
@@ -217,7 +264,7 @@ fn sanitize_final_event(
         if sanitized.evidence_pointer.is_none() {
             if let Some(digest) = sanitized.content_digest_sha256.clone() {
                 sanitized.evidence_pointer = Some(EvidencePointer {
-                    uri: format!("context://summary/{}", sanitized.event_id.0),
+                    uri: format!("context://summary/{}", sanitized.event_id.as_u64()),
                     digest_sha256: Some(digest.clone()),
                     media_type: Some("text/plain".into()),
                     blob_ref: None,

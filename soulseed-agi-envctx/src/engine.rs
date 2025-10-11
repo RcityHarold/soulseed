@@ -86,6 +86,8 @@ where
             tool_permission,
             life_journey,
             source_versions,
+            environment_vectors: Vec::new(),
+            navigation_path: None,
             context_digest: String::new(),
             degradation_reason: degradation.clone(),
             lite_mode: degradation.is_some(),

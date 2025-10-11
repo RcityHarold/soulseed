@@ -4,10 +4,11 @@ use serde_json::json;
 use time::OffsetDateTime;
 
 use crate::{
-    cache::InMemoryPolicyStore,
+    cache::{InMemoryPolicyStore, InMemoryTicketStore},
     policy::Policy,
     policy::Predicate,
     quota::ScenarioQuotaClient,
+    ticket::AccessTicket,
     types::{scenario_slug, Action, ConversationScenario, Effect, ResourceUrn, Role, TenantId},
     Evaluator,
 };
@@ -15,6 +16,7 @@ use crate::{
 pub struct InMemoryEnv {
     pub policies: Arc<InMemoryPolicyStore>,
     pub quota: Arc<ScenarioQuotaClient>,
+    pub tickets: Arc<InMemoryTicketStore>,
     clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
@@ -23,6 +25,7 @@ impl Default for InMemoryEnv {
         Self {
             policies: Arc::new(InMemoryPolicyStore::default()),
             quota: Arc::new(ScenarioQuotaClient::new()),
+            tickets: Arc::new(InMemoryTicketStore::default()),
             clock: Arc::new(|| OffsetDateTime::now_utc().unix_timestamp() * 1000),
         }
     }
@@ -33,8 +36,14 @@ impl InMemoryEnv {
         self.policies.push(tenant, policy);
     }
 
+    pub fn insert_ticket(&self, ticket: AccessTicket) {
+        self.tickets.insert(ticket);
+    }
+
     pub fn evaluator(&self) -> Evaluator {
-        Evaluator::new(self.policies.clone(), self.quota.clone()).with_clock(self.clock.clone())
+        Evaluator::new(self.policies.clone(), self.quota.clone())
+            .with_ticket_store(self.tickets.clone())
+            .with_clock(self.clock.clone())
     }
 
     pub fn set_fixed_time(&mut self, time_ms: i64) {

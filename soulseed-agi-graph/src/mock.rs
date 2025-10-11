@@ -8,7 +8,7 @@ use crate::{
     errors::{Degradation, GraphError},
     plan::PreparedPlan,
     scenario::scenario_rule,
-    types::{ConceptNode, EmotionNode, SemanticEdge, SemanticEdgeKind, TopicNode},
+    types::{ConceptNode, EmotionNode, SemanticEdge, SemanticEdgeKind, SemanticRef, TopicNode},
     AwarenessEventType, DialogueEvent, EventId, LiveEventPointer, LiveSubscribe, RecallQuery,
     SyncPointKind, TimelineQuery, TimelineResponse,
 };
@@ -34,10 +34,10 @@ impl MockExecutor {
     }
 
     pub fn append_event(&mut self, event: DialogueEvent) -> Result<(), GraphError> {
-        if !self.caps.allowed_tenants.contains(&event.tenant_id.0) {
+        if !self.caps.allowed_tenants.contains(&event.tenant_id.as_u64()) {
             return Err(GraphError::AuthForbidden);
         }
-        let key = (event.tenant_id.0, event.session_id.0, event.sequence_number);
+        let key = (event.tenant_id.as_u64(), event.session_id.as_u64(), event.sequence_number);
         if self.timeline_store.contains_key(&key) {
             return Err(GraphError::StorageConflict);
         }
@@ -50,7 +50,7 @@ impl MockExecutor {
         plan: PreparedPlan,
         query: &TimelineQuery,
     ) -> Result<TimelineResponse, GraphError> {
-        self.ensure_tenant(query.tenant_id.0)?;
+        self.ensure_tenant(query.tenant_id.as_u64())?;
         match &plan.plan {
             crate::plan::Plan::Timeline {
                 scenario,
@@ -105,7 +105,7 @@ impl MockExecutor {
         query: &crate::api::CausalQuery,
         degradation: Option<Degradation>,
     ) -> Result<crate::api::CausalResponse, GraphError> {
-        self.ensure_tenant(query.tenant_id.0)?;
+        self.ensure_tenant(query.tenant_id.as_u64())?;
         if let crate::plan::Plan::Causal {
             scenario,
             event_types,
@@ -133,17 +133,42 @@ impl MockExecutor {
                 }
             }
         }
+        let plan_scenario = match &plan.plan {
+            crate::plan::Plan::Causal { scenario, .. } => scenario.clone(),
+            _ => None,
+        };
+        let semantic_edges = vec![SemanticEdge {
+            from: SemanticRef::Event(query.root_event),
+            to: SemanticRef::Concept(format!("concept:{}", query.root_event.as_u64())),
+            kind: SemanticEdgeKind::EventToConcept,
+            weight: Some(0.7),
+        }];
+
+        if let Some(scene) = query
+            .scenario
+            .as_ref()
+            .or(plan_scenario.as_ref())
+        {
+            let allowed = scenario_rule(scene).allowed_semantic_edges;
+            if semantic_edges
+                .iter()
+                .any(|edge| !allowed.contains(&edge.kind))
+            {
+                return Err(GraphError::InvalidQuery("semantic_edge_not_allowed"));
+            }
+        }
+
         Ok(crate::api::CausalResponse {
             tenant_id: query.tenant_id,
             nodes: Vec::new(),
             edges: vec![CausalEdge {
                 from: query.root_event,
-                to: EventId(query.root_event.0 + 1),
+                to: EventId::from_raw_unchecked(query.root_event.as_u64() + 1),
                 edge_type: "TRIGGERED".into(),
                 weight: Some(0.7),
             }],
             concept_nodes: vec![ConceptNode {
-                concept_id: format!("concept:{}", query.root_event.0),
+                concept_id: format!("concept:{}", query.root_event.as_u64()),
                 label: "goal_alignment".into(),
                 score: Some(0.82),
                 evidence_pointer: None,
@@ -159,12 +184,7 @@ impl MockExecutor {
                 intensity: Some(0.4),
                 evidence_pointer: None,
             }],
-            semantic_edges: vec![SemanticEdge {
-                from: query.root_event.0.to_string(),
-                to: format!("concept:{}", query.root_event.0),
-                kind: SemanticEdgeKind::EventToConcept,
-                weight: Some(0.7),
-            }],
+            semantic_edges,
             indices_used: plan.indices_used,
             query_hash: "mock-causal".into(),
             degradation_reason: degradation.map(|d| d.reason),
@@ -177,7 +197,7 @@ impl MockExecutor {
         query: &RecallQuery,
         degradation: Option<Degradation>,
     ) -> Result<RecallResponse, GraphError> {
-        self.ensure_tenant(query.tenant_id.0)?;
+        self.ensure_tenant(query.tenant_id.as_u64())?;
         match &plan.plan {
             crate::plan::Plan::VectorAnn { filter, .. }
             | crate::plan::Plan::SparseBm25 { filter, .. } => {
@@ -235,7 +255,7 @@ impl MockExecutor {
         plan: PreparedPlan,
         query: &AwarenessQuery,
     ) -> Result<AwarenessResponse, GraphError> {
-        self.ensure_tenant(query.tenant_id.0)?;
+        self.ensure_tenant(query.tenant_id.as_u64())?;
         if let crate::plan::Plan::Awareness { filters, .. } = &plan.plan {
             Self::ensure_option_match(
                 &filters.awareness_cycle_id,
@@ -308,7 +328,7 @@ impl MockExecutor {
         query: &ExplainReplayQuery,
         degradation: Option<Degradation>,
     ) -> Result<ExplainReplayResponse, GraphError> {
-        self.ensure_tenant(query.tenant_id.0)?;
+        self.ensure_tenant(query.tenant_id.as_u64())?;
 
         let mut filters = AwarenessFilters::default();
         filters.awareness_cycle_id = Some(query.awareness_cycle_id);
@@ -361,7 +381,7 @@ impl MockExecutor {
         plan: PreparedPlan,
         sub: &LiveSubscribe,
     ) -> Result<Vec<LiveEventPointer>, GraphError> {
-        self.ensure_tenant(sub.tenant_id.0)?;
+        self.ensure_tenant(sub.tenant_id.as_u64())?;
         if let crate::plan::Plan::Live {
             filters,
             rate,

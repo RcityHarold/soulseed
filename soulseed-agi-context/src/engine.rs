@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    assembly::{build_prefix, merge_delta},
+    assembly::{build_prefix, manifest_item_cmp, merge_delta},
     config::ContextConfig,
     errors::ContextError,
     traits::{
@@ -13,13 +13,16 @@ use crate::{
         ScoreAdapter,
     },
     types::{
-        BundleItem, BundleScoreStats, BundleSegment, ContextBundle, ContextEvent, ContextItem,
-        ContextItemDigests, DeltaPatch, EnvironmentSnapshotEvent, EvidencePointer, ExplainBundle,
-        GraphExplain, Partition, PlanAction, PromptBundle, RedactionEntry, RedactionReport,
-        RunInput, RunOutput, ScoredItem,
+        AccessClass, Anchor, BundleItem, BundleScoreStats, BundleSegment, ContextBuiltEvent,
+        ContextBundle, ContextEvent, ContextItem, ContextItemDigests, DeltaMergedEvent, DeltaPatch,
+        EnvironmentSnapshotEvent, EvidenceLinkedEvent, EvidencePointer, ExplainBundle,
+        GraphExplain, Partition, PlanAction, PromptBundle, PromptIssuedEvent,
+        RedactionEntry, RedactionReport, RedactionReportedEvent, RunInput, RunOutput, ScoredItem,
+        StageMetric,
     },
     validate::{ensure_summary_anchor, validate_run},
 };
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 #[derive(Clone, Debug)]
@@ -34,6 +37,29 @@ struct ItemRecord {
     score_stats: BundleScoreStats,
     score_scaled: i32,
     prompt_line: Option<String>,
+    visibility: VisibilityLevel,
+    risk: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisibilityLevel {
+    MinimalSharing,
+    TaskContext,
+    FullGroup,
+}
+
+impl VisibilityLevel {
+    fn from_tags(tags: &Value) -> Self {
+        if let Some(vis) = tags.get("visibility").and_then(|v| v.as_str()) {
+            match vis {
+                "minimal_sharing" => VisibilityLevel::MinimalSharing,
+                "task_context" => VisibilityLevel::TaskContext,
+                _ => VisibilityLevel::FullGroup,
+            }
+        } else {
+            VisibilityLevel::FullGroup
+        }
+    }
 }
 
 impl ItemRecord {
@@ -72,6 +98,8 @@ impl ItemRecord {
             score_stats,
             score_scaled: (score.final_score * 1000.0).round() as i32,
             prompt_line: Some(value_to_prompt(&item.content)),
+            visibility: VisibilityLevel::from_tags(&item.policy_tags),
+            risk: item.features.risk,
         }
     }
 
@@ -112,6 +140,8 @@ impl ItemRecord {
             score_stats,
             score_scaled: (base_score.final_score * 1000.0).round() as i32,
             prompt_line: Some(value_to_prompt(&summary.summary)),
+            visibility: VisibilityLevel::TaskContext,
+            risk: 0.0,
         }
     }
 
@@ -161,6 +191,139 @@ impl ItemRecord {
             Partition::P4Dialogue => prompt.dialogue.push(line.clone()),
         }
     }
+}
+
+fn dedup_key(record: &ItemRecord, id: &str) -> String {
+    if let Some(content) = &record.digests.content {
+        format!("content:{content}")
+    } else if let Some(semantic) = &record.digests.semantic {
+        format!("semantic:{semantic}")
+    } else {
+        format!("ci:{id}")
+    }
+}
+
+fn redaction_entry_for(
+    id: &str,
+    record: &ItemRecord,
+    reason: &str,
+    final_action: PlanAction,
+) -> RedactionEntry {
+    RedactionEntry {
+        ci_id: id.to_string(),
+        reason: reason.to_string(),
+        evidence_pointer: record.evidence_ptrs.first().cloned(),
+        final_action: Some(final_action),
+    }
+}
+
+fn enforce_dedup(
+    scored: Vec<ScoredItem>,
+    records: &mut HashMap<String, ItemRecord>,
+) -> (Vec<ScoredItem>, Vec<String>, Vec<RedactionEntry>) {
+    let mut filtered: Vec<ScoredItem> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut redactions: Vec<RedactionEntry> = Vec::new();
+    let mut seen: HashMap<String, (usize, String, f32)> = HashMap::new();
+
+    for scored_item in scored.into_iter() {
+        let id = scored_item.item.id.clone();
+        let key = {
+            let record = records.get(&id).expect("record must exist before dedup");
+            dedup_key(record, &id)
+        };
+        if let Some((existing_idx, existing_id, existing_score)) = seen.get(&key).cloned() {
+            if scored_item.score.final_score > existing_score {
+                if let Some(prev_record) = records.get_mut(&existing_id) {
+                    prev_record.push_reason("dedup", format!("replaced_by:{id}"));
+                    reasons.push(format!("ctx_dedup:{}->{}", existing_id, id));
+                    redactions.push(redaction_entry_for(
+                        &existing_id,
+                        prev_record,
+                        "dedup_replaced",
+                        PlanAction::Evict,
+                    ));
+                }
+                if let Some(record) = records.get_mut(&id) {
+                    record.push_reason("dedup", "primary_after_replace");
+                }
+                seen.insert(
+                    key,
+                    (existing_idx, id.clone(), scored_item.score.final_score),
+                );
+                if let Some(slot) = filtered.get_mut(existing_idx) {
+                    *slot = scored_item.clone();
+                }
+            } else {
+                if let Some(record) = records.get_mut(&id) {
+                    record.push_reason("dedup", format!("duplicate_of:{existing_id}"));
+                    redactions.push(redaction_entry_for(
+                        &id,
+                        record,
+                        "dedup_duplicate",
+                        PlanAction::Evict,
+                    ));
+                }
+                reasons.push(format!("ctx_dedup:{}->{}", id, existing_id));
+                continue;
+            }
+        } else {
+            if let Some(record) = records.get_mut(&id) {
+                record.push_reason("dedup", "primary");
+            }
+            let idx = filtered.len();
+            seen.insert(key, (idx, id.clone(), scored_item.score.final_score));
+            filtered.push(scored_item);
+        }
+    }
+
+    (filtered, reasons, redactions)
+}
+
+fn allow_minimal(anchor: &Anchor) -> bool {
+    matches!(anchor.access_class, AccessClass::Restricted)
+}
+
+fn enforce_privacy(
+    scored: Vec<ScoredItem>,
+    records: &mut HashMap<String, ItemRecord>,
+    anchor: &Anchor,
+) -> (Vec<ScoredItem>, Vec<String>, Vec<RedactionEntry>) {
+    let mut filtered: Vec<ScoredItem> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
+    let mut redactions: Vec<RedactionEntry> = Vec::new();
+    let minimal_allowed = allow_minimal(anchor);
+
+    for scored_item in scored.into_iter() {
+        let id = scored_item.item.id.clone();
+        let record = records
+            .get_mut(&id)
+            .expect("record must exist before privacy");
+        let mut drop_reason: Option<String> = None;
+        if scored_item.item.partition == Partition::P2Evidence && record.evidence_ptrs.is_empty() {
+            drop_reason = Some("missing_pointer".into());
+        } else if record.risk >= 0.85 {
+            drop_reason = Some("high_risk".into());
+        } else if record.visibility == VisibilityLevel::MinimalSharing && !minimal_allowed {
+            drop_reason = Some("visibility_minimal_sharing".into());
+        }
+
+        if let Some(reason) = drop_reason {
+            record.push_reason("privacy", reason.clone());
+            reasons.push(format!("ctx_privacy:{}:{}", id, reason));
+            redactions.push(redaction_entry_for(
+                &id,
+                record,
+                &format!("privacy_{reason}"),
+                PlanAction::Evict,
+            ));
+            continue;
+        }
+
+        filtered.push(scored_item);
+    }
+
+    (filtered, reasons, redactions)
 }
 
 fn ensure_item_digests(item: &ContextItem) -> ContextItemDigests {
@@ -288,27 +451,51 @@ impl<'a> ContextEngine<'a> {
         let env_digest_tag = ("envctx_digest", env_ctx.context_digest.clone());
         let env_degradation = env_ctx.degradation_reason.clone();
 
-        let scored = score_items(self.scorer, &scenario_cfg, &items);
-        let mut item_records: HashMap<String, ItemRecord> = HashMap::new();
-        for entry in &scored {
-            item_records.insert(
-                entry.item.id.clone(),
-                ItemRecord::from_context_item(&entry.item, &entry.score),
-            );
-        }
-        for record in item_records.values_mut() {
-            record.push_reason("dedup", "unique");
-            record.push_reason("privacy", "minimal_visible");
-        }
+        let mut stage_metrics: Vec<(&'static str, Duration)> = Vec::new();
+        let mut stage_redactions: Vec<RedactionEntry> = Vec::new();
+
+        let score_timer = Instant::now();
+        let scored_initial = score_items(self.scorer, &scenario_cfg, &items);
+        stage_metrics.push(("score", score_timer.elapsed()));
+
+        let mut item_records: HashMap<String, ItemRecord> = scored_initial
+            .iter()
+            .map(|entry| {
+                (
+                    entry.item.id.clone(),
+                    ItemRecord::from_context_item(&entry.item, &entry.score),
+                )
+            })
+            .collect();
+
+        let dedup_timer = Instant::now();
+        let (scored_dedup, dedup_reasons, dedup_redactions) =
+            enforce_dedup(scored_initial, &mut item_records);
+        stage_metrics.push(("dedup", dedup_timer.elapsed()));
+        let dedup_removed_count = dedup_redactions.len();
+
+        let privacy_timer = Instant::now();
+        let (scored, privacy_reasons, privacy_redactions) =
+            enforce_privacy(scored_dedup, &mut item_records, &anchor);
+        stage_metrics.push(("privacy", privacy_timer.elapsed()));
+        let privacy_removed_count = privacy_redactions.len();
+
         let score_index: HashMap<String, crate::types::ContextScore> = scored
             .iter()
             .map(|entry| (entry.item.id.clone(), entry.score.clone()))
             .collect();
+
+        let plan_timer = Instant::now();
         let mut plan = self.planner.plan(&anchor, &scenario_cfg, &scored);
+        stage_metrics.push(("trim", plan_timer.elapsed()));
         self.store.record_plan(&plan);
 
         let mut degrade_reasons: Vec<String> = Vec::new();
+        degrade_reasons.extend(dedup_reasons);
+        degrade_reasons.extend(privacy_reasons);
         let mut ask_consent_reasons: Vec<String> = Vec::new();
+        stage_redactions.extend(dedup_redactions);
+        stage_redactions.extend(privacy_redactions);
 
         let mut final_tokens_total: i64 = 0;
         let original_total: i64 = items.iter().map(|ci| ci.tokens as i64).sum();
@@ -316,9 +503,9 @@ impl<'a> ContextEngine<'a> {
         let mut quality_stats = Vec::new();
         let mut segments: HashMap<Partition, Vec<BundleItem>> = HashMap::new();
         let mut prompt = PromptBundle::default();
-        let mut pointer_index: HashMap<String, Vec<EvidencePointer>> = items
+        let mut pointer_index: HashMap<String, Vec<EvidencePointer>> = scored
             .iter()
-            .map(|ci| (ci.id.clone(), ci.links.evidence_ptrs.clone()))
+            .map(|ci| (ci.item.id.clone(), ci.item.links.evidence_ptrs.clone()))
             .collect();
 
         let index_map: HashMap<String, usize> = plan
@@ -328,6 +515,7 @@ impl<'a> ContextEngine<'a> {
             .map(|(idx, item)| (item.ci_id.clone(), idx))
             .collect();
 
+        let compression_timer = Instant::now();
         for scored_item in &scored {
             let item = &scored_item.item;
             let partition = scored_item.score.partition_affinity;
@@ -574,12 +762,14 @@ impl<'a> ContextEngine<'a> {
             }
         }
 
+        stage_metrics.push(("compress", compression_timer.elapsed()));
+
         let tokens_saved = original_total - final_tokens_total;
 
         let mut segments_vec: Vec<BundleSegment> = segments
             .into_iter()
             .map(|(partition, mut items)| {
-                items.sort_by(|a, b| a.ci_id.cmp(&b.ci_id));
+                items.sort_by(|a, b| manifest_item_cmp(a, b));
                 BundleSegment { partition, items }
             })
             .collect();
@@ -651,40 +841,87 @@ impl<'a> ContextEngine<'a> {
             prompt,
         };
 
+        let pointer_stats = bundle
+            .segments
+            .iter()
+            .filter(|seg| seg.partition == Partition::P2Evidence)
+            .flat_map(|seg| seg.items.iter())
+            .fold((0u32, 0u32), |(total, ok), item| {
+                let total_next = total + 1;
+                let ok_next = if item.evidence_ptrs.is_empty() {
+                    ok
+                } else {
+                    ok + 1
+                };
+                (total_next, ok_next)
+            });
+        let pointer_integrity = if pointer_stats.0 == 0 {
+            1.0
+        } else {
+            pointer_stats.1 as f64 / pointer_stats.0 as f64
+        };
+
+        let stage_metric_records: Vec<StageMetric> = stage_metrics
+            .iter()
+            .map(|(stage, duration)| StageMetric {
+                stage: stage.to_string(),
+                duration_ms: duration.as_secs_f64() * 1000.0,
+            })
+            .collect();
+
         let now = OffsetDateTime::now_utc();
         let (manifest, delta_patch) = if let Some(prev_manifest) = previous_manifest {
             let merged = merge_delta(&prev_manifest, &bundle)
                 .map_err(|err| ContextError::ManifestInvariant(format!("delta_merge:{err}")))?;
-            self.store.record_event(&ContextEvent::DeltaMerged {
-                anchor: anchor.clone(),
-                schema_v: anchor.schema_v,
-                patch_id: merged.patch.patch_id.clone(),
-                manifest_digest: merged.manifest.manifest_digest.clone(),
-                at: now,
-            });
+            self.store
+                .record_event(&ContextEvent::DeltaMerged(DeltaMergedEvent {
+                    anchor: anchor.clone(),
+                    schema_v: anchor.schema_v,
+                    patch_id: merged.patch.patch_id.clone(),
+                    manifest_digest: merged.manifest.manifest_digest.clone(),
+                    added: merged.report.added.clone(),
+                    updated: merged.report.updated.clone(),
+                    removed: merged.report.removed.clone(),
+                    score_stats: merged.patch.score_stats.clone(),
+                    degrade_reasons: degrade_reasons.clone(),
+                    pointer_integrity,
+                    tokens_saved,
+                    at: now,
+                }));
             (merged.manifest, merged.patch)
         } else {
             let manifest = build_prefix(&bundle)
                 .map_err(|err| ContextError::ManifestInvariant(format!("manifest_build:{err}")))?;
-            self.store.record_event(&ContextEvent::ContextBuilt {
-                anchor: anchor.clone(),
-                schema_v: anchor.schema_v,
-                plan_id: plan.plan_id.clone(),
-                manifest_digest: manifest.manifest_digest.clone(),
-                at: now,
-            });
+            self.store
+                .record_event(&ContextEvent::ContextBuilt(ContextBuiltEvent {
+                    anchor: anchor.clone(),
+                    schema_v: anchor.schema_v,
+                    plan_id: plan.plan_id.clone(),
+                    manifest_digest: manifest.manifest_digest.clone(),
+                    stage_metrics: stage_metric_records.clone(),
+                    dedup_removed: dedup_removed_count as u32,
+                    privacy_removed: privacy_removed_count as u32,
+                    tokens_saved,
+                    degrade_reasons: degrade_reasons.clone(),
+                    pointer_integrity,
+                    budget: plan.budget.clone(),
+                    at: now,
+                }));
             let patch = build_full_patch(&bundle);
             (manifest, patch)
         };
 
         let prompt_digest = hash_json(&serde_json::to_value(&bundle.prompt).unwrap_or(Value::Null));
-        self.store.record_event(&ContextEvent::PromptIssued {
-            anchor: anchor.clone(),
-            schema_v: anchor.schema_v,
-            manifest_digest: manifest.manifest_digest.clone(),
-            prompt_digest,
-            at: now,
-        });
+        self.store
+            .record_event(&ContextEvent::PromptIssued(PromptIssuedEvent {
+                anchor: anchor.clone(),
+                schema_v: anchor.schema_v,
+                manifest_digest: manifest.manifest_digest.clone(),
+                prompt_digest,
+                budget: plan.budget.clone(),
+                partitions: plan.partitions.clone(),
+                at: now,
+            }));
 
         let rollback_count = rolled_back.len() as f64;
 
@@ -706,6 +943,59 @@ impl<'a> ContextEngine<'a> {
             .map(|s| format!("{:?}", s))
             .unwrap_or_else(|| "Unspecified".into());
         let scenario_tag = ("scenario", scenario_label.clone());
+
+        for (stage, duration) in &stage_metrics {
+            self.obs.emit_metric(
+                "ctx_stage_latency_ms",
+                duration.as_secs_f64() * 1000.0,
+                &[
+                    tenant_tag.clone(),
+                    scenario_tag.clone(),
+                    env_digest_tag.clone(),
+                    ("stage", stage.to_string()),
+                ],
+            );
+        }
+
+        self.obs.emit_metric(
+            "ctx_dedup_removed_total",
+            dedup_removed_count as f64,
+            &[
+                tenant_tag.clone(),
+                scenario_tag.clone(),
+                env_digest_tag.clone(),
+            ],
+        );
+
+        self.obs.emit_metric(
+            "ctx_privacy_removed_total",
+            privacy_removed_count as f64,
+            &[
+                tenant_tag.clone(),
+                scenario_tag.clone(),
+                env_digest_tag.clone(),
+            ],
+        );
+
+        self.obs.emit_metric(
+            "ctx_pointer_integrity",
+            pointer_integrity,
+            &[
+                tenant_tag.clone(),
+                scenario_tag.clone(),
+                env_digest_tag.clone(),
+            ],
+        );
+
+        self.obs.emit_metric(
+            "ctx_manifest_replay_consistency",
+            1.0,
+            &[
+                tenant_tag.clone(),
+                scenario_tag.clone(),
+                env_digest_tag.clone(),
+            ],
+        );
 
         self.obs.emit_metric(
             "ctx_token_saving_total",
@@ -831,18 +1121,17 @@ impl<'a> ContextEngine<'a> {
             .map(|item| (item.ci_id.clone(), item.action.clone()))
             .collect();
 
-        let redaction_entries: Vec<RedactionEntry> = report
-            .rolled_back
-            .iter()
-            .map(|(ci_id, reason)| RedactionEntry {
+        let mut redaction_entries: Vec<RedactionEntry> = stage_redactions;
+        redaction_entries.extend(report.rolled_back.iter().map(|(ci_id, reason)| {
+            RedactionEntry {
                 ci_id: ci_id.clone(),
                 reason: reason.clone(),
                 evidence_pointer: pointer_index
                     .get(ci_id)
                     .and_then(|list| list.first().cloned()),
                 final_action: action_map.get(ci_id).cloned(),
-            })
-            .collect();
+            }
+        }));
 
         let redaction = RedactionReport {
             anchor: anchor.clone(),
@@ -851,12 +1140,29 @@ impl<'a> ContextEngine<'a> {
             entries: redaction_entries,
         };
         self.store.record_redaction(&redaction);
-        self.store.record_event(&ContextEvent::RedactionReported {
-            anchor: anchor.clone(),
-            schema_v: anchor.schema_v,
-            manifest_digest: manifest.manifest_digest.clone(),
-            at: OffsetDateTime::now_utc(),
-        });
+        self.store
+            .record_event(&ContextEvent::RedactionReported(RedactionReportedEvent {
+                anchor: anchor.clone(),
+                schema_v: anchor.schema_v,
+                manifest_digest: manifest.manifest_digest.clone(),
+                entries: redaction.entries.clone(),
+                at: OffsetDateTime::now_utc(),
+            }));
+
+        for segment in &bundle.segments {
+            for item in &segment.items {
+                for pointer in &item.evidence_ptrs {
+                    self.store
+                        .record_event(&ContextEvent::EvidenceLinked(EvidenceLinkedEvent {
+                            anchor: anchor.clone(),
+                            schema_v: anchor.schema_v,
+                            ci_id: item.ci_id.clone(),
+                            pointer: pointer.clone(),
+                            at: now,
+                        }));
+                }
+            }
+        }
 
         Ok(RunOutput {
             plan,

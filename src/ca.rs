@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use soulseed_agi_core_models::{
-    CycleId,
+    AwarenessCycleId,
     awareness::{AwarenessAnchor, AwarenessEvent, DeltaPatch, SyncPointKind},
 };
 use time::OffsetDateTime;
@@ -30,7 +30,7 @@ pub struct InjectionDecision {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MergeDeltaRequest {
-    pub cycle_id: CycleId,
+    pub cycle_id: AwarenessCycleId,
     pub anchor: AwarenessAnchor,
     pub kind: SyncPointKind,
     pub timeframe: (OffsetDateTime, OffsetDateTime),
@@ -121,7 +121,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         DialogueEvent {
             tenant_id: soulseed_agi_core_models::TenantId::new(1),
-            event_id: EventId(1),
+            event_id: EventId::from_raw_unchecked(1),
             session_id: SessionId::new(1),
             subject: Subject::Human(HumanId::new(1)),
             participants: vec![SubjectRef {
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn noop_service_marks_injections_ignored() {
         let request = MergeDeltaRequest {
-            cycle_id: CycleId(1),
+            cycle_id: AwarenessCycleId::from_raw_unchecked(1),
             anchor: dummy_anchor(),
             kind: SyncPointKind::Barrier,
             timeframe: (

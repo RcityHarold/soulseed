@@ -1,6 +1,6 @@
 use crate::{
-    common::EvidencePointer, AccessClass, ConversationScenario, EnvelopeHead, ModelError,
-    Provenance, SessionId, Snapshot, Subject, SubjectRef, TenantId,
+    common::EvidencePointer, AccessClass, ConversationScenario, CorrelationId, EnvelopeHead,
+    ModelError, Provenance, SessionId, Snapshot, Subject, SubjectRef, TenantId, TraceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,6 +9,8 @@ use serde_json::Value;
 pub struct Session {
     pub tenant_id: TenantId,
     pub session_id: SessionId,
+    pub trace_id: TraceId,
+    pub correlation_id: CorrelationId,
     pub subject: Subject,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<SubjectRef>,
@@ -42,6 +44,16 @@ fn default_restricted() -> AccessClass {
 
 impl Session {
     pub fn validate(&self) -> Result<(), ModelError> {
+        if self.head.trace_id != self.trace_id {
+            return Err(ModelError::Invariant(
+                "session.trace_id must match head.trace_id",
+            ));
+        }
+        if self.head.correlation_id != self.correlation_id {
+            return Err(ModelError::Invariant(
+                "session.correlation_id must match head.correlation_id",
+            ));
+        }
         if matches!(self.access_class, AccessClass::Restricted) && self.provenance.is_none() {
             return Err(ModelError::Missing("provenance"));
         }

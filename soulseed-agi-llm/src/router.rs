@@ -1,4 +1,4 @@
-use crate::dto::{LlmInput, ModelProfile};
+use crate::dto::{LlmInput, ModelRoutingDecision};
 use crate::errors::EngineError;
 use crate::tw_client::ThinWaistClient;
 
@@ -10,7 +10,7 @@ impl LlmRouter {
         &self,
         client: &C,
         input: &LlmInput,
-    ) -> Result<ModelProfile, EngineError> {
+    ) -> Result<ModelRoutingDecision, EngineError> {
         let hints = vec![input.scene.clone()];
         Ok(client.select_model(&input.anchor, &input.scene, &hints)?)
     }

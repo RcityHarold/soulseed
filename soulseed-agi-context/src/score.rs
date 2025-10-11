@@ -93,7 +93,7 @@ impl ScoreAdapter for ScoreAdapterHalfLife {
             + stab * w.stab
             + dup * w.dup
             + len * w.len
-            + (1.0 - risk) * w.risk;
+            + risk * w.risk;
 
         let final_score = weighted.clamp(-1.0, 1.0);
         let importance = ((rel * 0.5 + auth * 0.3 + cau * 0.2).max(0.0)).clamp(0.0, 1.0);

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AIId, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType, AwarenessFork,
-    ConceptNode, ConversationScenario, CycleId, DialogueEvent, DialogueEventType, EmotionNode,
+    ConceptNode, ConversationScenario, AwarenessCycleId, DialogueEvent, DialogueEventType, EmotionNode,
     EventId, HumanId, RelationshipEdge, RelationshipSnapshot, SemanticEdge, SessionId, SubjectRef,
     SyncPointKind, TenantId, TopicNode,
 };
@@ -166,8 +166,8 @@ pub const EXPLAIN_EVENT_TYPES_DEFAULT: &[AwarenessEventType] = &[
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AwarenessFilters {
-    pub awareness_cycle_id: Option<CycleId>,
-    pub parent_cycle_id: Option<CycleId>,
+    pub awareness_cycle_id: Option<AwarenessCycleId>,
+    pub parent_cycle_id: Option<AwarenessCycleId>,
     pub collab_scope_id: Option<String>,
     pub barrier_id: Option<String>,
     pub env_mode: Option<String>,
@@ -214,7 +214,7 @@ pub struct AwarenessResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExplainReplayQuery {
     pub tenant_id: TenantId,
-    pub awareness_cycle_id: CycleId,
+    pub awareness_cycle_id: AwarenessCycleId,
     pub forks: Option<Vec<AwarenessFork>>,
     pub event_types: Option<Vec<AwarenessEventType>>,
     pub limit: u32,

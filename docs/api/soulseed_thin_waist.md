@@ -124,7 +124,18 @@
 响应: {"cycle_id": "cyc-clarify-001", "accepted": true, "reason": null}
 
 ### 4.6 GET /tenants/{tenant_id}/ace/cycles/{cycle_id}
-返回周期信息、最新 SyncPointReport、AwarenessEvent 列表、当前 HITL 队列。
+返回周期信息、最新 SyncPointReport、RouterDecision、AwarenessEvent 列表、当前 HITL 队列。
+
+`CycleSchedule`/`CycleEmission` 新增字段：
+- `router_decision`：DFR 产出的 `DecisionPath` 及 Explain 指纹；
+- `decision_events`：按顺序列出 `ac_started` → `ic_started` → `decision_routed` → … → `ic_ended`/`finalized`。
+
+`SyncPointReport` 新增字段：
+- `applied_ids` / `ignored_ids`：被吸收/忽略的 Context Item ID 列表；
+- `missing_sequences`：检测到的缺失 sequence number；
+- `delta_added` / `delta_updated` / `delta_removed`：DeltaPatch 三元组；
+- `context_bundle`：最新上下文快照；
+- `explain_fingerprint`：一次吸收 Explain 指纹。
 
 ### 4.7 GET /tenants/{tenant_id}/ace/cycles/{cycle_id}/outbox
 返回待发送的 Final、DeltaPatch、LateReceipt，便于前端展示最终答案或迟到回执。

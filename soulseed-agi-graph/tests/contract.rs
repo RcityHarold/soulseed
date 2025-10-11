@@ -11,7 +11,7 @@ use soulseed_agi_graph::{
     plan::{Plan, PlannerConfig},
     planner::Planner,
     scenario_rule, AccessClass, AwarenessDegradationReason, AwarenessEventType, AwarenessFork,
-    ConversationScenario, CorrelationId, CycleId, DialogueEvent, DialogueEventType, EnvelopeHead,
+    ConversationScenario, CorrelationId, AwarenessCycleId, DialogueEvent, DialogueEventType, EnvelopeHead,
     EventId, HumanId, InvariantCheck, LiveFilters, LiveSubscribe, MessageId, MessagePointer,
     SemanticEdgeKind, SessionId, Snapshot, Subject, SyncPointKind, TenantId, TraceId,
 };
@@ -94,7 +94,7 @@ fn awareness_query_base() -> AwarenessQuery {
     AwarenessQuery {
         tenant_id: TenantId::new(1),
         filters: AwarenessFilters {
-            awareness_cycle_id: Some(CycleId::new(777)),
+            awareness_cycle_id: Some(AwarenessCycleId::new(777)),
             parent_cycle_id: None,
             collab_scope_id: None,
             barrier_id: None,
@@ -115,7 +115,7 @@ fn awareness_query_base() -> AwarenessQuery {
 fn explain_query_base() -> ExplainReplayQuery {
     ExplainReplayQuery {
         tenant_id: TenantId::new(1),
-        awareness_cycle_id: CycleId::new(777),
+        awareness_cycle_id: AwarenessCycleId::new(777),
         forks: None,
         event_types: None,
         limit: 100,
@@ -337,6 +337,10 @@ fn scenario_rule_provides_expected_event_types() {
         .primary_event_types
         .iter()
         .any(|ty| matches!(ty, DialogueEventType::Message)));
+    assert!(rule
+        .allowed_semantic_edges
+        .iter()
+        .any(|edge| matches!(edge, SemanticEdgeKind::EventToConcept)));
 }
 
 #[test]

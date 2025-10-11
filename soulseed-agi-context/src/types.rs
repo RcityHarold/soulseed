@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -399,40 +399,101 @@ pub struct RunOutput {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StageMetric {
+    pub stage: String,
+    pub duration_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextBuiltEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub plan_id: String,
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stage_metrics: Vec<StageMetric>,
+    pub dedup_removed: u32,
+    pub privacy_removed: u32,
+    pub tokens_saved: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degrade_reasons: Vec<String>,
+    pub pointer_integrity: f64,
+    pub budget: BudgetSummary,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DeltaMergedEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub patch_id: String,
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub added: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub updated: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed: Vec<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub score_stats: HashMap<String, f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degrade_reasons: Vec<String>,
+    pub pointer_integrity: f64,
+    pub tokens_saved: i64,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ContextCompactedEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_zero_tokens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deduplicated: Vec<String>,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RedactionReportedEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<RedactionEntry>,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PromptIssuedEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub manifest_digest: String,
+    pub prompt_digest: String,
+    pub budget: BudgetSummary,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partitions: Vec<PartitionUsage>,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceLinkedEvent {
+    pub anchor: Anchor,
+    pub schema_v: u16,
+    pub ci_id: String,
+    pub pointer: EvidencePointer,
+    pub at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ContextEvent {
-    ContextBuilt {
-        anchor: Anchor,
-        schema_v: u16,
-        plan_id: String,
-        manifest_digest: String,
-        at: OffsetDateTime,
-    },
-    DeltaMerged {
-        anchor: Anchor,
-        schema_v: u16,
-        patch_id: String,
-        manifest_digest: String,
-        at: OffsetDateTime,
-    },
-    ContextCompacted {
-        anchor: Anchor,
-        schema_v: u16,
-        from_version: u32,
-        to_version: u32,
-        manifest_digest: String,
-        at: OffsetDateTime,
-    },
-    RedactionReported {
-        anchor: Anchor,
-        schema_v: u16,
-        manifest_digest: String,
-        at: OffsetDateTime,
-    },
-    PromptIssued {
-        anchor: Anchor,
-        schema_v: u16,
-        manifest_digest: String,
-        prompt_digest: String,
-        at: OffsetDateTime,
-    },
+    ContextBuilt(ContextBuiltEvent),
+    DeltaMerged(DeltaMergedEvent),
+    ContextCompacted(ContextCompactedEvent),
+    RedactionReported(RedactionReportedEvent),
+    PromptIssued(PromptIssuedEvent),
+    EvidenceLinked(EvidenceLinkedEvent),
 }

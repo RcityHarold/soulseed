@@ -98,6 +98,7 @@ pub struct ContextRuntimeInput {
     pub config: ContextConfig,
     pub items: Vec<ContextItem>,
     pub graph_explain: Option<GraphExplain>,
+    pub previous_manifest: Option<crate::assembly::ContextManifest>,
 }
 
 pub struct ContextRuntime<G, Obs = NoopObs> {
@@ -151,7 +152,7 @@ where
             config: input.config,
             items: input.items,
             graph_explain: input.graph_explain,
-            previous_manifest: None,
+            previous_manifest: input.previous_manifest,
         })
     }
 
@@ -495,7 +496,7 @@ mod tests {
             id: id.into(),
             partition: Partition::P4Dialogue,
             partition_hint: Some(Partition::P4Dialogue),
-            source_event_id: EventId(u64::from(tokens)),
+            source_event_id: EventId::from_raw_unchecked(u64::from(tokens)),
             source_message_id: Some(MessageId(u64::from(tokens))),
             observed_at: OffsetDateTime::UNIX_EPOCH,
             content: serde_json::json!({"text": id}),
@@ -543,6 +544,7 @@ mod tests {
                 config,
                 items,
                 graph_explain: None,
+                previous_manifest: None,
             })
             .expect("run succeeds");
         assert!(result
@@ -581,6 +583,7 @@ mod tests {
                 config,
                 items,
                 graph_explain: None,
+                previous_manifest: None,
             })
             .expect("run degrades but succeeds");
         assert!(output
