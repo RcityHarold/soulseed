@@ -1,5 +1,6 @@
 pub mod api;
 pub mod errors;
+pub mod maintenance;
 pub mod mock;
 pub mod plan;
 pub mod planner;
@@ -9,6 +10,7 @@ pub mod validate;
 
 pub use api::*;
 pub use errors::*;
+pub use maintenance::*;
 pub use mock::*;
 pub use plan::*;
 pub use planner::*;

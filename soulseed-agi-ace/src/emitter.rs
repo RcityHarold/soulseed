@@ -20,12 +20,12 @@ impl Emitter {
 
         messages.push(OutboxMessage {
             cycle_id: emission.cycle_id,
-            event_id: emission.final_event.event_id,
+            event_id: emission.final_event.base.event_id,
             payload: AwarenessEvent {
                 anchor: emission.anchor.clone(),
-                event_id: emission.final_event.event_id,
+                event_id: emission.final_event.base.event_id,
                 event_type: AwarenessEventType::Finalized,
-                occurred_at_ms: emission.final_event.timestamp_ms,
+                occurred_at_ms: emission.final_event.base.timestamp_ms,
                 awareness_cycle_id: emission.cycle_id,
                 parent_cycle_id: None,
                 collab_scope_id: None,
@@ -34,14 +34,14 @@ impl Emitter {
                 inference_cycle_sequence: 1,
                 degradation_reason: None,
                 payload: json!({
-                    "final_event_id": emission.final_event.event_id.as_u64(),
+                    "final_event_id": emission.final_event.base.event_id.as_u64(),
                     "lane": format!("{:?}", emission.lane),
                 }),
             },
         });
 
         Ok(OutboxEnvelope {
-            tenant_id: emission.final_event.tenant_id,
+            tenant_id: emission.final_event.base.tenant_id,
             cycle_id: emission.cycle_id,
             messages,
         })

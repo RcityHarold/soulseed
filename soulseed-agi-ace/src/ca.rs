@@ -124,7 +124,7 @@ impl CaService for CaServiceDefault {
             ));
         }
 
-        let scenario = events.first().map(|event| event.scenario.clone());
+        let scenario = events.first().map(|event| event.base.scenario.clone());
         let context_anchor = to_context_anchor(&anchor, scenario);
 
         let mut config = ContextConfig::default();
@@ -259,21 +259,21 @@ fn partition_for_event(event_type: DialogueEventType) -> Partition {
 
 fn base_features_for_event(event: &DialogueEvent, tokens: u32) -> FeatureVec {
     FeatureVec {
-        rel: match event.event_type {
+        rel: match event.base.event_type {
             DialogueEventType::ToolResult => 0.88,
             DialogueEventType::ToolCall | DialogueEventType::SelfReflection => 0.74,
             DialogueEventType::Decision => 0.76,
             DialogueEventType::Lifecycle | DialogueEventType::System => 0.65,
             DialogueEventType::Message => 0.72,
         },
-        cau: match event.event_type {
+        cau: match event.base.event_type {
             DialogueEventType::Decision => 0.7,
             DialogueEventType::ToolResult => 0.68,
             DialogueEventType::Message => 0.52,
             _ => 0.6,
         },
         rec: 0.58,
-        auth: if matches!(event.access_class, AccessClass::Public) {
+        auth: if matches!(event.base.access_class, AccessClass::Public) {
             0.45
         } else {
             0.62
@@ -281,7 +281,7 @@ fn base_features_for_event(event: &DialogueEvent, tokens: u32) -> FeatureVec {
         stab: 0.55,
         dup: 0.08,
         len: (tokens as f32 / 2048.0).min(1.0),
-        risk: match event.access_class {
+        risk: match event.base.access_class {
             AccessClass::Restricted => 0.82,
             AccessClass::Internal => 0.32,
             _ => 0.18,
@@ -322,38 +322,39 @@ fn context_item_from_event(
     let content = serde_json::to_value(event).unwrap_or(Value::Null);
     let tokens = estimate_tokens_from_value(&content);
     let features = base_features_for_event(event, tokens);
-    let partition = partition_for_event(event.event_type.clone());
+    let partition = partition_for_event(event.base.event_type.clone());
     let mut digests = ContextItemDigests::default();
     digests.content = event
-        .content_digest_sha256
-        .clone()
+        .payload
+        .content_digest_sha256()
+        .cloned()
         .map(|digest| format!("sha256-{}", digest))
         .or_else(|| Some(hash_json(&content)));
     let mut links = ContextItemLinks::default();
-    if let Some(pointer) = &event.evidence_pointer {
+    if let Some(pointer) = event.payload.evidence_pointer() {
         links.evidence_ptrs.push(pointer.clone());
         if let Some(digest) = pointer.digest_sha256.clone() {
             digests.evidence = Some(digest);
         }
     }
-    links.supersedes = event.supersedes.map(|id| id.as_u64().to_string());
+    links.supersedes = event.base.supersedes.map(|id| id.as_u64().to_string());
 
     ContextItem {
         anchor: anchor.clone(),
-        id: format!("evt:{}", event.event_id.as_u64()),
+        id: format!("evt:{}", event.base.event_id.as_u64()),
         partition,
         partition_hint: Some(partition),
-        source_event_id: event.event_id,
-        source_message_id: event.message_ref.as_ref().map(|ptr| ptr.message_id),
-        observed_at: to_offset_date_time(event.timestamp_ms),
+        source_event_id: event.base.event_id,
+        source_message_id: event.payload.message_ref().map(|ptr| ptr.message_id),
+        observed_at: to_offset_date_time(event.base.timestamp_ms),
         content,
         tokens,
         features,
         policy_tags: json!({
-            "visibility": visibility_tag(event.access_class),
+            "visibility": visibility_tag(event.base.access_class),
             "syncpoint": format!("{:?}", kind).to_lowercase(),
         }),
-        typ: Some(format!("dialogue::{:?}", event.event_type)),
+        typ: Some(format!("dialogue::{:?}", event.base.event_type)),
         digests,
         links,
     }
@@ -562,11 +563,29 @@ fn build_awareness_events(
 fn map_syncpoint_event(kind: &SyncPointKind) -> AwarenessEventType {
     match kind {
         SyncPointKind::IcEnd => AwarenessEventType::IcEnded,
-        SyncPointKind::ToolBarrier => AwarenessEventType::ToolCalled,
+        SyncPointKind::ToolBarrier
+        | SyncPointKind::ToolBarrierReached => AwarenessEventType::ToolBarrierReached,
+        SyncPointKind::ToolBarrierReleased => AwarenessEventType::ToolBarrierReleased,
+        SyncPointKind::ToolBarrierTimeout => AwarenessEventType::ToolBarrierTimeout,
         SyncPointKind::ToolChainNext => AwarenessEventType::RouteSwitched,
         SyncPointKind::CollabTurnEnd => AwarenessEventType::CollabResolved,
         SyncPointKind::ClarifyAnswered => AwarenessEventType::ClarificationAnswered,
+        SyncPointKind::ClarifyWindowOpened | SyncPointKind::ClarifyWindowClosed => {
+            AwarenessEventType::SyncPointReported
+        }
+        SyncPointKind::ToolWindowOpened | SyncPointKind::ToolWindowClosed => {
+            AwarenessEventType::SyncPointReported
+        }
+        SyncPointKind::HitlWindowOpened | SyncPointKind::HitlWindowClosed => {
+            AwarenessEventType::SyncPointReported
+        }
         SyncPointKind::HitlAbsorb => AwarenessEventType::HumanInjectionReceived,
+        SyncPointKind::Merged => AwarenessEventType::SyncPointMerged,
+        SyncPointKind::DriftDetected
+        | SyncPointKind::LateSignalObserved
+        | SyncPointKind::BudgetExceeded
+        | SyncPointKind::BudgetRecovered
+        | SyncPointKind::DegradationRecorded => AwarenessEventType::SyncPointReported,
     }
 }
 

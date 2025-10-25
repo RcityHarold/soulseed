@@ -18,69 +18,99 @@ fn mk_snapshot() -> Snapshot {
     }
 }
 
-fn mk_base_event() -> DialogueEvent {
-    DialogueEvent {
-        tenant_id: TenantId::from_raw_unchecked(1),
-        event_id: EventId::from_raw_unchecked(1),
-        session_id: SessionId::from_raw_unchecked(1),
-        subject: Subject::Human(HumanId::from_raw_unchecked(1)),
-        participants: vec![],
-        head: mk_head(),
-        snapshot: Snapshot {
-            schema_v: 1,
-            created_at: time::OffsetDateTime::now_utc(),
-        },
-        timestamp_ms: 1,
-        scenario: ConversationScenario::HumanToAi,
-        event_type: DialogueEventType::Message,
-        time_window: None,
-        access_class: AccessClass::Restricted,
-        provenance: Some(Provenance {
-            source: "ui".into(),
-            method: "llm".into(),
-            model: Some("mock".into()),
-            content_digest_sha256: Some("sha256:demo".into()),
-        }),
-        sequence_number: 1,
-        trigger_event_id: None,
-        temporal_pattern_id: None,
-        causal_links: vec![],
-        reasoning_trace: None,
-        reasoning_confidence: None,
-        reasoning_strategy: None,
-        content_embedding: Some(vec![0.0; 4]),
-        context_embedding: None,
-        decision_embedding: None,
-        embedding_meta: Some(EmbeddingMeta {
-            model: "mock".into(),
-            dim: 4,
-            ts: 1,
-        }),
-        concept_vector: None,
-        semantic_cluster_id: None,
-        cluster_method: None,
-        concept_distance_to_goal: None,
-        real_time_priority: None,
-        notification_targets: None,
-        live_stream_id: None,
-        growth_stage: None,
-        processing_latency_ms: None,
-        influence_score: None,
-        community_impact: None,
-        evidence_pointer: None,
-        content_digest_sha256: None,
-        blob_ref: None,
-        supersedes: None,
-        superseded_by: None,
-        message_ref: Some(MessagePointer {
-            message_id: MessageId::from_raw_unchecked(1),
-        }),
-        tool_invocation: None,
-        tool_result: None,
-        self_reflection: None,
-        metadata: serde_json::json!({}),
-        #[cfg(feature = "vectors-extra")]
-        vectors: ExtraVectors::default(),
+#[cfg(not(feature = "event-v2"))]
+mod legacy_dialogue_event_tests {
+    use super::*;
+    use soulseed_agi_core_models::legacy::dialogue_event::{
+        DialogueEvent, MessagePointer, ToolInvocation, ToolResult,
+    };
+
+    fn mk_base_event() -> DialogueEvent {
+        DialogueEvent {
+            tenant_id: TenantId::from_raw_unchecked(1),
+            event_id: EventId::from_raw_unchecked(1),
+            session_id: SessionId::from_raw_unchecked(1),
+            subject: Subject::Human(HumanId::from_raw_unchecked(1)),
+            participants: vec![],
+            head: mk_head(),
+            snapshot: Snapshot {
+                schema_v: 1,
+                created_at: time::OffsetDateTime::now_utc(),
+            },
+            timestamp_ms: 1,
+            scenario: ConversationScenario::HumanToAi,
+            event_type: DialogueEventType::Message,
+            time_window: None,
+            access_class: AccessClass::Restricted,
+            provenance: Some(Provenance {
+                source: "ui".into(),
+                method: "llm".into(),
+                model: Some("mock".into()),
+                content_digest_sha256: Some("sha256:demo".into()),
+            }),
+            sequence_number: 1,
+            trigger_event_id: None,
+            temporal_pattern_id: None,
+            causal_links: vec![],
+            reasoning_trace: None,
+            reasoning_confidence: None,
+            reasoning_strategy: None,
+            content_embedding: Some(vec![0.0; 4]),
+            context_embedding: None,
+            decision_embedding: None,
+            embedding_meta: Some(EmbeddingMeta {
+                model: "mock".into(),
+                dim: 4,
+                ts: 1,
+            }),
+            concept_vector: None,
+            semantic_cluster_id: None,
+            cluster_method: None,
+            concept_distance_to_goal: None,
+            real_time_priority: None,
+            notification_targets: None,
+            live_stream_id: None,
+            growth_stage: None,
+            processing_latency_ms: None,
+            influence_score: None,
+            community_impact: None,
+            evidence_pointer: None,
+            content_digest_sha256: None,
+            blob_ref: None,
+            supersedes: None,
+            superseded_by: None,
+            message_ref: Some(MessagePointer {
+                message_id: MessageId::from_raw_unchecked(1),
+            }),
+            tool_invocation: None,
+            tool_result: None,
+            self_reflection: None,
+            metadata: serde_json::json!({}),
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
+        }
+    }
+
+    #[test]
+    fn dialogue_event_passes_validation() {
+        let event = mk_base_event();
+        assert!(event.validate().is_ok());
+    }
+
+    #[test]
+    fn restricted_requires_provenance() {
+        let mut event = mk_base_event();
+        event.provenance = None;
+        let err = event.validate().unwrap_err();
+        assert!(matches!(err, ModelError::Missing("provenance")));
+    }
+
+    #[test]
+    fn embedding_dim_mismatch_is_error() {
+        let mut event = mk_base_event();
+        event.content_embedding = Some(vec![0.0; 3]);
+        let err = event.validate().unwrap_err();
+        assert!(matches!(err, ModelError::Invariant(_)));
     }
 }
 
@@ -399,6 +429,112 @@ fn human_profile_sensitive_requires_restricted_access() {
         content_digest_sha256: None,
     });
     assert!(profile.validate().is_ok());
+}
+
+#[cfg(feature = "event-v2")]
+mod dialogue_event_v2_tests {
+    use super::*;
+    use soulseed_agi_core_models::{legacy::dialogue_event as legacy, DialogueEventV2};
+
+    fn mk_legacy_event() -> legacy::DialogueEvent {
+        legacy::DialogueEvent {
+            tenant_id: TenantId::from_raw_unchecked(5),
+            event_id: EventId::from_raw_unchecked(99),
+            session_id: SessionId::from_raw_unchecked(7),
+            subject: Subject::AI(AIId::from_raw_unchecked(3)),
+            participants: vec![SubjectRef {
+                kind: Subject::Human(HumanId::from_raw_unchecked(2)),
+                role: Some("requester".into()),
+            }],
+            head: mk_head(),
+            snapshot: mk_snapshot(),
+            timestamp_ms: 1_700_000_000_000,
+            scenario: ConversationScenario::HumanToAi,
+            event_type: DialogueEventType::ToolResult,
+            time_window: Some("hour-10".into()),
+            access_class: AccessClass::Restricted,
+            provenance: Some(Provenance {
+                source: "ace".into(),
+                method: "tool".into(),
+                model: Some("planner-v1".into()),
+                content_digest_sha256: Some("sha256:demo".into()),
+            }),
+            sequence_number: 42,
+            trigger_event_id: Some(EventId::from_raw_unchecked(55)),
+            temporal_pattern_id: Some("daily-clarify".into()),
+            causal_links: vec![legacy::CausalLink {
+                from_event: EventId::from_raw_unchecked(12),
+                relation: "causal".into(),
+                weight: Some(0.8),
+                confidence: Some(0.9),
+            }],
+            reasoning_trace: Some("tool executed successfully".into()),
+            reasoning_confidence: Some(0.88),
+            reasoning_strategy: Some("self-eval".into()),
+            content_embedding: Some(vec![0.2; 4]),
+            context_embedding: None,
+            decision_embedding: None,
+            embedding_meta: Some(EmbeddingMeta {
+                model: "mock-emb".into(),
+                dim: 4,
+                ts: 1_700_000_000_000,
+            }),
+            concept_vector: None,
+            semantic_cluster_id: Some("cluster-clarify".into()),
+            cluster_method: None,
+            concept_distance_to_goal: Some(0.12),
+            real_time_priority: Some(RealTimePriority::High),
+            notification_targets: Some(vec![]),
+            live_stream_id: None,
+            growth_stage: Some("tool:result".into()),
+            processing_latency_ms: Some(240),
+            influence_score: Some(0.67),
+            community_impact: None,
+            evidence_pointer: Some(EvidencePointer {
+                uri: "blob://tool/result-99".into(),
+                digest_sha256: Some("sha256:payload".into()),
+                media_type: Some("application/json".into()),
+                blob_ref: None,
+                span: None,
+                access_policy: Some("restricted".into()),
+            }),
+            content_digest_sha256: Some("sha256:payload".into()),
+            blob_ref: None,
+            supersedes: Some(EventId::from_raw_unchecked(90)),
+            superseded_by: None,
+            message_ref: None,
+            tool_invocation: Some(legacy::ToolInvocation {
+                tool_id: "search".into(),
+                call_id: "call-77".into(),
+                input: json!({"query": "news"}),
+                strategy: Some("fallback".into()),
+            }),
+            tool_result: Some(legacy::ToolResult {
+                tool_id: "search".into(),
+                call_id: "call-77".into(),
+                success: true,
+                output: json!({"summary": "latest headlines"}),
+                error: None,
+                degradation_reason: None,
+            }),
+            self_reflection: None,
+            metadata: json!({"lane": "tool"}),
+            #[cfg(feature = "vectors-extra")]
+            vectors: ExtraVectors::default(),
+        }
+    }
+
+    #[test]
+    fn v2_event_validates_and_roundtrips() {
+        let legacy_event = mk_legacy_event();
+        let v2_event: DialogueEventV2 = legacy_event.clone().into();
+        v2_event.validate().expect("v2 dialogue event valid");
+
+        let roundtrip: legacy::DialogueEvent = v2_event.clone().into();
+        let original = serde_json::to_value(&legacy_event).unwrap();
+        let again = serde_json::to_value(&roundtrip).unwrap();
+        assert_eq!(original, again, "round-trip conversion should be lossless");
+    }
 }
 
 #[test]

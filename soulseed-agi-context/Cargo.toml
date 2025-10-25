@@ -10,12 +10,13 @@ license = "Apache-2.0"
 path = "src/lib.rs"
 
 [features]
-default = ["uuidv7", "strict-privacy"]
+default = ["uuidv7", "strict-privacy", "event-v2"]
 uuidv7 = ["soulseed-agi-core-models/uuidv7", "soulseed-agi-envctx/uuidv7"]
 strict-privacy = [
     "soulseed-agi-core-models/strict-privacy",
     "soulseed-agi-envctx/strict-privacy",
 ]
+event-v2 = ["soulseed-agi-core-models/event-v2"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

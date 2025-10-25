@@ -181,11 +181,7 @@ pub struct AIProfile {
     pub mission: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub values: Option<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "narrative"
-    )]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "narrative")]
     pub self_narrative: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meaning_narrative: Option<String>,
@@ -231,8 +227,7 @@ impl HumanProfile {
         if self.nickname.trim().is_empty() {
             return Err(ModelError::Missing("nickname"));
         }
-        if self.has_sensitive_attributes()
-            && !matches!(self.access_class, AccessClass::Restricted)
+        if self.has_sensitive_attributes() && !matches!(self.access_class, AccessClass::Restricted)
         {
             return Err(ModelError::Invariant(
                 "sensitive human profile fields require restricted access_class",
@@ -258,8 +253,7 @@ impl AIProfile {
     }
 
     pub fn validate(&self) -> Result<(), ModelError> {
-        if self.has_sensitive_attributes()
-            && !matches!(self.access_class, AccessClass::Restricted)
+        if self.has_sensitive_attributes() && !matches!(self.access_class, AccessClass::Restricted)
         {
             return Err(ModelError::Invariant(
                 "sensitive AI profile fields require restricted access_class",

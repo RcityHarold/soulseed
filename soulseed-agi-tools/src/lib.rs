@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dto;
 pub mod engine;
+pub mod enhancement;
 pub mod errors;
 pub mod explainer;
 pub mod metrics;
@@ -13,6 +14,7 @@ pub mod tw_client;
 pub use config::*;
 pub use dto::*;
 pub use engine::*;
+pub use enhancement::*;
 pub use errors::*;
 pub use explainer::*;
 pub use metrics::*;

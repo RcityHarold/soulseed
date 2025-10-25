@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["event-v2"]
 strict-privacy = [
     "soulseed-agi-core-models/strict-privacy",
     "soulseed-agi-tools/strict-privacy",
@@ -16,6 +16,10 @@ uuidv7 = [
 vectors-extra = [
     "soulseed-agi-core-models/vectors-extra",
     "soulseed-agi-tools/vectors-extra",
+]
+event-v2 = [
+    "soulseed-agi-core-models/event-v2",
+    "soulseed-agi-tools/event-v2",
 ]
 
 [dependencies]

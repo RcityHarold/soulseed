@@ -12,6 +12,7 @@ use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::awareness::{
     AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
 };
+use soulseed_agi_core_models::DialogueEvent;
 
 pub struct SyncPointAggregator {
     ca: Arc<dyn CaService>,
@@ -21,6 +22,15 @@ impl Default for SyncPointAggregator {
     fn default() -> Self {
         let ca: Arc<dyn CaService> = Arc::new(CaServiceDefault::default());
         Self { ca }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(feature = "event-v2")]
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_event(event: &DialogueEvent) {
+    if let Err(err) = soulseed_agi_core_models::validate_dialogue_event(event) {
+        debug_assert!(false, "dialogue event validation failed: {:?}", err);
     }
 }
 
@@ -69,7 +79,7 @@ mod tests {
 
     fn dialogue_event(anchor: &AwarenessAnchor) -> DialogueEvent {
         let now = OffsetDateTime::now_utc();
-        DialogueEvent {
+        let event = DialogueEvent {
             tenant_id: anchor.tenant_id,
             event_id: EventId::generate(),
             session_id: anchor.session_id.unwrap(),
@@ -131,7 +141,9 @@ mod tests {
             metadata: json!({"degradation_reason": "clarify_concurrency"}),
             #[cfg(feature = "vectors-extra")]
             vectors: ExtraVectors::default(),
-        }
+        };
+        validate_event(&event);
+        event
     }
 
     #[test]
@@ -261,15 +273,15 @@ impl SyncPointAggregator {
         }
 
         let mut events = input.events.clone();
-        events.sort_by_key(|ev| (ev.timestamp_ms, ev.event_id.as_u64()));
+        events.sort_by_key(|ev| (ev.base.timestamp_ms, ev.base.event_id.as_u64()));
         let mut seen = std::collections::HashSet::new();
-        events.retain(|ev| seen.insert(ev.event_id.as_u64()));
+        events.retain(|ev| seen.insert(ev.base.event_id.as_u64()));
 
         let mut missing = 0u32;
         let mut missing_sequences = Vec::new();
         let mut last_seq: Option<u64> = None;
         for ev in &events {
-            let seq = ev.sequence_number;
+            let seq = ev.base.sequence_number;
             if let Some(prev) = last_seq {
                 if seq > prev + 1 {
                     for missing_seq in (prev + 1)..seq {

@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod dialogue_event;
 pub mod enums;
 pub mod ids;
+pub mod legacy;
 pub mod message;
 pub mod profiles;
 pub mod relationships;

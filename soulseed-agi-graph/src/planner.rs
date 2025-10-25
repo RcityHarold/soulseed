@@ -1,14 +1,16 @@
 use crate::{
     api::{
         AwarenessFilters, AwarenessQuery, CausalDir, CausalQuery, ExplainReplayQuery,
-        LiveSubscribe, RecallQuery, RecallQueryTextOrVec, TimelineQuery,
-        EXPLAIN_EVENT_TYPES_DEFAULT,
+        InfluenceQuery, LiveSubscribe, NeighborhoodDirection, NeighborhoodQuery, PathQuery,
+        PathStrategy, PatternQuery, RecallQuery, RecallQueryTextOrVec, SimilarityQuery,
+        SimilarityStrategy, SubgraphQuery, TimelineQuery, EXPLAIN_EVENT_TYPES_DEFAULT,
     },
     errors::{Degradation, GraphError},
     plan::{
         Plan, PlanComponent, PlannerConfig, PreparedPlan, IDX_AWARENESS_BARRIER,
         IDX_AWARENESS_COLLAB, IDX_AWARENESS_CYCLE, IDX_AWARENESS_ENV, IDX_AWARENESS_PARENT,
-        IDX_EDGE, IDX_SESSION_ORDER, IDX_SPARSE, IDX_TIMELINE, IDX_VEC,
+        IDX_EDGE, IDX_GRAPH_INFLUENCE, IDX_GRAPH_NEIGHBORHOOD, IDX_GRAPH_PATH, IDX_GRAPH_PATTERN,
+        IDX_GRAPH_SUBGRAPH, IDX_SESSION_ORDER, IDX_SPARSE, IDX_TIMELINE, IDX_VEC,
     },
     scenario::scenario_rule,
     AwarenessEventType, SyncPointKind,
@@ -56,7 +58,11 @@ impl Planner {
                     .or_else(|| query.event_types.clone()),
             }
         };
-        let hash = format!("timeline:tenant={}:limit={}", query.tenant_id.as_u64(), limit);
+        let hash = format!(
+            "timeline:tenant={}:limit={}",
+            query.tenant_id.as_u64(),
+            limit
+        );
         Ok((
             PreparedPlan {
                 plan,
@@ -105,7 +111,9 @@ impl Planner {
         };
         let hash = format!(
             "causal:tenant={}:root={}:depth={}",
-            query.tenant_id.as_u64(), query.root_event.as_u64(), depth
+            query.tenant_id.as_u64(),
+            query.root_event.as_u64(),
+            depth
         );
         Ok((
             PreparedPlan {
@@ -114,6 +122,146 @@ impl Planner {
             },
             hash,
             degradation,
+        ))
+    }
+
+    pub fn plan_path(
+        &self,
+        query: &PathQuery,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        if query.start == query.goal {
+            return Err(GraphError::InvalidQuery("path_requires_distinct_nodes"));
+        }
+        let requested_depth = query.max_depth.unwrap_or(self.cfg.default_causal_depth);
+        let depth = requested_depth.min(self.cfg.max_path_depth);
+        let mut degradations = Vec::new();
+        if requested_depth > depth {
+            degradations.push("depth_truncated");
+        }
+        let max_paths = query.max_paths.min(self.cfg.max_limit as u16);
+        if query.max_paths > max_paths {
+            degradations.push("path_count_truncated");
+        }
+        let strategy = match query.strategy {
+            PathStrategy::Bfs => "bfs",
+            PathStrategy::BidirectionalDijkstra => "bidirectional_dijkstra",
+        }
+        .to_string();
+        let plan = Plan::Path {
+            index: IDX_GRAPH_PATH.to_string(),
+            start: query.start,
+            goal: query.goal,
+            strategy: strategy.clone(),
+            max_depth: depth,
+            max_paths,
+            scenario: query.scenario.clone(),
+        };
+        let hash = format!(
+            "path:tenant={}:start={}:goal={}:strategy={}",
+            query.tenant_id.as_u64(),
+            query.start.as_u64(),
+            query.goal.as_u64(),
+            strategy
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![IDX_GRAPH_PATH.into()],
+            },
+            hash,
+            join_degradations(degradations),
+        ))
+    }
+
+    pub fn plan_neighborhood(
+        &self,
+        query: &NeighborhoodQuery,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        let radius = query.radius.min(self.cfg.max_neighborhood_radius);
+        let limit = query.limit.min(self.cfg.max_limit);
+        let mut degradations = Vec::new();
+        if query.radius > radius {
+            degradations.push("radius_truncated");
+        }
+        if query.limit > limit {
+            degradations.push("limit_truncated");
+        }
+        let direction = match query.direction {
+            NeighborhoodDirection::Outbound => "outbound",
+            NeighborhoodDirection::Inbound => "inbound",
+            NeighborhoodDirection::Both => "both",
+        }
+        .to_string();
+        let plan = Plan::Neighborhood {
+            index: IDX_GRAPH_NEIGHBORHOOD.to_string(),
+            center: query.center,
+            direction,
+            radius,
+            limit,
+            scenario: query.scenario.clone(),
+        };
+        let hash = format!(
+            "neighborhood:tenant={}:center={}:radius={}",
+            query.tenant_id.as_u64(),
+            query.center.as_u64(),
+            radius
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![IDX_GRAPH_NEIGHBORHOOD.into()],
+            },
+            hash,
+            join_degradations(degradations),
+        ))
+    }
+
+    pub fn plan_subgraph(
+        &self,
+        query: &SubgraphQuery,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        if query.seeds.is_empty() {
+            return Err(GraphError::InvalidQuery("seeds_required"));
+        }
+        let radius = query.radius.min(self.cfg.max_subgraph_radius);
+        let max_nodes = query.max_nodes.min(self.cfg.max_subgraph_nodes);
+        let mut degradations = Vec::new();
+        if query.radius > radius {
+            degradations.push("radius_truncated");
+        }
+        if query.max_nodes > max_nodes {
+            degradations.push("node_limit_truncated");
+        }
+        let plan = Plan::Subgraph {
+            index: IDX_GRAPH_SUBGRAPH.to_string(),
+            seeds: query.seeds.clone(),
+            radius,
+            max_nodes,
+            scenario: query.scenario.clone(),
+            include_artifacts: query.include_artifacts.unwrap_or(false),
+        };
+        let hash = format!(
+            "subgraph:tenant={}:seeds={}:radius={}",
+            query.tenant_id.as_u64(),
+            query.seeds.len(),
+            radius
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![IDX_GRAPH_SUBGRAPH.into()],
+            },
+            hash,
+            join_degradations(degradations),
         ))
     }
 
@@ -151,10 +299,18 @@ impl Planner {
         }
         let hash = match &query.query {
             RecallQueryTextOrVec::Text(_) => {
-                format!("recall:text:tenant={}:k={}", query.tenant_id.as_u64(), query.k)
+                format!(
+                    "recall:text:tenant={}:k={}",
+                    query.tenant_id.as_u64(),
+                    query.k
+                )
             }
             RecallQueryTextOrVec::Vec(_) => {
-                format!("recall:vec:tenant={}:k={}", query.tenant_id.as_u64(), query.k)
+                format!(
+                    "recall:vec:tenant={}:k={}",
+                    query.tenant_id.as_u64(),
+                    query.k
+                )
             }
         };
         Ok((
@@ -167,11 +323,136 @@ impl Planner {
         ))
     }
 
+    pub fn plan_similarity(
+        &self,
+        query: &SimilarityQuery,
+        vector_available: bool,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        let top_k = query.top_k.min(self.cfg.max_similarity_k);
+        let mut degradations = Vec::new();
+        if query.top_k > top_k {
+            degradations.push("similarity_k_truncated");
+        }
+        let mut index = IDX_VEC.to_string();
+        let mut strategy = query.strategy.clone();
+        if !vector_available {
+            if matches!(strategy, SimilarityStrategy::Vector) {
+                degradations.push("vector_index_unavailable");
+                strategy = SimilarityStrategy::Hybrid;
+            }
+            index = IDX_SPARSE.to_string();
+        }
+        let plan = Plan::Similarity {
+            index: index.clone(),
+            anchor: query.anchor_event,
+            top_k,
+            strategy: match strategy {
+                SimilarityStrategy::Vector => "vector",
+                SimilarityStrategy::Hybrid => "hybrid",
+            }
+            .to_string(),
+            filter: query.filters.clone(),
+        };
+        let hash = format!(
+            "similarity:tenant={}:anchor={}:k={}",
+            query.tenant_id.as_u64(),
+            query.anchor_event.as_u64(),
+            top_k
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![index],
+            },
+            hash,
+            join_degradations(degradations),
+        ))
+    }
+
     pub fn plan_hybrid(&self, components: Vec<PlanComponent>, k: u16) -> PreparedPlan {
         PreparedPlan {
             plan: Plan::Hybrid { components, k },
             indices_used: vec![IDX_VEC.into(), IDX_SPARSE.into(), IDX_EDGE.into()],
         }
+    }
+
+    pub fn plan_influence(
+        &self,
+        query: &InfluenceQuery,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        if query.seeds.is_empty() {
+            return Err(GraphError::InvalidQuery("seeds_required"));
+        }
+        let iterations = query.iterations.min(self.cfg.max_influence_iterations);
+        let mut degradations = Vec::new();
+        if query.iterations > iterations {
+            degradations.push("iterations_truncated");
+        }
+        let damping = query.damping_factor.clamp(0.0, 1.0);
+        if (query.damping_factor - damping).abs() > f32::EPSILON {
+            degradations.push("damping_clamped");
+        }
+        let plan = Plan::Influence {
+            index: IDX_GRAPH_INFLUENCE.to_string(),
+            seeds: query.seeds.clone(),
+            horizon_ms: query.horizon_ms,
+            damping_factor: damping,
+            iterations,
+            scenario: query.scenario.clone(),
+        };
+        let hash = format!(
+            "influence:tenant={}:seeds={}:iterations={}",
+            query.tenant_id.as_u64(),
+            query.seeds.len(),
+            iterations
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![IDX_GRAPH_INFLUENCE.into()],
+            },
+            hash,
+            join_degradations(degradations),
+        ))
+    }
+
+    pub fn plan_pattern(
+        &self,
+        query: &PatternQuery,
+    ) -> Result<(PreparedPlan, String, Option<Degradation>), GraphError> {
+        if query.tenant_id.as_u64() == 0 {
+            return Err(GraphError::AuthForbidden);
+        }
+        let limit = query.limit.min(self.cfg.max_pattern_limit);
+        let mut degradations = Vec::new();
+        if query.limit > limit {
+            degradations.push("limit_truncated");
+        }
+        let plan = Plan::Pattern {
+            index: IDX_GRAPH_PATTERN.to_string(),
+            template_id: query.template_id.clone(),
+            limit,
+        };
+        let hash = format!(
+            "pattern:tenant={}:template={}:limit={}",
+            query.tenant_id.as_u64(),
+            query.template_id,
+            limit
+        );
+        Ok((
+            PreparedPlan {
+                plan,
+                indices_used: vec![IDX_GRAPH_PATTERN.into()],
+            },
+            hash,
+            join_degradations(degradations),
+        ))
     }
 
     pub fn plan_live(
@@ -349,5 +630,15 @@ impl Planner {
         );
 
         Ok((prepared, hash, degradation))
+    }
+}
+
+fn join_degradations(degradations: Vec<&'static str>) -> Option<Degradation> {
+    if degradations.is_empty() {
+        None
+    } else {
+        Some(Degradation {
+            reason: degradations.join("+"),
+        })
     }
 }

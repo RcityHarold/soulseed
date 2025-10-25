@@ -1,3 +1,4 @@
+use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use crate::aggregator::SyncPointAggregator;
 use crate::budget::BudgetManager;
 use crate::ca::InjectionAction;
@@ -16,7 +17,6 @@ use serde_json::{Map, Value, json};
 use soulseed_agi_core_models::AwarenessCycleId;
 use soulseed_agi_core_models::awareness::AwarenessEventType;
 use soulseed_agi_core_models::common::EvidencePointer;
-use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -196,7 +196,7 @@ impl<'a> AceEngine<'a> {
             drop(registry);
             let late_event = soulseed_agi_core_models::awareness::AwarenessEvent {
                 anchor: emission.anchor.clone(),
-                event_id: emission.final_event.event_id,
+                event_id: emission.final_event.base.event_id,
                 event_type: AwarenessEventType::LateReceiptObserved,
                 occurred_at_ms: OffsetDateTime::now_utc().unix_timestamp() * 1000,
                 awareness_cycle_id: emission.cycle_id,
@@ -207,8 +207,8 @@ impl<'a> AceEngine<'a> {
                 inference_cycle_sequence: 1,
                 degradation_reason: None,
                 payload: json!({
-                    "late_event_id": emission.final_event.event_id.as_u64(),
-                    "original_timestamp": emission.final_event.timestamp_ms,
+                    "late_event_id": emission.final_event.base.event_id.as_u64(),
+                    "original_timestamp": emission.final_event.base.timestamp_ms,
                 }),
             };
             let envelope = crate::types::OutboxEnvelope {
@@ -255,16 +255,17 @@ fn sanitize_final_event(
     lane: &CycleLane,
     event: &soulseed_agi_core_models::DialogueEvent,
 ) -> soulseed_agi_core_models::DialogueEvent {
-    let mut sanitized = event.clone();
+    let mut legacy: soulseed_agi_core_models::legacy::dialogue_event::DialogueEvent =
+        event.clone().into();
     if matches!(lane, CycleLane::Collab | CycleLane::SelfReason) {
-        sanitized.reasoning_trace = None;
-        sanitized.reasoning_confidence = None;
-        sanitized.reasoning_strategy = None;
-        sanitized.metadata = merge_metadata(&sanitized.metadata, lane);
-        if sanitized.evidence_pointer.is_none() {
-            if let Some(digest) = sanitized.content_digest_sha256.clone() {
-                sanitized.evidence_pointer = Some(EvidencePointer {
-                    uri: format!("context://summary/{}", sanitized.event_id.as_u64()),
+        legacy.reasoning_trace = None;
+        legacy.reasoning_confidence = None;
+        legacy.reasoning_strategy = None;
+        legacy.metadata = merge_metadata(&legacy.metadata, lane);
+        if legacy.evidence_pointer.is_none() {
+            if let Some(digest) = legacy.content_digest_sha256.clone() {
+                legacy.evidence_pointer = Some(EvidencePointer {
+                    uri: format!("context://summary/{}", legacy.event_id.as_u64()),
                     digest_sha256: Some(digest.clone()),
                     media_type: Some("text/plain".into()),
                     blob_ref: None,
@@ -274,6 +275,8 @@ fn sanitize_final_event(
             }
         }
     }
+    let sanitized = soulseed_agi_core_models::convert_legacy_dialogue_event(legacy);
+    validate_event(&sanitized);
     sanitized
 }
 
@@ -285,4 +288,11 @@ fn merge_metadata(original: &Value, lane: &CycleLane) -> Value {
     map.insert("summary_only".into(), Value::Bool(true));
     map.insert("lane".into(), Value::String(format!("{:?}", lane)));
     Value::Object(map)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_event(event: &soulseed_agi_core_models::DialogueEvent) {
+    if let Err(err) = soulseed_agi_core_models::validate_dialogue_event(event) {
+        debug_assert!(false, "dialogue event validation failed: {:?}", err);
+    }
 }

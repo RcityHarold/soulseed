@@ -6,6 +6,7 @@ use soulseed_agi_core_models::{
     ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType, EnvelopeHead, EventId,
     EvidencePointer, RealTimePriority, Snapshot, Subject, SubjectRef, TraceId,
 };
+use soulseed_agi_core_models::legacy::dialogue_event::DialogueEvent as LegacyDialogueEvent;
 use soulseed_agi_tools::dto::{Anchor, ToolResultSummary};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -291,7 +292,7 @@ pub fn build_final_event(
         })
     };
     let now = OffsetDateTime::now_utc();
-    DialogueEvent {
+    let final_event_legacy = LegacyDialogueEvent {
         tenant_id: anchor.tenant_id,
         event_id: EventId::from_raw_unchecked(now.unix_timestamp_nanos() as u64),
         session_id: anchor.session_id.expect("final event requires session"),
@@ -398,7 +399,10 @@ pub fn build_final_event(
         },
         #[cfg(feature = "vectors-extra")]
         vectors: ExtraVectors::default(),
-    }
+    };
+    let event = soulseed_agi_core_models::convert_legacy_dialogue_event(final_event_legacy);
+    validate_event(&event);
+    event
 }
 
 pub fn new_plan_id(_anchor: &Anchor) -> String {
@@ -441,4 +445,10 @@ pub struct PlannedLlm {
     pub model_decision: ModelRoutingDecision,
     pub prompt: PromptBundle,
     pub intent: LlmExecutionIntent,
+}
+
+fn validate_event(event: &DialogueEvent) {
+    if let Err(err) = soulseed_agi_core_models::validate_dialogue_event(event) {
+        debug_assert!(false, "dialogue event validation failed: {:?}", err);
+    }
 }

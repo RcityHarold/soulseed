@@ -1,3 +1,5 @@
+#![cfg(not(feature = "event-v2"))]
+
 use soulseed_agi_core_models::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

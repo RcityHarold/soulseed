@@ -3,17 +3,19 @@ use std::collections::HashSet;
 use soulseed_agi_graph::{
     api::{
         AwarenessFilters, AwarenessQuery, CausalDir, CausalQuery, ExplainReplayQuery,
-        RecallFilters, RecallQuery, RecallQueryTextOrVec, TimelineQuery,
-        EXPLAIN_EVENT_TYPES_DEFAULT,
+        InfluenceQuery, NeighborhoodDirection, NeighborhoodQuery, PathQuery, PathStrategy,
+        PatternQuery, RecallFilters, RecallQuery, RecallQueryTextOrVec, SimilarityQuery,
+        SimilarityStrategy, SubgraphQuery, TimelineQuery, EXPLAIN_EVENT_TYPES_DEFAULT,
     },
     errors::GraphError,
     mock::{Capabilities, MockExecutor},
     plan::{Plan, PlannerConfig},
     planner::Planner,
-    scenario_rule, AccessClass, AwarenessDegradationReason, AwarenessEventType, AwarenessFork,
-    ConversationScenario, CorrelationId, AwarenessCycleId, DialogueEvent, DialogueEventType, EnvelopeHead,
-    EventId, HumanId, InvariantCheck, LiveFilters, LiveSubscribe, MessageId, MessagePointer,
-    SemanticEdgeKind, SessionId, Snapshot, Subject, SyncPointKind, TenantId, TraceId,
+    scenario_rule, AccessClass, AwarenessCycleId, AwarenessDegradationReason, AwarenessEventType,
+    AwarenessFork, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventPayloadKind,
+    DialogueEventType, EnvelopeHead, EventId, HumanId, InvariantCheck, LiveFilters, LiveSubscribe,
+    MessageId, MessagePointer, SemanticEdgeKind, SessionId, Snapshot, Subject, SyncPointKind,
+    TenantId, TraceId,
 };
 
 fn planner_env(vector_available: bool) -> (Planner, MockExecutor) {
@@ -121,6 +123,18 @@ fn explain_query_base() -> ExplainReplayQuery {
         limit: 100,
         after: None,
     }
+}
+
+#[test]
+fn scenario_rule_includes_payloads_and_routes() {
+    let rule = scenario_rule(&ConversationScenario::HumanToAi);
+    assert!(rule
+        .primary_payloads
+        .contains(&DialogueEventPayloadKind::MessagePrimary));
+    assert!(rule.allowed_forks.contains(&AwarenessFork::Clarify));
+    assert!(rule
+        .explain_fields
+        .contains(&"decision.explain.router_digest"));
 }
 
 #[test]
@@ -515,4 +529,150 @@ fn explain_replay_executor_surfaces_degradation_reason() {
         Some("fork_filter_not_supported")
     );
     assert!(resp.segments.is_empty());
+}
+
+#[test]
+fn path_planner_truncates_depth_and_paths() {
+    let cfg = PlannerConfig::default();
+    let planner = Planner::new(cfg.clone());
+    let query = PathQuery {
+        tenant_id: TenantId::new(1),
+        start: EventId::new(10),
+        goal: EventId::new(20),
+        strategy: PathStrategy::BidirectionalDijkstra,
+        max_depth: Some(cfg.max_path_depth + 5),
+        max_paths: (cfg.max_limit as u16) + 50,
+        time_window: None,
+        scenario: None,
+    };
+    let (prepared, hash, degradation) = planner.plan_path(&query).unwrap();
+    assert!(hash.starts_with("path:tenant="));
+    let reason = degradation.expect("expected degradation").reason;
+    assert!(reason.contains("depth_truncated"));
+    assert!(reason.contains("path_count_truncated"));
+    if let Plan::Path {
+        max_depth,
+        max_paths,
+        ..
+    } = prepared.plan
+    {
+        assert_eq!(max_depth, cfg.max_path_depth);
+        assert_eq!(max_paths, cfg.max_limit as u16);
+    } else {
+        panic!("expected path plan");
+    }
+}
+
+#[test]
+fn neighborhood_planner_respects_radius_limit() {
+    let cfg = PlannerConfig::default();
+    let planner = Planner::new(cfg.clone());
+    let query = NeighborhoodQuery {
+        tenant_id: TenantId::new(1),
+        center: EventId::new(42),
+        direction: NeighborhoodDirection::Both,
+        radius: cfg.max_neighborhood_radius + 2,
+        limit: cfg.max_limit + 100,
+        scenario: None,
+    };
+    let (prepared, _, degradation) = planner.plan_neighborhood(&query).unwrap();
+    let reason = degradation.expect("expected degradation").reason;
+    assert!(reason.contains("radius_truncated"));
+    assert!(reason.contains("limit_truncated"));
+    if let Plan::Neighborhood { radius, limit, .. } = prepared.plan {
+        assert_eq!(radius, cfg.max_neighborhood_radius);
+        assert_eq!(limit, cfg.max_limit);
+    } else {
+        panic!("expected neighborhood plan");
+    }
+}
+
+#[test]
+fn subgraph_planner_requires_seeds() {
+    let planner = Planner::new(PlannerConfig::default());
+    let query = SubgraphQuery {
+        tenant_id: TenantId::new(1),
+        seeds: Vec::new(),
+        radius: 1,
+        max_nodes: 10,
+        scenario: None,
+        include_artifacts: Some(false),
+    };
+    let err = planner.plan_subgraph(&query).unwrap_err();
+    assert_eq!(err, GraphError::InvalidQuery("seeds_required"));
+}
+
+#[test]
+fn similarity_planner_falls_back_without_vector_index() {
+    let planner = Planner::new(PlannerConfig::default());
+    let query = SimilarityQuery {
+        tenant_id: TenantId::new(1),
+        anchor_event: EventId::new(9),
+        top_k: 300,
+        strategy: SimilarityStrategy::Vector,
+        filters: RecallFilters {
+            scenes: None,
+            topics: None,
+            time_window: None,
+            participant: None,
+            event_types: None,
+        },
+    };
+    let (_plan, _, degradation) = planner
+        .plan_similarity(&query, false)
+        .expect("planner should succeed");
+    let reason = degradation.expect("expected degradation").reason;
+    assert!(reason.contains("vector_index_unavailable"));
+    assert!(reason.contains("similarity_k_truncated"));
+}
+
+#[test]
+fn influence_planner_clamps_iterations_and_damping() {
+    let cfg = PlannerConfig::default();
+    let planner = Planner::new(cfg.clone());
+    let query = InfluenceQuery {
+        tenant_id: TenantId::new(1),
+        seeds: vec![EventId::new(1), EventId::new(2)],
+        horizon_ms: Some(10_000),
+        damping_factor: 1.5,
+        iterations: cfg.max_influence_iterations + 20,
+        scenario: None,
+    };
+    let (prepared, _, degradation) = planner.plan_influence(&query).unwrap();
+    let reason = degradation.expect("expected degradation").reason;
+    assert!(reason.contains("iterations_truncated"));
+    assert!(reason.contains("damping_clamped"));
+    if let Plan::Influence {
+        iterations,
+        damping_factor,
+        ..
+    } = prepared.plan
+    {
+        assert_eq!(iterations, cfg.max_influence_iterations);
+        assert!((damping_factor - 1.0).abs() < f32::EPSILON);
+    } else {
+        panic!("expected influence plan");
+    }
+}
+
+#[test]
+fn pattern_planner_limits_results() {
+    let cfg = PlannerConfig::default();
+    let planner = Planner::new(cfg.clone());
+    let query = PatternQuery {
+        tenant_id: TenantId::new(1),
+        template_id: "test-pattern".into(),
+        limit: cfg.max_pattern_limit + 500,
+        parameters: serde_json::json!({ "threshold": 0.8 }),
+    };
+    let (prepared, _, degradation) = planner.plan_pattern(&query).unwrap();
+    assert_eq!(
+        degradation.expect("expected degradation").reason,
+        "limit_truncated"
+    );
+    if let Plan::Pattern { limit, .. } = prepared.plan {
+        assert_eq!(limit, cfg.max_pattern_limit);
+    } else {
+        panic!("expected pattern plan");
+    }
 }

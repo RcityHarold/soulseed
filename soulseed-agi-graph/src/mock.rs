@@ -3,15 +3,23 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     api::{
         AwarenessFilters, AwarenessQuery, AwarenessResponse, CausalEdge, ExplainReplayQuery,
-        ExplainReplayResponse, ExplainReplaySegment, RecallResponse, EXPLAIN_EVENT_TYPES_DEFAULT,
+        ExplainReplayResponse, ExplainReplaySegment, GraphView, InfluenceQuery, InfluenceResponse,
+        NeighborhoodQuery, NeighborhoodResponse, PathQuery, PathResponse, PathStrategy,
+        PatternQuery, PatternResponse, RecallResponse, SimilarityQuery, SimilarityResponse,
+        SubgraphQuery, SubgraphResponse, EXPLAIN_EVENT_TYPES_DEFAULT,
     },
     errors::{Degradation, GraphError},
     plan::PreparedPlan,
     scenario::scenario_rule,
-    types::{ConceptNode, EmotionNode, SemanticEdge, SemanticEdgeKind, SemanticRef, TopicNode},
+    types::{
+        ConceptNode, EmotionNode, GraphEdge, GraphEdgeKind, GraphNode, GraphNodeKind, GraphNodeRef,
+        SemanticEdge, SemanticEdgeKind, SemanticRef, TopicNode,
+    },
     AwarenessEventType, DialogueEvent, EventId, LiveEventPointer, LiveSubscribe, RecallQuery,
     SyncPointKind, TimelineQuery, TimelineResponse,
 };
+use serde_json::json;
+use soulseed_agi_core_models::validate_dialogue_event;
 
 #[derive(Clone, Debug)]
 pub struct Capabilities {
@@ -34,10 +42,21 @@ impl MockExecutor {
     }
 
     pub fn append_event(&mut self, event: DialogueEvent) -> Result<(), GraphError> {
-        if !self.caps.allowed_tenants.contains(&event.tenant_id.as_u64()) {
+        if let Err(_err) = validate_dialogue_event(&event) {
+            return Err(GraphError::InvalidQuery("invalid_event_structure"));
+        }
+        if !self
+            .caps
+            .allowed_tenants
+            .contains(&event.base.tenant_id.as_u64())
+        {
             return Err(GraphError::AuthForbidden);
         }
-        let key = (event.tenant_id.as_u64(), event.session_id.as_u64(), event.sequence_number);
+        let key = (
+            event.base.tenant_id.as_u64(),
+            event.base.session_id.as_u64(),
+            event.base.sequence_number,
+        );
         if self.timeline_store.contains_key(&key) {
             return Err(GraphError::StorageConflict);
         }
@@ -96,6 +115,7 @@ impl MockExecutor {
             indices_used: plan.indices_used,
             query_hash: "mock-timeline".into(),
             degradation_reason: None,
+            graph: None,
         })
     }
 
@@ -144,11 +164,7 @@ impl MockExecutor {
             weight: Some(0.7),
         }];
 
-        if let Some(scene) = query
-            .scenario
-            .as_ref()
-            .or(plan_scenario.as_ref())
-        {
+        if let Some(scene) = query.scenario.as_ref().or(plan_scenario.as_ref()) {
             let allowed = scenario_rule(scene).allowed_semantic_edges;
             if semantic_edges
                 .iter()
@@ -185,8 +201,249 @@ impl MockExecutor {
                 evidence_pointer: None,
             }],
             semantic_edges,
+            graph_nodes: Vec::new(),
+            graph_edges: Vec::new(),
             indices_used: plan.indices_used,
             query_hash: "mock-causal".into(),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_path(
+        &self,
+        plan: PreparedPlan,
+        query: &PathQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<PathResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        let (strategy, max_depth, max_paths) = match &plan.plan {
+            crate::plan::Plan::Path {
+                strategy,
+                max_depth,
+                max_paths,
+                ..
+            } => (strategy.clone(), *max_depth, *max_paths),
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        let mut nodes = Vec::new();
+        nodes.push(GraphNode {
+            id: GraphNodeRef::Event(query.start),
+            kind: GraphNodeKind::Event,
+            label: Some("start".into()),
+            summary: None,
+            weight: Some(1.0),
+            metadata: None,
+        });
+        nodes.push(GraphNode {
+            id: GraphNodeRef::Event(query.goal),
+            kind: GraphNodeKind::Event,
+            label: Some("goal".into()),
+            summary: None,
+            weight: Some(1.0),
+            metadata: None,
+        });
+        let edges = vec![GraphEdge {
+            from: GraphNodeRef::Event(query.start),
+            to: GraphNodeRef::Event(query.goal),
+            kind: GraphEdgeKind::RoutesThrough,
+            strength: Some(0.6),
+            confidence: Some(0.7),
+            temporal_decay: Some(0.1),
+            since_ms: None,
+            until_ms: None,
+            explain: Some("mock_path_edge".into()),
+            properties: json!({
+                "max_depth": max_depth,
+                "max_paths": max_paths
+            }),
+        }];
+        let graph = GraphView {
+            nodes,
+            edges,
+            summary: Some("mock_path".into()),
+        };
+        let algorithm = match strategy.as_str() {
+            "bidirectional_dijkstra" => PathStrategy::BidirectionalDijkstra,
+            _ => PathStrategy::Bfs,
+        };
+        Ok(PathResponse {
+            tenant_id: query.tenant_id,
+            algorithm,
+            hop_count: 1,
+            total_cost: None,
+            graph,
+            indices_used: plan.indices_used,
+            query_hash: "mock-path".into(),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_neighborhood(
+        &self,
+        plan: PreparedPlan,
+        query: &NeighborhoodQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<NeighborhoodResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        let radius = match &plan.plan {
+            crate::plan::Plan::Neighborhood { radius, .. } => *radius,
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        let nodes = vec![GraphNode {
+            id: GraphNodeRef::Event(query.center),
+            kind: GraphNodeKind::Event,
+            label: Some("center".into()),
+            summary: None,
+            weight: Some(1.0),
+            metadata: None,
+        }];
+        let edges = Vec::new();
+        let graph = GraphView {
+            nodes,
+            edges,
+            summary: Some("mock_neighborhood".into()),
+        };
+        Ok(NeighborhoodResponse {
+            tenant_id: query.tenant_id,
+            graph,
+            expansion_depth: radius,
+            indices_used: plan.indices_used,
+            query_hash: "mock-neighborhood".into(),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_subgraph(
+        &self,
+        plan: PreparedPlan,
+        query: &SubgraphQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<SubgraphResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        if query.seeds.is_empty() {
+            return Err(GraphError::InvalidQuery("seeds_required"));
+        }
+        let (radius, include_artifacts) = match &plan.plan {
+            crate::plan::Plan::Subgraph {
+                radius,
+                include_artifacts,
+                ..
+            } => (*radius, *include_artifacts),
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        let nodes: Vec<GraphNode> = query
+            .seeds
+            .iter()
+            .map(|seed| GraphNode {
+                id: GraphNodeRef::Event(*seed),
+                kind: GraphNodeKind::Event,
+                label: Some(format!("seed:{}", seed.as_u64())),
+                summary: None,
+                weight: Some(0.9),
+                metadata: Some(json!({ "radius": radius })),
+            })
+            .collect();
+        let graph = GraphView {
+            nodes,
+            edges: Vec::new(),
+            summary: Some(if include_artifacts {
+                "mock_subgraph_with_artifacts".into()
+            } else {
+                "mock_subgraph".into()
+            }),
+        };
+        Ok(SubgraphResponse {
+            tenant_id: query.tenant_id,
+            graph,
+            indices_used: plan.indices_used,
+            query_hash: "mock-subgraph".into(),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_similarity(
+        &self,
+        plan: PreparedPlan,
+        query: &SimilarityQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<SimilarityResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        let top_k = match &plan.plan {
+            crate::plan::Plan::Similarity { top_k, .. } => *top_k,
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        Ok(SimilarityResponse {
+            tenant_id: query.tenant_id,
+            hits: Vec::new(),
+            indices_used: plan.indices_used,
+            query_hash: format!("mock-similarity-k{}", top_k),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_influence(
+        &self,
+        plan: PreparedPlan,
+        query: &InfluenceQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<InfluenceResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        let iterations = match &plan.plan {
+            crate::plan::Plan::Influence { iterations, .. } => *iterations,
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        if query.seeds.is_empty() {
+            return Err(GraphError::InvalidQuery("seeds_required"));
+        }
+        let nodes: Vec<GraphNode> = query
+            .seeds
+            .iter()
+            .map(|seed| GraphNode {
+                id: GraphNodeRef::Event(*seed),
+                kind: GraphNodeKind::Event,
+                label: Some(format!("seed:{}", seed.as_u64())),
+                summary: None,
+                weight: Some(1.0 / query.seeds.len() as f32),
+                metadata: Some(json!({ "iteration": iterations })),
+            })
+            .collect();
+        let graph = GraphView {
+            nodes,
+            edges: Vec::new(),
+            summary: Some("mock_influence".into()),
+        };
+        Ok(InfluenceResponse {
+            tenant_id: query.tenant_id,
+            graph,
+            total_influence: 1.0,
+            iterations,
+            indices_used: plan.indices_used,
+            query_hash: "mock-influence".into(),
+            degradation_reason: degradation.map(|d| d.reason),
+        })
+    }
+
+    pub fn execute_pattern(
+        &self,
+        plan: PreparedPlan,
+        query: &PatternQuery,
+        degradation: Option<Degradation>,
+    ) -> Result<PatternResponse, GraphError> {
+        self.ensure_tenant(query.tenant_id.as_u64())?;
+        let limit = match &plan.plan {
+            crate::plan::Plan::Pattern { limit, .. } => *limit,
+            _ => return Err(GraphError::NoIndexPlan),
+        };
+        let graph = GraphView {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            summary: Some(format!("pattern:{}", query.template_id)),
+        };
+        Ok(PatternResponse {
+            tenant_id: query.tenant_id,
+            matches: vec![graph],
+            indices_used: plan.indices_used,
+            query_hash: format!("mock-pattern-{}", limit),
             degradation_reason: degradation.map(|d| d.reason),
         })
     }
@@ -247,6 +504,7 @@ impl MockExecutor {
             indices_used: plan.indices_used,
             query_hash: "mock-recall".into(),
             degradation_reason: degradation.map(|d| d.reason),
+            graph: None,
         })
     }
 

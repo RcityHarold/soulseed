@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
-    AIId, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType, AwarenessFork,
-    ConceptNode, ConversationScenario, AwarenessCycleId, DialogueEvent, DialogueEventType, EmotionNode,
-    EventId, HumanId, RelationshipEdge, RelationshipSnapshot, SemanticEdge, SessionId, SubjectRef,
-    SyncPointKind, TenantId, TopicNode,
+    AIId, AwarenessCycleId, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
+    AwarenessFork, ConceptNode, ConversationScenario, DialogueEvent, DialogueEventType,
+    EmotionNode, EventId, GraphEdge, GraphNode, HumanId, RelationshipEdge, RelationshipSnapshot,
+    SemanticEdge, SessionId, SubjectRef, SyncPointKind, TenantId, TopicNode,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -39,6 +40,159 @@ pub struct TimelineResponse {
     pub tenant_id: TenantId,
     pub items: Vec<TimelineItem>,
     pub next: Option<PageCursor>,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathStrategy {
+    Bfs,
+    BidirectionalDijkstra,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathQuery {
+    pub tenant_id: TenantId,
+    pub start: EventId,
+    pub goal: EventId,
+    pub strategy: PathStrategy,
+    pub max_depth: Option<u8>,
+    pub max_paths: u16,
+    pub time_window: Option<TimeWindow>,
+    pub scenario: Option<ConversationScenario>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PathResponse {
+    pub tenant_id: TenantId,
+    pub algorithm: PathStrategy,
+    pub hop_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost: Option<f32>,
+    pub graph: GraphView,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NeighborhoodDirection {
+    Outbound,
+    Inbound,
+    Both,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeighborhoodQuery {
+    pub tenant_id: TenantId,
+    pub center: EventId,
+    pub direction: NeighborhoodDirection,
+    pub radius: u8,
+    pub limit: u32,
+    pub scenario: Option<ConversationScenario>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeighborhoodResponse {
+    pub tenant_id: TenantId,
+    pub graph: GraphView,
+    pub expansion_depth: u8,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubgraphQuery {
+    pub tenant_id: TenantId,
+    pub seeds: Vec<EventId>,
+    pub radius: u8,
+    pub max_nodes: u32,
+    pub scenario: Option<ConversationScenario>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_artifacts: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubgraphResponse {
+    pub tenant_id: TenantId,
+    pub graph: GraphView,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimilarityStrategy {
+    Vector,
+    Hybrid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityQuery {
+    pub tenant_id: TenantId,
+    pub anchor_event: EventId,
+    pub top_k: u16,
+    pub strategy: SimilarityStrategy,
+    pub filters: RecallFilters,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityHit {
+    pub event: DialogueEvent,
+    pub score: f32,
+    pub algorithm: SimilarityStrategy,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimilarityResponse {
+    pub tenant_id: TenantId,
+    pub hits: Vec<SimilarityHit>,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InfluenceQuery {
+    pub tenant_id: TenantId,
+    pub seeds: Vec<EventId>,
+    pub horizon_ms: Option<i64>,
+    pub damping_factor: f32,
+    pub iterations: u8,
+    pub scenario: Option<ConversationScenario>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InfluenceResponse {
+    pub tenant_id: TenantId,
+    pub graph: GraphView,
+    pub total_influence: f32,
+    pub iterations: u8,
+    pub indices_used: Vec<String>,
+    pub query_hash: String,
+    pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatternQuery {
+    pub tenant_id: TenantId,
+    pub template_id: String,
+    pub limit: u32,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub parameters: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatternResponse {
+    pub tenant_id: TenantId,
+    pub matches: Vec<GraphView>,
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
@@ -83,6 +237,10 @@ pub struct CausalResponse {
     pub emotion_nodes: Vec<EmotionNode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub semantic_edges: Vec<SemanticEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_nodes: Vec<GraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graph_edges: Vec<GraphEdge>,
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
@@ -105,6 +263,8 @@ pub struct StitchResponse {
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -144,6 +304,8 @@ pub struct RecallResponse {
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GraphView>,
 }
 
 pub const EXPLAIN_EVENT_TYPES_DEFAULT: &[AwarenessEventType] = &[
@@ -209,6 +371,16 @@ pub struct AwarenessResponse {
     pub indices_used: Vec<String>,
     pub query_hash: String,
     pub degradation_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GraphView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<GraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<GraphEdge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

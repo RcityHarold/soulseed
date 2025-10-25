@@ -125,11 +125,7 @@ impl GlobalIdFactory {
             guard.last_timestamp = timestamp;
         }
 
-        Ok(compose_raw_id(
-            timestamp,
-            self.shard_id,
-            guard.sequence,
-        ))
+        Ok(compose_raw_id(timestamp, self.shard_id, guard.sequence))
     }
 
     pub fn validate_raw(raw: u64) -> IdResult<IdComponents> {
@@ -137,14 +133,15 @@ impl GlobalIdFactory {
         if timestamp > MAX_TIMESTAMP {
             return Err(IdError::TimestampOverflow(timestamp));
         }
-        let shard_id =
-            ((raw >> SHARD_SHIFT) & ((1 << SHARD_BITS) - 1)) as u16;
+        let shard_id = ((raw >> SHARD_SHIFT) & ((1 << SHARD_BITS) - 1)) as u16;
         if shard_id > MAX_SHARD_ID {
             return Err(IdError::ShardOutOfRange(shard_id));
         }
         let sequence = (raw & ((1 << SEQUENCE_BITS) - 1)) as u16;
         if sequence > MAX_SEQUENCE {
-            return Err(IdError::SequenceOverflow { timestamp_ms: timestamp });
+            return Err(IdError::SequenceOverflow {
+                timestamp_ms: timestamp,
+            });
         }
 
         Ok(IdComponents {
@@ -165,9 +162,7 @@ impl GlobalIdFactory {
 }
 
 fn compose_raw_id(timestamp: u64, shard_id: u16, sequence: u16) -> u64 {
-    (timestamp << TIMESTAMP_SHIFT)
-        | ((shard_id as u64) << SHARD_SHIFT)
-        | sequence as u64
+    (timestamp << TIMESTAMP_SHIFT) | ((shard_id as u64) << SHARD_SHIFT) | sequence as u64
 }
 
 static GLOBAL_FACTORY: OnceLock<GlobalIdFactory> = OnceLock::new();
@@ -188,14 +183,11 @@ fn to_base36(mut value: u64) -> String {
         buf[idx] = BASE36_ALPHABET[rem];
         value /= 36;
     }
-    std::str::from_utf8(&buf[idx..])
-        .unwrap()
-        .to_string()
+    std::str::from_utf8(&buf[idx..]).unwrap().to_string()
 }
 
 fn from_base36(value: &str) -> IdResult<u64> {
-    u64::from_str_radix(&value.to_uppercase(), 36)
-        .map_err(|_| IdError::InvalidBase36)
+    u64::from_str_radix(&value.to_uppercase(), 36).map_err(|_| IdError::InvalidBase36)
 }
 
 macro_rules! define_id_type {
@@ -221,8 +213,7 @@ macro_rules! define_id_type {
             }
 
             pub fn generate_in_shard(shard_id: u16) -> Self {
-                Self::try_generate_in_shard(shard_id)
-                    .expect("id generation failed")
+                Self::try_generate_in_shard(shard_id).expect("id generation failed")
             }
 
             pub fn from_raw(raw: u64) -> IdResult<Self> {
@@ -260,8 +251,7 @@ macro_rules! define_id_type {
             }
 
             pub fn components(&self) -> IdComponents {
-                GlobalIdFactory::validate_raw(self.0)
-                    .expect("id components invalid")
+                GlobalIdFactory::validate_raw(self.0).expect("id components invalid")
             }
 
             pub fn timestamp_ms(&self) -> u64 {

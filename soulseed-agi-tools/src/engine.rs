@@ -14,6 +14,7 @@ use soulseed_agi_core_models::{
     CorrelationId, DialogueEvent, DialogueEventType, EnvelopeHead, RealTimePriority,
     SelfReflectionRecord, Snapshot, ToolInvocation, ToolResult, TraceId,
 };
+use soulseed_agi_core_models::legacy::dialogue_event::DialogueEvent as LegacyDialogueEvent;
 use std::collections::HashMap;
 use time::OffsetDateTime;
 use xxhash_rust::xxh3::xxh3_64;
@@ -211,6 +212,7 @@ impl<'a> ToolEngineRunner for ToolEngine<'a> {
             plan,
             execution: record,
             dialogue_events,
+
         })
     }
 }
@@ -283,7 +285,7 @@ fn build_dialogue_events(
             .saturating_sub(stage.start_ms)
             .min(u64::from(u32::MAX)) as u32;
 
-        let call_event = DialogueEvent {
+        let call_event_legacy = LegacyDialogueEvent {
             tenant_id: plan.anchor.tenant_id,
             event_id: new_event_id(&plan.plan_id, "call", &spec.idem_key),
             session_id,
@@ -354,6 +356,8 @@ fn build_dialogue_events(
             #[cfg(feature = "vectors-extra")]
             vectors: ExtraVectors::default(),
         };
+        let call_event = soulseed_agi_core_models::convert_legacy_dialogue_event(call_event_legacy);
+        validate_event(&call_event);
         events.push(call_event);
         next_sequence += 1;
         next_timestamp += 1;
@@ -388,7 +392,7 @@ fn build_dialogue_events(
         };
         let result_degrade = tool_result.degradation_reason.clone();
 
-        let result_event = DialogueEvent {
+        let result_event_legacy = LegacyDialogueEvent {
             tenant_id: plan.anchor.tenant_id,
             event_id: new_event_id(&plan.plan_id, "result", &spec.idem_key),
             session_id,
@@ -460,6 +464,9 @@ fn build_dialogue_events(
             #[cfg(feature = "vectors-extra")]
             vectors: ExtraVectors::default(),
         };
+        let result_event =
+            soulseed_agi_core_models::convert_legacy_dialogue_event(result_event_legacy);
+        validate_event(&result_event);
         events.push(result_event);
         next_sequence += 1;
         next_timestamp += 1;
@@ -472,7 +479,7 @@ fn build_dialogue_events(
                 outcome: summary.summary.clone(),
                 confidence: None,
             };
-            let event = DialogueEvent {
+            let self_event_legacy = LegacyDialogueEvent {
                 tenant_id: plan.anchor.tenant_id,
                 event_id: new_event_id(&plan.plan_id, "self_reflection", &summary.tool_id),
                 session_id,
@@ -535,12 +542,14 @@ fn build_dialogue_events(
                 #[cfg(feature = "vectors-extra")]
                 vectors: ExtraVectors::default(),
             };
+            let event = soulseed_agi_core_models::convert_legacy_dialogue_event(self_event_legacy);
+            validate_event(&event);
             events.push(event);
         }
     } else if matches!(plan.lane, ToolLane::Collaboration) {
         if let Some(summary) = &execution.summary {
             let collab_pointer = summary.evidence_pointer.clone();
-            let collab_event = DialogueEvent {
+            let collab_event_legacy = LegacyDialogueEvent {
                 tenant_id: plan.anchor.tenant_id,
                 event_id: new_event_id(&plan.plan_id, "collaboration", &summary.tool_id),
                 session_id,
@@ -611,6 +620,9 @@ fn build_dialogue_events(
                 #[cfg(feature = "vectors-extra")]
                 vectors: ExtraVectors::default(),
             };
+            let collab_event =
+                soulseed_agi_core_models::convert_legacy_dialogue_event(collab_event_legacy);
+            validate_event(&collab_event);
             events.push(collab_event);
         }
     }
@@ -620,4 +632,11 @@ fn build_dialogue_events(
 
 fn new_event_id(plan_id: &str, kind: &str, key: &str) -> crate::dto::EventId {
     crate::dto::EventId::from_raw_unchecked(xxh3_64(format!("{plan_id}:{kind}:{key}").as_bytes()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_event(event: &DialogueEvent) {
+    if let Err(err) = soulseed_agi_core_models::validate_dialogue_event(event) {
+        debug_assert!(false, "dialogue event validation failed: {:?}", err);
+    }
 }
