@@ -2,9 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use crate::errors::AceError;
-use crate::types::{BudgetSnapshot, CycleLane, CycleSchedule, ScheduleOutcome, new_cycle_id};
+use crate::types::{
+    BudgetSnapshot, CycleLane, CycleSchedule, CycleStatus, ScheduleOutcome, new_cycle_id,
+};
 use blake3::Hasher;
-use serde_json::{json, to_value, Value};
+use serde_json::{Value, json, to_value};
 use soulseed_agi_core_models::awareness::{
     AwarenessAnchor, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType, AwarenessFork,
 };
@@ -39,6 +41,7 @@ struct SchedulerState {
     active: HashMap<u64, CycleLane>,
     clarify_stats: HashMap<u64, ClarifyStats>,
     last_fork: HashMap<u64, AwarenessFork>,
+    status: HashMap<u64, CycleStatus>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,8 +68,11 @@ impl CycleScheduler {
         &self,
         decision: RouterDecision,
         budget: BudgetSnapshot,
+        parent_cycle_id: Option<AwarenessCycleId>,
+        collab_scope_id: Option<String>,
     ) -> Result<ScheduleOutcome, AceError> {
         let plan = &decision.plan;
+        let plan_cycle_id = plan.cycle_id;
         let anchor = plan.anchor.clone();
         let tenant = anchor.tenant_id.into_inner();
         let lane: CycleLane = plan.fork.into();
@@ -75,7 +81,10 @@ impl CycleScheduler {
         if !self.cfg.allow_parallel_lanes {
             let guard = self.state.lock().unwrap();
             if let Some(active_lane) = guard.active.get(&tenant) {
-                if matches!((active_lane, &lane), (CycleLane::Clarify, CycleLane::Clarify)) {
+                if matches!(
+                    (active_lane, &lane),
+                    (CycleLane::Clarify, CycleLane::Clarify)
+                ) {
                     return Ok(ScheduleOutcome {
                         accepted: false,
                         reason: Some("clarify_lane_busy".into()),
@@ -146,12 +155,26 @@ impl CycleScheduler {
         }
 
         let prev_fork = guard.last_fork.get(&tenant).copied();
-        let decision_events =
-            build_decision_events(&anchor, plan.cycle_id, &decision, &lane, prev_fork);
+        let collab_scope_ref = collab_scope_id.as_deref();
+        let decision_events = build_decision_events(
+            &anchor,
+            plan_cycle_id,
+            &decision,
+            &lane,
+            prev_fork,
+            parent_cycle_id,
+            collab_scope_ref,
+        );
         let explain_fingerprint = fingerprint_decision(&decision);
 
+        let initial_status = if matches!(lane, CycleLane::SelfReason) {
+            CycleStatus::Running
+        } else {
+            CycleStatus::AwaitingExternal
+        };
+
         let cycle = CycleSchedule {
-            cycle_id: plan.cycle_id,
+            cycle_id: plan_cycle_id,
             lane: lane.clone(),
             anchor: anchor.clone(),
             budget: budget.clone(),
@@ -159,6 +182,9 @@ impl CycleScheduler {
             router_decision: decision,
             decision_events: decision_events.clone(),
             explain_fingerprint: explain_fingerprint.clone(),
+            status: initial_status,
+            parent_cycle_id,
+            collab_scope_id: collab_scope_id.clone(),
         };
 
         guard
@@ -167,6 +193,7 @@ impl CycleScheduler {
             .or_default()
             .push_back(cycle.clone());
         guard.last_fork.insert(tenant, lane.as_fork());
+        guard.status.insert(plan_cycle_id.as_u64(), initial_status);
         Ok(ScheduleOutcome {
             accepted: true,
             reason: None,
@@ -178,20 +205,49 @@ impl CycleScheduler {
     pub fn start_next(&self, tenant: u64) -> Option<CycleSchedule> {
         let mut guard = self.state.lock().unwrap();
         let queue = guard.pending.get_mut(&tenant)?;
-        let cycle = queue.pop_front()?;
+        let mut cycle = queue.pop_front()?;
+        let current_status = guard.status.get(&cycle.cycle_id.as_u64()).copied();
+        match current_status {
+            Some(CycleStatus::AwaitingExternal | CycleStatus::Suspended) => {
+                cycle.status = current_status.unwrap();
+            }
+            Some(status) if status != CycleStatus::Running => {
+                cycle.status = status;
+            }
+            _ => {
+                cycle.status = CycleStatus::Running;
+                guard
+                    .status
+                    .insert(cycle.cycle_id.as_u64(), CycleStatus::Running);
+            }
+        }
         guard.active.insert(tenant, cycle.lane.clone());
         Some(cycle)
     }
 
-    pub fn finish(&self, tenant: u64) {
+    pub fn finish(&self, tenant: u64, cycle_id: AwarenessCycleId, status: CycleStatus) {
         let mut guard = self.state.lock().unwrap();
         guard.active.remove(&tenant);
+        guard.status.insert(cycle_id.as_u64(), status);
+        if matches!(status, CycleStatus::Completed | CycleStatus::Failed) {
+            guard.status.remove(&cycle_id.as_u64());
+        }
         if let Some(stats) = guard.clarify_stats.get_mut(&tenant) {
             stats.rounds = stats.rounds.saturating_sub(1);
             if stats.rounds == 0 {
                 guard.clarify_stats.remove(&tenant);
             }
         }
+    }
+
+    pub fn mark_status(&self, cycle_id: AwarenessCycleId, status: CycleStatus) {
+        let mut guard = self.state.lock().unwrap();
+        guard.status.insert(cycle_id.as_u64(), status);
+    }
+
+    pub fn status_of(&self, cycle_id: AwarenessCycleId) -> Option<CycleStatus> {
+        let guard = self.state.lock().unwrap();
+        guard.status.get(&cycle_id.as_u64()).copied()
     }
 }
 
@@ -201,6 +257,8 @@ fn build_decision_events(
     decision: &RouterDecision,
     lane: &CycleLane,
     previous: Option<AwarenessFork>,
+    parent_cycle_id: Option<AwarenessCycleId>,
+    collab_scope_id: Option<&str>,
 ) -> Vec<AwarenessEvent> {
     let mut events = Vec::new();
     let mut next_event_id = cycle_id.as_u64();
@@ -210,14 +268,23 @@ fn build_decision_events(
         degradation = map_degradation(decision.plan.explain.degradation_reason.as_deref());
     }
 
+    let plan_value = to_value(&decision.decision_path.plan).unwrap_or_else(|_| Value::Null);
+    let rationale_value =
+        to_value(&decision.decision_path.rationale).unwrap_or_else(|_| Value::Null);
+    let budget_plan_value =
+        to_value(&decision.decision_path.budget_plan).unwrap_or_else(|_| Value::Null);
+    let decision_path_value = to_value(&decision.decision_path).unwrap_or_else(|_| Value::Null);
+    let route_plan_value = to_value(&decision.plan).unwrap_or_else(|_| Value::Null);
+    let collab_scope_string = collab_scope_id.map(|s| s.to_string());
+
     events.push(AwarenessEvent {
         anchor: anchor.clone(),
         event_id: EventId::from_raw_unchecked(next_event_id),
-        event_type: AwarenessEventType::AcStarted,
+        event_type: AwarenessEventType::AwarenessCycleStarted,
         occurred_at_ms,
         awareness_cycle_id: cycle_id,
-        parent_cycle_id: None,
-        collab_scope_id: None,
+        parent_cycle_id,
+        collab_scope_id: collab_scope_string.clone(),
         barrier_id: None,
         env_mode: None,
         inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
@@ -235,11 +302,11 @@ fn build_decision_events(
     events.push(AwarenessEvent {
         anchor: anchor.clone(),
         event_id: EventId::from_raw_unchecked(next_event_id),
-        event_type: AwarenessEventType::IcStarted,
+        event_type: AwarenessEventType::InferenceCycleStarted,
         occurred_at_ms,
         awareness_cycle_id: cycle_id,
-        parent_cycle_id: None,
-        collab_scope_id: None,
+        parent_cycle_id,
+        collab_scope_id: collab_scope_string.clone(),
         barrier_id: None,
         env_mode: None,
         inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
@@ -254,44 +321,45 @@ fn build_decision_events(
     events.push(AwarenessEvent {
         anchor: anchor.clone(),
         event_id: EventId::from_raw_unchecked(next_event_id),
+        event_type: AwarenessEventType::AssessmentProduced,
+        occurred_at_ms,
+        awareness_cycle_id: cycle_id,
+        parent_cycle_id,
+        collab_scope_id: collab_scope_string.clone(),
+        barrier_id: None,
+        env_mode: None,
+        inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
+        degradation_reason: degradation,
+        payload: json!({
+            "lane": format!("{:?}", lane),
+            "plan": plan_value.clone(),
+            "rationale": rationale_value,
+            "budget_plan": budget_plan_value,
+            "confidence": decision.decision_path.confidence,
+        }),
+    });
+    next_event_id += 1;
+
+    events.push(AwarenessEvent {
+        anchor: anchor.clone(),
+        event_id: EventId::from_raw_unchecked(next_event_id),
         event_type: AwarenessEventType::DecisionRouted,
         occurred_at_ms,
         awareness_cycle_id: cycle_id,
-        parent_cycle_id: None,
-        collab_scope_id: None,
+        parent_cycle_id,
+        collab_scope_id: collab_scope_string.clone(),
         barrier_id: None,
         env_mode: None,
         inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
         degradation_reason: degradation,
         payload: json!({
             "fork": format!("{:?}", lane),
-            "decision_path": to_value(&decision.decision_path).unwrap_or_else(|_| Value::Null),
-            "route_plan": to_value(&decision.plan).unwrap_or_else(|_| Value::Null),
+            "decision_path": decision_path_value,
+            "route_plan": route_plan_value,
             "rejected": decision.rejected,
         }),
     });
     next_event_id += 1;
-
-    if matches!(lane, CycleLane::SelfReason) {
-        events.push(AwarenessEvent {
-            anchor: anchor.clone(),
-            event_id: EventId::from_raw_unchecked(next_event_id),
-            event_type: AwarenessEventType::AssessmentProduced,
-            occurred_at_ms,
-            awareness_cycle_id: cycle_id,
-            parent_cycle_id: None,
-            collab_scope_id: None,
-            barrier_id: None,
-            env_mode: None,
-            inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
-            degradation_reason: degradation,
-            payload: json!({
-                "lane": "self_reason",
-                "plan": to_value(&decision.decision_path.plan).unwrap_or_else(|_| Value::Null),
-            }),
-        });
-        next_event_id += 1;
-    }
 
     if let Some(prev) = previous {
         if prev != lane.as_fork() {
@@ -301,8 +369,8 @@ fn build_decision_events(
                 event_type: AwarenessEventType::RouteReconsidered,
                 occurred_at_ms,
                 awareness_cycle_id: cycle_id,
-                parent_cycle_id: None,
-                collab_scope_id: None,
+                parent_cycle_id,
+                collab_scope_id: collab_scope_string.clone(),
                 barrier_id: None,
                 env_mode: None,
                 inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,
@@ -321,8 +389,8 @@ fn build_decision_events(
                 event_type: AwarenessEventType::RouteSwitched,
                 occurred_at_ms,
                 awareness_cycle_id: cycle_id,
-                parent_cycle_id: None,
-                collab_scope_id: None,
+                parent_cycle_id,
+                collab_scope_id: collab_scope_string,
                 barrier_id: None,
                 env_mode: None,
                 inference_cycle_sequence: decision.decision_path.inference_cycle_sequence,

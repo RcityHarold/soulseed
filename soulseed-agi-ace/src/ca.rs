@@ -11,7 +11,7 @@ use soulseed_agi_context::{
     },
 };
 use soulseed_agi_core_models::{
-    AccessClass, ConversationScenario, AwarenessCycleId, DialogueEvent, DialogueEventType, EventId,
+    AccessClass, AwarenessCycleId, ConversationScenario, DialogueEvent, DialogueEventType, EventId,
     awareness::{
         AwarenessAnchor, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
         DeltaPatch, SyncPointKind,
@@ -562,9 +562,10 @@ fn build_awareness_events(
 
 fn map_syncpoint_event(kind: &SyncPointKind) -> AwarenessEventType {
     match kind {
-        SyncPointKind::IcEnd => AwarenessEventType::IcEnded,
-        SyncPointKind::ToolBarrier
-        | SyncPointKind::ToolBarrierReached => AwarenessEventType::ToolBarrierReached,
+        SyncPointKind::IcEnd => AwarenessEventType::InferenceCycleCompleted,
+        SyncPointKind::ToolBarrier | SyncPointKind::ToolBarrierReached => {
+            AwarenessEventType::ToolBarrierReached
+        }
         SyncPointKind::ToolBarrierReleased => AwarenessEventType::ToolBarrierReleased,
         SyncPointKind::ToolBarrierTimeout => AwarenessEventType::ToolBarrierTimeout,
         SyncPointKind::ToolChainNext => AwarenessEventType::RouteSwitched,
@@ -595,10 +596,11 @@ mod tests {
     use serde_json::json;
     #[cfg(feature = "vectors-extra")]
     use soulseed_agi_core_models::ExtraVectors;
+    use soulseed_agi_core_models::legacy::dialogue_event as legacy;
     use soulseed_agi_core_models::{
         AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
         EnvelopeHead, EventId, HumanId, MessageId, MessagePointer, SessionId, Snapshot, Subject,
-        SubjectRef, TraceId,
+        SubjectRef, TraceId, convert_legacy_dialogue_event,
     };
     use time::OffsetDateTime;
 
@@ -618,7 +620,7 @@ mod tests {
 
     fn dummy_event() -> DialogueEvent {
         let now = OffsetDateTime::now_utc();
-        DialogueEvent {
+        let legacy_event = legacy::DialogueEvent {
             tenant_id: soulseed_agi_core_models::TenantId::new(1),
             event_id: EventId::from_raw_unchecked(1),
             session_id: SessionId::new(1),
@@ -672,7 +674,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             message_ref: Some(MessagePointer {
-                message_id: MessageId(1),
+                message_id: MessageId::from_raw_unchecked(1),
             }),
             tool_invocation: None,
             tool_result: None,
@@ -680,7 +682,8 @@ mod tests {
             metadata: json!({}),
             #[cfg(feature = "vectors-extra")]
             vectors: ExtraVectors::default(),
-        }
+        };
+        convert_legacy_dialogue_event(legacy_event)
     }
 
     #[test]

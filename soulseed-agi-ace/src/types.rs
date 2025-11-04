@@ -48,6 +48,16 @@ impl CycleLane {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CycleStatus {
+    Running,
+    AwaitingExternal,
+    Suspended,
+    Completed,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BudgetSnapshot {
     pub tokens_allowed: u32,
@@ -72,6 +82,11 @@ pub struct CycleSchedule {
     pub decision_events: Vec<AwarenessEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain_fingerprint: Option<String>,
+    pub status: CycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_cycle_id: Option<AwarenessCycleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collab_scope_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +95,10 @@ pub struct CycleRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<RouterCandidate>,
     pub budget: BudgetSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_cycle_id: Option<AwarenessCycleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collab_scope_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +113,41 @@ pub struct SyncPointInput {
     pub pending_injections: Vec<HitlInjection>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub context_manifest: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_cycle_id: Option<AwarenessCycleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collab_scope_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncPointSourceSummary {
+    pub event_id: EventId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncPointMergeSummary {
+    pub digest: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SyncPointSourceSummary>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncPointFailureSummary {
+    pub event_id: EventId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,6 +168,10 @@ pub struct SyncPointReport {
     pub ignored_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_sequences: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged: Vec<SyncPointMergeSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<SyncPointFailureSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delta_added: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -145,6 +203,15 @@ pub struct CycleEmission {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explain_fingerprint: Option<String>,
     pub router_decision: RouterDecision,
+    pub status: CycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_cycle_id: Option<AwarenessCycleId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collab_scope_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_manifest: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

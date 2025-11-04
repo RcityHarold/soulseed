@@ -20,4 +20,6 @@ pub enum AceError {
     Outbox(String),
     #[error("conversation assembler error: {0}")]
     Ca(String),
+    #[error("persistence error: {0}")]
+    Persistence(String),
 }

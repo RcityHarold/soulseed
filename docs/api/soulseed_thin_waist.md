@@ -44,172 +44,282 @@
 ## 4. Endpoint 总览
 | 分类 | 方法与路径 | 说明 |
 | --- | --- | --- |
-| Dialogue | POST /tenants/{tenant_id}/dialogue-events | 写入对话事件 |
-|  | GET /tenants/{tenant_id}/dialogue-events/{event_id} | 查询单条事件 |
-| Graph | GET /tenants/{tenant_id}/graph/timeline | 时间线查询 |
-|  | GET /tenants/{tenant_id}/graph/causal | 因果链路查询 |
-|  | GET /tenants/{tenant_id}/graph/recall | 历史召回（向量/BM25/Hybrid） |
-| Context | GET /tenants/{tenant_id}/context/bundle | 获取最新 ContextBundle |
-|  | POST /tenants/{tenant_id}/context/manifest/compact | 触发上下文压缩 |
-| ACE Cycle | POST /tenants/{tenant_id}/ace/cycles | 启动觉知周期 |
-|  | GET /tenants/{tenant_id}/ace/cycles/{cycle_id} | 查询周期状态和 SyncPointReport |
-|  | GET /tenants/{tenant_id}/ace/cycles/{cycle_id}/outbox | 查询待发 Final/DeltaPatch |
-| HITL | POST /tenants/{tenant_id}/ace/injections | 提交人类注入 |
-| Awareness | GET /tenants/{tenant_id}/awareness/events | 查询 AwarenessEvent |
-| Explain | GET /tenants/{tenant_id}/explain/indices | 查看 indices_used/query_hash/degrade |
-| Streaming | GET /tenants/{tenant_id}/live/dialogues/{session_id} | SSE 订阅 Dialogue 与 Awareness |
+| Core | POST /api/v1/triggers/dialogue | 以完整 `DialogueEvent` 触发觉知周期，服务端自动构建 `CycleRequest` + `SyncPointInput` |
+| Core | GET /healthz | 运行状态检查 |
+| Preview | GET /api/v1/ace/cycles/{cycle_id} | 返回 `CycleSchedule`、`SyncPointInput`、Outbox 摘要等快照 |
+| Preview | GET /api/v1/ace/cycles/{cycle_id}/outbox | 拉取待发送的 Final / DeltaPatch / LateReceipt |
+| Preview | GET /api/v1/ace/cycles/{cycle_id}/stream | SSE 订阅周期状态（pending/complete/timeout） |
+| Preview | POST /api/v1/ace/injections | 追加 HITL 注入，驱动后续 Clarify/协作流程 |
+| TODO（规划中） | POST /api/v1/ace/cycles | 直接提交 `CycleRequest`，适合内部编排器 |
 
-以下为关键接口详解。
+以下为已实现的核心接口说明，后续 TODO 接口保持设计占位，待对接 Soulbase 侧再扩充。
 
-### 4.1 POST /tenants/{tenant_id}/dialogue-events
-用于写入 DialogueEvent。九种对话场景统一使用该接口。
-~~~json
+### 4.1 POST /api/v1/triggers/dialogue
+以 DialogueEvent 触发 Clarify/Tool/SelfReason/Collab 等觉知周期，`ace_service` 会借助 `TriggerComposer` 生成 `CycleRequest`，并由 `AutoSyncDriver` 自动拼装 `SyncPointInput`，无需调用方再手动 `submit_callback`。
+
+请求示例（与 `soulseed_agi_core_models::dialogue_event::DialogueEvent` 一致）：
+```json
 {
-  "event_id": "ev-20250301-0001",
-  "session_id": "sess-20250301-001",
-  "scenario": "human_to_ai",
-  "event_type": "message",
-  "timestamp_ms": 1740806400000,
-  "subject": {"kind": "human", "human_id": "h-0001"},
-  "participants": [{"kind": "ai", "ai_id": "ai-mentor", "role": "assistant"}],
-  "head": {
-    "envelope_id": "env-0001",
-    "trace_id": "trace-123",
-    "correlation_id": "corr-123",
-    "config_snapshot_hash": "cfg-v1",
-    "config_snapshot_version": 1
+  "base": {
+    "tenant_id": 42,
+    "event_id": 1289461295035584512,
+    "session_id": 99,
+    "subject": {"AI": 7},
+    "participants": [{"Human": 1, "role": "user"}],
+    "head": {
+      "envelope_id": "01955b1f-5f93-77b2-a73c-4b91f2a9b4f9",
+      "trace_id": "trace-7d3f",
+      "correlation_id": "corr-9b21",
+      "config_snapshot_hash": "cfg-v1",
+      "config_snapshot_version": 1
+    },
+    "snapshot": {"schema_v": 1, "created_at": "2025-03-01T00:00:00Z"},
+    "timestamp_ms": 1740806400000,
+    "scenario": "human_to_ai",
+    "event_type": "message",
+    "sequence_number": 5,
+    "access_class": "internal",
+    "provenance": {"source": "front-end", "method": "http"}
   },
-  "snapshot": {
-    "schema_v": 1,
-    "created_at": "2025-03-01T00:00:00Z"
+  "payload": {
+    "kind": "message_primary",
+    "data": {
+      "message": {"message_id": 512},
+      "channel": "dialogue",
+      "attributes": {"text": "你好，想学习 Soulseed 的开发流程。"}
+    }
   },
-  "sequence_number": 1,
-  "access_class": "internal",
-  "metadata": {"text": "你好，我需要学习 Soulseed 的开发流程。"}
+  "metadata": {"ingest": "api"}
 }
-~~~
-成功响应返回补全后的 DialogueEvent（含 reasoning_trace 等）。同一 tenant_id + event_id 支持幂等覆盖。
+```
 
-### 4.2 GET /tenants/{tenant_id}/graph/timeline
-- 查询参数: session_id、scenario、since_ms、until_ms、limit
-- 响应: items 列表和 next_cursor（命中索引 idx_dialogue_event_timeline）
-
-### 4.3 GET /tenants/{tenant_id}/graph/causal
-- 查询参数: root_event_id、direction=forward|backward|both、depth、scenario
-- 响应: nodes 与 edges，用于绘制因果链
-
-### 4.4 GET /tenants/{tenant_id}/graph/recall
-- 查询参数: mode=vector|bm25|hybrid、query_text、embedding、k、filters(json)
-- 响应: 召回数组，包含 score、source_event_id、indices_used、query_hash、degradation_reason
-
-### 4.5 POST /tenants/{tenant_id}/ace/cycles
-- 用于触发 Clarify/Tool/SelfReason/Collab 周期
-~~~json
+响应示例：
+```json
 {
-  "lane": "clarify",
-  "anchor": {"tenant_id": "tenant-a", "envelope_id": "env-clarify-01", "schema_v": 1},
-  "tool_plan": null,
-  "llm_plan": {
-    "model_id": "openai:gpt-4.1",
-    "budget": {"tokens": 4096, "walltime_ms": 15000}
-  },
-  "budget": {
-    "tokens_allowed": 6000,
-    "tokens_spent": 0,
-    "walltime_ms_allowed": 30000,
-    "walltime_ms_used": 0
-  }
+  "cycle_id": 197556902645067776,
+  "status": "completed",
+  "manifest_digest": "auto:clarify:197556902645067776"
 }
-~~~
-响应: {"cycle_id": "cyc-clarify-001", "accepted": true, "reason": null}
+```
 
-### 4.6 GET /tenants/{tenant_id}/ace/cycles/{cycle_id}
-返回周期信息、最新 SyncPointReport、RouterDecision、AwarenessEvent 列表、当前 HITL 队列。
+> **Notes**
+> - 响应中的 `status` 为最新的 `CycleOutcome` 枚举字符串，`AutoSyncDriver` 会同步推进 `drive_until_idle`，因此常见返回值为 `completed`。
+> - `manifest_digest` 来源于自动生成的 `SyncPointInput.context_manifest.manifest_digest`，用于后续 Explain 或查询上下文快照。
+> - 若想直接提交 `CycleRequest`（例如内部服务链路），可使用下文 “数据结构参考” 的 JSON 模板命中 `/api/v1/ace/cycles`（TODO）。
 
-`CycleSchedule`/`CycleEmission` 新增字段：
-- `router_decision`：DFR 产出的 `DecisionPath` 及 Explain 指纹；
-- `decision_events`：按顺序列出 `ac_started` → `ic_started` → `decision_routed` → … → `ic_ended`/`finalized`。
+### 4.2 GET /healthz
+服务自检，返回
+```json
+{ "status": "ok" }
+```
 
-`SyncPointReport` 新增字段：
-- `applied_ids` / `ignored_ids`：被吸收/忽略的 Context Item ID 列表；
-- `missing_sequences`：检测到的缺失 sequence number；
-- `delta_added` / `delta_updated` / `delta_removed`：DeltaPatch 三元组；
-- `context_bundle`：最新上下文快照；
-- `explain_fingerprint`：一次吸收 Explain 指纹。
-
-### 4.7 GET /tenants/{tenant_id}/ace/cycles/{cycle_id}/outbox
-返回待发送的 Final、DeltaPatch、LateReceipt，便于前端展示最终答案或迟到回执。
-
-### 4.8 GET /tenants/{tenant_id}/context/bundle
-- 查询参数: anchor.envelope_id、manifest_digest(可选)
-- 响应: bundle.segments, bundle.explain.indices_used, bundle.explain.degradation_reason 等
-
-### 4.9 POST /tenants/{tenant_id}/context/manifest/compact
-手动触发上下文压缩，例如 {"anchor": {...}, "target_level": "L2"}。
-
-### 4.10 POST /tenants/{tenant_id}/ace/injections
-提交人类注入请求。
-~~~json
+### 4.3 GET /api/v1/ace/cycles/{cycle_id}
+返回一次触发后的快照，结构示例：
+```json
 {
-  "cycle_id": "cyc-clarify-001",
+  "schedule": { "cycle_id": 197556902645067776, "lane": "clarify", "status": "completed", "router_decision": {"context_digest": "ctx:..."}},
+  "sync_point": { "kind": "clarify_answered", "events": [{ "base": {"event_type": "decision"}, "metadata": {"answer": "..."}}]},
+  "outcomes": [
+    {"cycle_id": 197556902645067776, "status": "completed", "manifest_digest": "auto:clarify:197556902645067776"}
+  ],
+  "outbox": [
+    {"event_id": 281474976710672, "payload": {"event_type": "awareness_cycle_ended"}}
+  ]
+}
+```
+
+### 4.4 GET /api/v1/ace/cycles/{cycle_id}/outbox
+仅返回 `outbox` 字段，方便前端轮询展示 Final/DeltaPatch/LateReceipt 等 Awareness 事件。
+
+### 4.5 GET /api/v1/ace/cycles/{cycle_id}/stream
+基于 SSE（Server-Sent Events）实时推送周期状态：
+
+- `event: pending`：结果尚未生成（每 500ms 发送一次心跳）。
+- `event: complete`：发送完整 `CycleSnapshot` JSON，并结束流。
+- `event: timeout`：等待超时（默认 60 次轮询）后推送超时事件。
+
+### 4.6 POST /api/v1/ace/injections
+向指定周期追加 HITL 注入，用于覆盖 Clarify 或人工补充指令。
+
+请求示例：
+```json
+{
+  "cycle_id": 197556902645067776,
   "priority": "p1_high",
   "author_role": "facilitator",
   "payload": {
     "type": "clarify_override",
-    "text": "请工具输出 Markdown，并限制在 300 token 内"
+    "text": "请用 Markdown 列表形式回答之前的问题，并补充后续步骤。"
   }
 }
-~~~
-响应: {"injection_id": "inj-20250301-0003", "status": "queued"}
+```
 
-### 4.11 GET /tenants/{tenant_id}/awareness/events
-支持按照 cycle_id、event_type、since_ms、until_ms、collab_scope_id、barrier_id、limit 过滤。
+响应返回最新的 `CycleSnapshot`，即与 `GET /api/v1/ace/cycles/{id}` 相同的结构。
 
-### 4.12 GET /tenants/{tenant_id}/explain/indices
-用于调试 Explain 链路。
-~~~json
+## 5. 数据结构参考
+
+### 5.1 CycleRequest（内部结构）
+`TriggerComposer::cycle_request_from_message` 会生成与下例类似的结构，供 `AceEngine::schedule_cycle` 使用：
+```json
 {
-  "graph": {
-    "indices_used": ["idx_dialogue_event_timeline"],
-    "query_hash": "timeline:hash",
-    "degradation_reason": null
+  "router_input": {
+    "anchor": {
+      "tenant_id": 42,
+      "envelope_id": "01955b1f-5f93-77b2-a73c-4b91f2a9b4f9",
+      "config_snapshot_hash": "cfg-v1",
+      "config_snapshot_version": 1,
+      "session_id": 99,
+      "sequence_number": 5,
+      "access_class": "internal",
+      "provenance": {"source": "front-end", "method": "http"},
+      "schema_v": 1,
+      "scenario": "human_to_ai"
+    },
+    "context": {
+      "anchor": { "...": "ContextAnchor 与上方 anchor 对齐" },
+      "schema_v": 1,
+      "version": 1,
+      "segments": [
+        {
+          "partition": "p4_dialogue",
+          "items": [
+            {
+              "ci_id": "msg:1289461295035584512",
+              "partition": "p4_dialogue",
+              "summary_level": null,
+              "tokens": 0,
+              "score_scaled": 0,
+              "ts_ms": 1740806400000,
+              "typ": "message",
+              "why_included": "trigger_message"
+            }
+          ]
+        }
+      ],
+      "explain": {
+        "reasons": ["message_trigger"],
+        "degradation_reason": null,
+        "indices_used": [],
+        "query_hash": null
+      },
+      "budget": {"target_tokens": 2048, "projected_tokens": 0},
+      "prompt": {"dialogue": ["event:1289461295035584512"]}
+    },
+    "context_digest": "ctx:1289461295035584512",
+    "scenario": "human_to_ai",
+    "scene_label": "auto.generated",
+    "user_prompt": "message:1289461295035584512",
+    "budget": {"max_tokens": 4096, "max_walltime_ms": 60000, "max_external_cost": 25.0},
+    "routing_seed": 1289461295035584512
   },
-  "context": {
-    "indices_used": ["context_manifest_digest"],
-    "query_hash": "context:compact:v3",
-    "degradation_reason": "graph_sparse_only"
+  "candidates": [],
+  "budget": {
+    "tokens_allowed": 6000,
+    "tokens_spent": 0,
+    "walltime_ms_allowed": 120000,
+    "walltime_ms_used": 0,
+    "external_cost_allowed": 50.0,
+    "external_cost_spent": 0.0
   },
-  "dfr": {
-    "router_digest": "blake3:2f9d...",
-    "degradation_reason": "budget_tokens"
-  },
-  "ace": {
-    "sync_point": "clarify_answered",
-    "degradation_reason": null
-  }
+  "parent_cycle_id": null,
+  "collab_scope_id": null
 }
-~~~
+```
 
-### 4.13 GET /tenants/{tenant_id}/live/dialogues/{session_id}
-Server-Sent Events 订阅对话与觉知事件。事件类型:
-- event: dialogue_event → data: {...DialogueEvent...}
-- event: awareness_event → data: {...AwarenessEvent...}
-- event: ping → data: {"ts": 1740806400000}
+### 5.2 SyncPointInput（AutoSyncDriver 输出）
+`AutoSyncDriver` 会根据 `CycleSchedule` 的 lane/plan 自动生成一个 `SyncPointInput`，其中 `events` 的最后一个元素即最终输出：
+```json
+{
+  "cycle_id": 197556902645067776,
+  "kind": "clarify_answered",
+  "anchor": { "...": "与 CycleSchedule.anchor 对齐" },
+  "events": [
+    {
+      "base": {
+        "tenant_id": 42,
+        "event_id": 197556902712969216,
+        "session_id": 99,
+        "subject": {"AI": 0},
+        "participants": [{"Human": 1, "role": "user"}],
+        "head": {
+          "envelope_id": "01955b1f-5f93-77b2-a73c-4b91f2a9b4f9",
+          "trace_id": "4eab7d7d-6f33-40c4-bc82-0c107e41a3b7",
+          "correlation_id": "51ab2d9a-5f6f-44a0-8f4d-2c9f0a0f87a9",
+          "config_snapshot_hash": "cfg-v1",
+          "config_snapshot_version": 1
+        },
+        "snapshot": {"schema_v": 1, "created_at": "2025-03-01T00:00:01Z"},
+        "timestamp_ms": 1740806401000,
+        "scenario": "human_to_ai",
+        "event_type": "decision",
+        "stage_hint": "clarify",
+        "access_class": "internal",
+        "sequence_number": 6,
+        "ac_id": 197556902645067776,
+        "ic_sequence": 1,
+        "parent_ac_id": null
+      },
+      "payload": {
+        "kind": "clarification_answered",
+        "data": {
+          "clarification_id": "clarify-197556902645067776",
+          "attributes": {
+            "questions": [
+              "请确认目标学习主题。",
+              "是否需要示例代码？"
+            ],
+            "limits": {"wait_ms": null, "total_wait_ms": null}
+          }
+        }
+      },
+      "metadata": {
+        "auto_generated": true,
+        "cycle_lane": "clarify",
+        "cycle_id": 197556902645067776,
+        "router_digest": "router:digest",
+        "context_digest": "ctx:1289461295035584512",
+        "decision_issued_at_ms": 1740806400500
+      }
+    }
+  ],
+  "budget": {
+    "tokens_allowed": 6000,
+    "tokens_spent": 0,
+    "walltime_ms_allowed": 120000,
+    "walltime_ms_used": 0,
+    "external_cost_allowed": 50.0,
+    "external_cost_spent": 0.0
+  },
+  "timeframe": ["2025-03-01T00:00:00Z", "2025-03-01T00:00:01Z"],
+  "pending_injections": [],
+  "context_manifest": {
+    "manifest_digest": "auto:clarify:197556902645067776",
+    "auto_generated": true,
+    "prepared_at_ms": 1740806401000,
+    "router_digest": "router:digest",
+    "context_digest": "ctx:1289461295035584512",
+    "cycle_lane": "clarify",
+    "cycle_id": 197556902645067776
+  },
+  "parent_cycle_id": null,
+  "collab_scope_id": null
+}
+```
 
-## 5. 九种对话场景推荐调用顺序
+> `events` 数组最后一项会被 `AceService::produce_final_event` 复用为最终对话输出；如需扩展工具或协作场景，可在 `AutoSyncDriver` 中注入额外事件（例如 `tool_result_recorded`、`collab_resolved`）。
+
+## 6. 九种对话场景推荐调用顺序
 | 场景 | 主要接口 | 说明 |
 | --- | --- | --- |
-| 人类↔人类私聊 | POST dialogue-events → GET graph/timeline | scenario=human_to_human，通常无 ACE 周期 |
-| 人类群聊 | 同上 + GET live/dialogues/{session} | 关注多 subject/participants |
-| 人类↔AI 私域 | POST dialogue-events → POST ace/cycles (clarify) → SSE | 展示 Clarify 闭环 |
-| AI↔AI 私聊 | 两个 AI 互发事件 → GET graph/causal | scenario=ai_to_ai，关注 decision 事件 |
-| AI 自省 | POST ace/cycles (self_reason) → GET awareness/events | 观察 ic_started/ic_ended 序列 |
-| 人类↔多 AI | POST dialogue-events (多 AI 参与) → POST ace/cycles (collab) | awareness.events 显示协同 barrier |
-| 多人类↔多 AI | 同上，scenario=multi_human_to_multi_ai | 前端需处理多租户/角色视图 |
-| AI 群组 | scenario=ai_group，结合 SSE 展示 AI 协作 |
-| AI↔系统 | scenario=ai_to_system，包含大量 tool_call/tool_result | 可配合 explain/indices 观察降级链 |
+| 人类↔人类私聊 | POST /api/v1/triggers/dialogue | scenario=human_to_human，多为记录型，不进入 ACE |
+| 人类群聊 | 同上 + TODO: SSE | 关注多 subject/participants，计划接入 SSE |
+| 人类↔AI 私域 | POST /api/v1/triggers/dialogue（Clarify） | AutoSyncDriver 自动产出 Clarify 回答 |
+| AI↔AI 私聊 | POST /api/v1/triggers/dialogue（SelfReason） | 自省/互评场景，待补充 Explain |
+| 人类↔工具链 | POST /api/v1/triggers/dialogue（Tool 路径） | 需扩展 AutoSyncDriver 生成 tool_result 事件 |
+| 协作/多 Agent | POST /api/v1/triggers/dialogue（Collab 路径） | SyncPointInput 支持 collab_scope_id |
+| AI↔系统 | 同上，payload 中含 tool 调用信息 | 可结合 Redis outbox 推送到 Soulbase |
 
-## 6. 常见错误码
+## 7. 常见错误码
 | Code | HTTP | 说明 |
 | --- | --- | --- |
 | dialogue.invalid_input | 400 | 请求体校验失败 |
@@ -220,7 +330,7 @@ Server-Sent Events 订阅对话与觉知事件。事件类型:
 | context.pointer_invalid | 400 | ContextItem 证据指针失效 |
 | auth.unauthorized | 401 | Token 无效或权限不足 |
 
-## 7. 变更记录
+## 8. 变更记录
 | 版本 | 日期 | 内容 |
 | --- | --- | --- |
 | v0.1 | 2025-03-01 | 首版，覆盖九场景最小接口集 |

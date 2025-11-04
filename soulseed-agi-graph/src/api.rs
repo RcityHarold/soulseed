@@ -320,9 +320,9 @@ pub const EXPLAIN_EVENT_TYPES_DEFAULT: &[AwarenessEventType] = &[
     AwarenessEventType::CollabRequested,
     AwarenessEventType::CollabResolved,
     AwarenessEventType::SyncPointReported,
-    AwarenessEventType::InjectionApplied,
-    AwarenessEventType::InjectionDeferred,
-    AwarenessEventType::InjectionIgnored,
+    AwarenessEventType::HumanInjectionApplied,
+    AwarenessEventType::HumanInjectionDeferred,
+    AwarenessEventType::HumanInjectionIgnored,
     AwarenessEventType::LateReceiptObserved,
 ];
 

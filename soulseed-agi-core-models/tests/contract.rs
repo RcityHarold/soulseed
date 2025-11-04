@@ -249,13 +249,13 @@ fn embedding_dim_mismatch_is_error() {
 #[test]
 fn awareness_event_contract_samples() {
     let mut ac_started = mk_awareness_event(
-        AwarenessEventType::AcStarted,
+        AwarenessEventType::AwarenessCycleStarted,
         json!({"routing_seed": 42, "ic_start": 1}),
     );
     ac_started.parent_cycle_id = Some(AwarenessCycleId::from_raw_unchecked(123));
 
     let mut ic_ended = mk_awareness_event(
-        AwarenessEventType::IcEnded,
+        AwarenessEventType::InferenceCycleCompleted,
         json!({"ic_seq": 1, "walltime_ms": 240, "llm_calls": 2}),
     );
     ic_ended.env_mode = Some("turbo".into());
@@ -279,7 +279,7 @@ fn awareness_event_contract_samples() {
     sync_report.barrier_id = Some("barrier-A".into());
 
     let mut injection_applied = mk_awareness_event(
-        AwarenessEventType::InjectionApplied,
+        AwarenessEventType::HumanInjectionApplied,
         json!({"injection_id": "inj-1", "delta_patch_id": "patch-77"}),
     );
     injection_applied.degradation_reason = Some(AwarenessDegradationReason::ClarifyExhausted);
@@ -395,7 +395,7 @@ fn session_requires_provenance_when_restricted() {
 
 #[test]
 fn awareness_event_parent_cycle_must_differ() {
-    let mut evt = mk_awareness_event(AwarenessEventType::AcStarted, json!({}));
+    let mut evt = mk_awareness_event(AwarenessEventType::AwarenessCycleStarted, json!({}));
     evt.parent_cycle_id = Some(evt.awareness_cycle_id);
     let err = evt.validate().unwrap_err();
     assert!(matches!(

@@ -1,7 +1,6 @@
 use once_cell::sync::Lazy;
 use serde_json::json;
 use soulseed_agi_ace::aggregator::SyncPointAggregator;
-use soulseed_agi_ace::errors::AceError;
 use soulseed_agi_ace::budget::{BudgetManager, BudgetPolicy};
 use soulseed_agi_ace::ca::{
     CaService, InjectionAction, InjectionDecision, MergeDeltaRequest, MergeDeltaResponse,
@@ -9,12 +8,20 @@ use soulseed_agi_ace::ca::{
 use soulseed_agi_ace::checkpointer::Checkpointer;
 use soulseed_agi_ace::emitter::Emitter;
 use soulseed_agi_ace::engine::AceEngine;
+use soulseed_agi_ace::errors::AceError;
 use soulseed_agi_ace::hitl::{HitlInjection, HitlPriority, HitlQueueConfig, HitlService};
 use soulseed_agi_ace::metrics::NoopMetrics;
 use soulseed_agi_ace::outbox::OutboxService;
+use soulseed_agi_ace::runtime::{AceService, TriggerComposer};
 use soulseed_agi_ace::scheduler::{CycleScheduler, SchedulerConfig};
 use soulseed_agi_ace::types::{
-    BudgetSnapshot, CycleEmission, CycleLane, CycleRequest, SyncPointInput, new_cycle_id,
+    AggregationOutcome, BudgetSnapshot, CycleEmission, CycleLane, CycleRequest, CycleStatus,
+    SyncPointInput, new_cycle_id,
+};
+use soulseed_agi_ace::{AceOrchestrator, CycleRuntime};
+use soulseed_agi_context::types::{
+    Anchor as ContextAnchor, BudgetSummary, BundleSegment, ContextBundle, ExplainBundle,
+    Partition as ContextPartition, PromptBundle,
 };
 #[cfg(feature = "vectors-extra")]
 use soulseed_agi_core_models::ExtraVectors;
@@ -23,35 +30,31 @@ use soulseed_agi_core_models::awareness::{
     DecisionBudgetEstimate, DecisionExplain, DecisionPath, DecisionPlan, DecisionRationale,
     SelfPlan, SyncPointKind, ToolPlan, ToolPlanBarrier, ToolPlanNode,
 };
+use soulseed_agi_core_models::legacy::dialogue_event as legacy;
 use soulseed_agi_core_models::{
     AccessClass, ConversationScenario, CorrelationId, DialogueEvent, DialogueEventType,
     EnvelopeHead, EventId, Snapshot, Subject, SubjectRef, TenantId, TraceId,
+    convert_legacy_dialogue_event,
 };
 use soulseed_agi_dfr::types::{
-    AssessmentSnapshot, BudgetEstimate, BudgetTarget, CatalogSnapshot, ContextSignals, PolicySnapshot,
-    RouteExplain, RoutePlan, RouterCandidate, RouterConfig, RouterDecision, RouterInput,
+    AssessmentSnapshot, BudgetEstimate, BudgetTarget, CatalogSnapshot, ContextSignals,
+    PolicySnapshot, RouteExplain, RoutePlan, RouterCandidate, RouterConfig, RouterDecision,
+    RouterInput,
 };
 use soulseed_agi_dfr::{
-    filter::CandidateFilter,
-    hardgate::HardGate,
+    RoutePlanner, RouterService, filter::CandidateFilter, hardgate::HardGate,
     scorer::CandidateScorer,
-    RoutePlanner,
-    RouterService,
-};
-use soulseed_agi_context::types::{
-    Anchor as ContextAnchor, BudgetSummary, BundleSegment, ContextBundle, ExplainBundle,
-    Partition as ContextPartition, PromptBundle,
 };
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 static ANCHOR: Lazy<AwarenessAnchor> = Lazy::new(|| AwarenessAnchor {
-    tenant_id: TenantId(42),
+    tenant_id: TenantId::from_raw_unchecked(42),
     envelope_id: Uuid::now_v7(),
     config_snapshot_hash: "cfg-ace".into(),
     config_snapshot_version: 1,
-    session_id: Some(soulseed_agi_core_models::SessionId(99)),
+    session_id: Some(soulseed_agi_core_models::SessionId::from_raw_unchecked(99)),
     sequence_number: Some(5),
     access_class: AccessClass::Restricted,
     provenance: Some(soulseed_agi_core_models::Provenance {
@@ -65,13 +68,13 @@ static ANCHOR: Lazy<AwarenessAnchor> = Lazy::new(|| AwarenessAnchor {
 
 fn dialogue_event() -> DialogueEvent {
     let now = OffsetDateTime::now_utc();
-    DialogueEvent {
+    let legacy_event = legacy::DialogueEvent {
         tenant_id: ANCHOR.tenant_id,
         event_id: EventId::from_raw_unchecked(now.unix_timestamp_nanos() as u64),
         session_id: ANCHOR.session_id.unwrap(),
         subject: Subject::AI(soulseed_agi_core_models::AIId::new(7)),
         participants: vec![SubjectRef {
-            kind: Subject::Human(soulseed_agi_core_models::HumanId(1)),
+            kind: Subject::Human(soulseed_agi_core_models::HumanId::from_raw_unchecked(1)),
             role: Some("user".into()),
         }],
         head: EnvelopeHead {
@@ -119,7 +122,7 @@ fn dialogue_event() -> DialogueEvent {
         supersedes: None,
         superseded_by: None,
         message_ref: Some(soulseed_agi_core_models::MessagePointer {
-            message_id: soulseed_agi_core_models::MessageId(1),
+            message_id: soulseed_agi_core_models::MessageId::from_raw_unchecked(1),
         }),
         tool_invocation: None,
         tool_result: None,
@@ -127,6 +130,72 @@ fn dialogue_event() -> DialogueEvent {
         metadata: json!({"degradation_reason": "clarify_concurrency"}),
         #[cfg(feature = "vectors-extra")]
         vectors: ExtraVectors::default(),
+    };
+    convert_legacy_dialogue_event(legacy_event)
+}
+
+#[derive(Clone)]
+struct RuntimeStub {
+    sync_events: Vec<DialogueEvent>,
+    manifest_digest: String,
+    final_event: DialogueEvent,
+    status: CycleStatus,
+}
+
+impl CycleRuntime for RuntimeStub {
+    fn prepare_sync_point(
+        &mut self,
+        schedule: &soulseed_agi_ace::types::CycleSchedule,
+    ) -> Result<SyncPointInput, AceError> {
+        let now = OffsetDateTime::now_utc();
+        let entries: Vec<_> = self
+            .sync_events
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| json!({"id": format!("evt-{idx}")}))
+            .collect();
+        Ok(SyncPointInput {
+            cycle_id: schedule.cycle_id,
+            kind: SyncPointKind::ClarifyAnswered,
+            anchor: schedule.anchor.clone(),
+            events: self.sync_events.clone(),
+            budget: schedule.budget.clone(),
+            timeframe: (now - Duration::seconds(1), now),
+            pending_injections: Vec::new(),
+            context_manifest: json!({
+                "entries": entries,
+                "manifest_digest": self.manifest_digest,
+            }),
+            parent_cycle_id: schedule.parent_cycle_id,
+            collab_scope_id: schedule.collab_scope_id.clone(),
+        })
+    }
+
+    fn produce_final_event(
+        &mut self,
+        _schedule: &soulseed_agi_ace::types::CycleSchedule,
+        _aggregation: &AggregationOutcome,
+    ) -> Result<(DialogueEvent, CycleStatus), AceError> {
+        Ok((self.final_event.clone(), self.status))
+    }
+}
+
+#[derive(Clone)]
+struct CaStub {
+    manifest: serde_json::Value,
+}
+
+impl CaService for CaStub {
+    fn merge_delta(&self, _request: MergeDeltaRequest) -> Result<MergeDeltaResponse, AceError> {
+        Ok(MergeDeltaResponse {
+            delta_patch: None,
+            awareness_events: Vec::new(),
+            injections: Vec::new(),
+            context_manifest: Some(self.manifest.clone()),
+            context_bundle: None,
+            prompt_bundle: None,
+            explain_bundle: None,
+        })
     }
 }
 
@@ -334,6 +403,8 @@ fn cycle_request_for_lane(lane: CycleLane, tokens_spent: u32) -> CycleRequest {
         router_input,
         candidates: vec![candidate],
         budget: budget(tokens_spent),
+        parent_cycle_id: None,
+        collab_scope_id: None,
     }
 }
 
@@ -349,15 +420,14 @@ fn schedule_and_start_cycle() {
     let decision = router_decision_stub(CycleLane::Clarify);
     let tenant = decision.plan.anchor.tenant_id.into_inner();
     let outcome = scheduler
-        .schedule(decision, budget(10))
+        .schedule(decision, budget(10), None, None)
         .expect("schedule");
     assert!(outcome.accepted);
     assert!(!outcome.awareness_events.is_empty());
-    let started = scheduler
-        .start_next(tenant)
-        .expect("start next");
+    let started = scheduler.start_next(tenant).expect("start next");
     assert_eq!(started.lane, CycleLane::Clarify);
-    scheduler.finish(tenant);
+    assert_eq!(started.status, CycleStatus::AwaitingExternal);
+    scheduler.finish(tenant, started.cycle_id, CycleStatus::Completed);
 }
 
 #[test]
@@ -373,15 +443,16 @@ fn clarify_gate_blocks_parallel() {
     let tenant = first.plan.anchor.tenant_id.into_inner();
     assert!(
         scheduler
-            .schedule(first, budget(12))
+            .schedule(first, budget(12), None, None)
             .unwrap()
             .accepted
     );
     let second = router_decision_stub(CycleLane::Clarify);
-    let rejected = scheduler.schedule(second, budget(15)).unwrap();
+    let rejected = scheduler.schedule(second, budget(15), None, None).unwrap();
     assert!(!rejected.accepted);
     assert_eq!(rejected.reason.as_deref(), Some("clarify_lane_busy"));
-    scheduler.finish(tenant);
+    let started = scheduler.start_next(tenant).expect("start first");
+    scheduler.finish(tenant, started.cycle_id, CycleStatus::Completed);
 }
 
 #[test]
@@ -398,6 +469,8 @@ fn aggregator_summarizes_events() {
             timeframe: (OffsetDateTime::now_utc(), OffsetDateTime::now_utc()),
             pending_injections: Vec::new(),
             context_manifest: json!({"entries": []}),
+            parent_cycle_id: None,
+            collab_scope_id: None,
         })
         .expect("aggregate");
     assert_eq!(outcome.report.kind, SyncPointKind::ClarifyAnswered);
@@ -545,6 +618,8 @@ fn hitl_injection_contract_flow() {
                     {"id": "fact-b"}
                 ]
             }),
+            parent_cycle_id: None,
+            collab_scope_id: None,
         })
         .expect("aggregate");
 
@@ -561,6 +636,8 @@ fn hitl_injection_contract_flow() {
     assert_eq!(aggregation.report.metrics["injections_applied"], 1);
     assert_eq!(aggregation.report.metrics["injections_deferred"], 1);
     assert_eq!(aggregation.report.metrics["injections_ignored"], 1);
+    assert_eq!(aggregation.report.metrics["merged_groups"], 1);
+    assert_eq!(aggregation.report.metrics["failure_sources"], 1);
     assert_eq!(
         aggregation.report.metrics["manifest_entries"].as_u64(),
         Some(2)
@@ -568,15 +645,25 @@ fn hitl_injection_contract_flow() {
     assert_eq!(aggregation.report.applied_ids.len(), 1);
     assert_eq!(aggregation.report.ignored_ids.len(), 1);
     assert!(aggregation.report.missing_sequences.is_empty());
+    assert_eq!(aggregation.report.merged.len(), 1);
+    assert_eq!(aggregation.report.failures.len(), 1);
+    assert!(!aggregation.report.merged[0].sources.is_empty());
     assert_eq!(
-        aggregation.report.delta_added,
-        vec![String::from("fact-a")]
+        aggregation.report.failures[0].degradation_reason.as_deref(),
+        Some("clarify_conflict")
     );
+    assert_eq!(aggregation.report.delta_added, vec![String::from("fact-a")]);
     assert_eq!(
         aggregation.report.delta_updated,
         vec![String::from("fact-b")]
     );
     assert!(aggregation.awareness_events.len() >= 4);
+    assert!(
+        aggregation
+            .awareness_events
+            .iter()
+            .any(|event| event.event_type == AwarenessEventType::SyncPointMerged)
+    );
     assert!(
         aggregation
             .awareness_events
@@ -588,7 +675,7 @@ fn hitl_injection_contract_flow() {
     let applied = aggregation
         .awareness_events
         .iter()
-        .find(|event| event.event_type == AwarenessEventType::InjectionApplied)
+        .find(|event| event.event_type == AwarenessEventType::HumanInjectionApplied)
         .expect("applied event");
     assert_eq!(applied.payload["reason"], "clarify_high_priority");
     assert_eq!(
@@ -599,14 +686,14 @@ fn hitl_injection_contract_flow() {
     let deferred = aggregation
         .awareness_events
         .iter()
-        .find(|event| event.event_type == AwarenessEventType::InjectionDeferred)
+        .find(|event| event.event_type == AwarenessEventType::HumanInjectionDeferred)
         .expect("deferred event");
     assert_eq!(deferred.payload["reason"], "requires_follow_up");
 
     let ignored = aggregation
         .awareness_events
         .iter()
-        .find(|event| event.event_type == AwarenessEventType::InjectionIgnored)
+        .find(|event| event.event_type == AwarenessEventType::HumanInjectionIgnored)
         .expect("ignored event");
     assert_eq!(ignored.payload["reason"], "stale_fact");
 
@@ -683,6 +770,8 @@ fn engine_pipeline_enqueues_outbox() {
             timeframe: (OffsetDateTime::now_utc(), OffsetDateTime::now_utc()),
             pending_injections: Vec::new(),
             context_manifest: json!({"entries": []}),
+            parent_cycle_id: None,
+            collab_scope_id: None,
         })
         .expect("aggregate");
     assert_eq!(aggregation.report.cycle_id, cycle.cycle_id);
@@ -699,6 +788,16 @@ fn engine_pipeline_enqueues_outbox() {
             anchor: ANCHOR.clone(),
             explain_fingerprint: aggregation.explain_fingerprint.clone(),
             router_decision: cycle.router_decision.clone(),
+            status: CycleStatus::Completed,
+            parent_cycle_id: None,
+            collab_scope_id: None,
+            manifest_digest: aggregation
+                .context_manifest
+                .as_ref()
+                .and_then(|val| val.get("manifest_digest"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            context_manifest: aggregation.context_manifest.clone(),
         })
         .expect("finalize");
 
@@ -760,6 +859,11 @@ fn finalize_rolls_back_when_outbox_commit_fails() {
         anchor: cycle.anchor.clone(),
         explain_fingerprint: cycle.explain_fingerprint.clone(),
         router_decision: cycle.router_decision.clone(),
+        status: CycleStatus::Completed,
+        parent_cycle_id: None,
+        collab_scope_id: None,
+        manifest_digest: None,
+        context_manifest: None,
     };
 
     outbox.fail_next_commit();
@@ -775,7 +879,9 @@ fn finalize_rolls_back_when_outbox_commit_fails() {
     assert!(outbox.dequeue(emission.anchor.tenant_id, 10).is_empty());
 
     // retry succeeds once commit failure is cleared
-    engine.finalize_cycle(emission.clone()).expect("finalize retry");
+    engine
+        .finalize_cycle(emission.clone())
+        .expect("finalize retry");
     let drained = outbox.dequeue(emission.anchor.tenant_id, 10);
     assert!(!drained.is_empty());
     assert!(
@@ -839,6 +945,8 @@ fn late_receipt_emits_event() {
             timeframe: (OffsetDateTime::now_utc(), OffsetDateTime::now_utc()),
             pending_injections: Vec::new(),
             context_manifest: json!({"entries": []}),
+            parent_cycle_id: None,
+            collab_scope_id: None,
         })
         .unwrap();
 
@@ -853,6 +961,16 @@ fn late_receipt_emits_event() {
         anchor: ANCHOR.clone(),
         explain_fingerprint: aggregation.explain_fingerprint.clone(),
         router_decision: cycle.router_decision.clone(),
+        status: CycleStatus::Completed,
+        parent_cycle_id: None,
+        collab_scope_id: None,
+        manifest_digest: aggregation
+            .context_manifest
+            .as_ref()
+            .and_then(|val| val.get("manifest_digest"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        context_manifest: aggregation.context_manifest.clone(),
     };
 
     engine.finalize_cycle(emission.clone()).unwrap();
@@ -869,5 +987,189 @@ fn late_receipt_emits_event() {
     assert_eq!(
         late[0].payload.event_type,
         AwarenessEventType::LateReceiptObserved
+    );
+}
+
+#[test]
+fn orchestrator_emits_cycle_end_with_parent_and_scope() {
+    let manifest_digest = "man-orch-001";
+    let manifest = json!({
+        "entries": [{"id": "orch"}],
+        "manifest_digest": manifest_digest,
+    });
+    let aggregator = SyncPointAggregator::new(Arc::new(CaStub {
+        manifest: manifest.clone(),
+    }));
+    let mut budget_mgr = BudgetManager::default();
+    budget_mgr.clarify_policy = BudgetPolicy {
+        lane_token_ceiling: Some(256),
+        lane_walltime_ceiling_ms: Some(5_000),
+        lane_external_cost_ceiling: Some(5.0),
+    };
+    let scheduler = CycleScheduler::new(SchedulerConfig::default());
+    let router_service = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let route_planner = RoutePlanner::default();
+    let checkpointer = Checkpointer::default();
+    let outbox = OutboxService::default();
+    let emitter = Emitter;
+    let hitl = HitlService::new(HitlQueueConfig::default());
+    let metrics = NoopMetrics::default();
+    let mut engine = AceEngine::new(
+        &scheduler,
+        &budget_mgr,
+        &aggregator,
+        &checkpointer,
+        &outbox,
+        &emitter,
+        &hitl,
+        &metrics,
+        &router_service,
+        &route_planner,
+    );
+    engine.lane_cooldown = Duration::milliseconds(0);
+
+    let parent_cycle_id = new_cycle_id();
+    let collab_scope = "scope-orch".to_string();
+
+    let mut request = cycle_request_for_lane(CycleLane::Clarify, 40);
+    request.parent_cycle_id = Some(parent_cycle_id);
+    request.collab_scope_id = Some(collab_scope.clone());
+
+    let schedule = engine.schedule_cycle(request).expect("schedule");
+    let cycle = schedule.cycle.expect("cycle");
+    let tenant = cycle.anchor.tenant_id.into_inner();
+
+    let runtime = RuntimeStub {
+        sync_events: vec![dialogue_event()],
+        manifest_digest: manifest_digest.to_string(),
+        final_event: dialogue_event(),
+        status: CycleStatus::Completed,
+    };
+
+    let mut orchestrator = AceOrchestrator::new(&engine, runtime);
+    let outcome = orchestrator
+        .drive_once(tenant)
+        .expect("drive_once completed")
+        .expect("cycle outcome");
+
+    assert_eq!(outcome.cycle_id, cycle.cycle_id);
+    assert_eq!(outcome.status, CycleStatus::Completed);
+    assert_eq!(outcome.manifest_digest.as_deref(), Some(manifest_digest));
+
+    let emitted = outbox.dequeue(ANCHOR.tenant_id, 20);
+    assert!(
+        emitted
+            .iter()
+            .any(|msg| msg.payload.event_type == AwarenessEventType::AwarenessCycleEnded)
+    );
+
+    let finalized = emitted
+        .iter()
+        .find(|msg| msg.payload.event_type == AwarenessEventType::Finalized)
+        .expect("finalized event");
+    assert_eq!(finalized.payload.parent_cycle_id, Some(parent_cycle_id));
+    assert_eq!(
+        finalized.payload.collab_scope_id.as_deref(),
+        Some(collab_scope.as_str())
+    );
+    assert_eq!(
+        finalized
+            .payload
+            .payload
+            .get("manifest_digest")
+            .and_then(|v| v.as_str()),
+        Some(manifest_digest)
+    );
+
+    let ended = emitted
+        .iter()
+        .find(|msg| msg.payload.event_type == AwarenessEventType::AwarenessCycleEnded)
+        .expect("cycle ended event");
+    assert_eq!(ended.payload.parent_cycle_id, Some(parent_cycle_id));
+    assert_eq!(
+        ended.payload.collab_scope_id.as_deref(),
+        Some(collab_scope.as_str())
+    );
+    assert_eq!(
+        ended
+            .payload
+            .payload
+            .get("manifest_digest")
+            .and_then(|v| v.as_str()),
+        Some(manifest_digest)
+    );
+}
+
+#[test]
+fn ace_service_runs_end_to_end() {
+    unsafe {
+        std::env::set_var("ACE_SURREAL_URL", "memory://ace-test");
+        std::env::set_var("ACE_PERSISTENCE_DISABLED", "1");
+    }
+
+    let scheduler = CycleScheduler::new(SchedulerConfig::default());
+    let mut budget_mgr = BudgetManager::default();
+    budget_mgr.clarify_policy = BudgetPolicy {
+        lane_token_ceiling: Some(512),
+        lane_walltime_ceiling_ms: Some(10_000),
+        lane_external_cost_ceiling: Some(10.0),
+    };
+    let aggregator = SyncPointAggregator::default();
+    let router_service = RouterService::new(
+        HardGate::default(),
+        CandidateFilter::default(),
+        CandidateScorer::default(),
+        RoutePlanner::default(),
+    );
+    let route_planner = RoutePlanner::default();
+    let checkpointer = Checkpointer::default();
+    let outbox = OutboxService::default();
+    let emitter = Emitter;
+    let hitl = HitlService::new(HitlQueueConfig::default());
+    let metrics = NoopMetrics::default();
+
+    let engine = AceEngine::new(
+        &scheduler,
+        &budget_mgr,
+        &aggregator,
+        &checkpointer,
+        &outbox,
+        &emitter,
+        &hitl,
+        &metrics,
+        &router_service,
+        &route_planner,
+    );
+
+    let mut service = AceService::new(engine).expect("ace service");
+
+    let trigger_event = dialogue_event();
+    let cycle_request = TriggerComposer::cycle_request_from_message(&trigger_event);
+    let (schedule, _) = service
+        .submit_trigger(cycle_request)
+        .expect("cycle scheduled");
+
+    let outcomes = service
+        .drive_until_idle(schedule.anchor.tenant_id.into_inner())
+        .expect("drive");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].cycle_id, schedule.cycle_id);
+    assert_eq!(outcomes[0].status, CycleStatus::Completed);
+
+    let drained = outbox.dequeue(schedule.anchor.tenant_id, 20);
+    assert!(
+        drained
+            .iter()
+            .any(|msg| msg.payload.event_type == AwarenessEventType::Finalized)
+    );
+    assert!(
+        drained
+            .iter()
+            .any(|msg| msg.payload.event_type == AwarenessEventType::AwarenessCycleEnded)
     );
 }

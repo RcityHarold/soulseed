@@ -50,7 +50,7 @@ src/ca.rs                      ACE→CA 契约副本（便于查阅）
 
 ## 外部依赖与落地注意
 
-- **Soulbase Gateway**：生产环境需要接入 Soulbase 提供的 Thin-Waist /llm、/tools、/graph.recall、/observe、/repo.append 等接口。本仓库默认使用 Mock 实现以通过合同测试。
+- **Soulbase Gateway**：生产环境需要接入 Soulbase 提供的 Thin-Waist /llm、/tools、/graph.recall、/observe、/repo.append 等接口。配置 `SOULBASE_GATEWAY_BASE_URL`、`SOULBASE_GATEWAY_TOKEN`（可选 `SOULBASE_GATEWAY_TIMEOUT_MS`）后，工具与协作分叉将通过真实 Gateway 获取回执；未配置时回退为本地合成数据以便快速自测。
 - **SurrealDB 索引**：Graph 层严格要求查询命中 timeline/causal/recall/awareness 等索引，禁止线扫。在真实部署中请提前创建对应索引。
 - **环境与权限**：EnvCtx、AuthZ、Quota 等模块需在 Soulbase 侧配置资源、策略与配额，否则会触发降级。
 
@@ -80,6 +80,50 @@ cd ../soulseed-agi-authz && cargo test
 ~~~
 
 所有测试均聚焦契约验证、Explain 外泄、降级路径、预算与权限策略，确保最小可运行版本稳定可回放。
+
+## 运行示例（auto-sync 觉知服务）
+
+1. **准备数据库与配置**
+   - 启动 SurrealDB（建议 v2.3+），并执行仓库提供的迁移脚本：
+     ```bash
+     surreal sql --conn ws://127.0.0.1:8000 -f migrations/surreal/001_soulseed_init.sql
+     surreal sql --conn ws://127.0.0.1:8000 -f migrations/surreal/002_dialogue_event_v2.sql
+     ```
+   - 拷贝 `.env.example` 到 `.env`，至少填写 `ACE_SURREAL_URL`、`ACE_SERVICE_ADDR`、`ACE_TENANT_ID`，如启用鉴权或 Redis 转发则补全对应变量。
+
+2. **启动服务**
+   ```bash
+   # 如需 Redis outbox，请带上 --features outbox-redis
+    cargo run --bin ace_service
+   ```
+   服务默认监听 `ACE_SERVICE_ADDR`（示例：0.0.0.0:8080），自动加载 `.env` 并初始化 Surreal 持久化与 AutoSyncDriver。
+
+3. **触发觉知周期**
+   ```bash
+   curl -X POST http://127.0.0.1:8080/api/v1/triggers/dialogue \
+     -H "Content-Type: application/json" \
+     -d @sample_dialogue_event.json
+   ```
+   请求体需满足 `soulseed_agi_core_models::dialogue_event::DialogueEvent` 契约；服务会立即调度 `AceService::drive_until_idle`，返回最新 `CycleOutcome`，并（在启用 `outbox-redis` 时）将 AwarenessEvent 推送到 Redis。
+
+> AutoSyncDriver 会依据决策计划自动生成 `SyncPointInput` 与 Final 对话事件，若需扩展工具/协作路径，可修改 `soulseed-agi-ace/src/runtime.rs` 中的自动组装逻辑。
+
+> 若 `.env` 提供 `OPENAI_API_KEY`（可选 `OPENAI_MODEL`，默认 `gpt-4o-mini`），Clarify/SelfReason 将调用真实 OpenAI LLM 返回回答/自省内容；若缺省则回退为合成文本。
+
+## 前后端联调与部署指引
+
+1. **基础依赖**：
+   - SurrealDB 已执行 001/002 迁移脚本；
+   - Redis（可选）用于 outbox 转发；
+   - OpenAI 账号，置入 `OPENAI_API_KEY`，若需要可通过 `OPENAI_MODEL` 指定模型。
+2. **启动服务**：`.env` 配置好后执行 `cargo run --bin ace_service`，即可监听 `ACE_SERVICE_ADDR`。
+3. **前端调用顺序**：
+   1. `POST /api/v1/triggers/dialogue` → 触发 Clarify/Tool/SelfReason/Collab 周期；
+   2. `GET /api/v1/ace/cycles/{cycle_id}` → 查询最新快照（包括 `CycleSchedule`、`SyncPointInput`、Outbox 摘要等）；
+   3. `GET /api/v1/ace/cycles/{cycle_id}/stream` → 通过 SSE 等待 `complete/timeout` 事件；
+   4. `GET /api/v1/ace/cycles/{cycle_id}/outbox` → 获取 Final/DeltaPatch/LateReceipt 觉知事件用于展示或下游写入；
+   5. `POST /api/v1/ace/injections` → 在 Clarify 或协作阶段追加 HITL 指令，再次驱动周期。
+4. **接入 Soulbase Gateway（可选）**：若需串联真实工具/Graph，请按 Soulbase 配置将 `OPENAI_*` 改为 Gateway Key，并在 `.env` 中追加 Soulbase 侧地址；当前代码仍可在无外部依赖场景下运行逻辑闭环。
 
 ## 常见开发任务
 

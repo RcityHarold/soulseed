@@ -198,7 +198,9 @@ mod tests {
         first.version = 1;
         first.created_at_ms = 10;
         first.temporal.time_window = Some("alpha".into());
-        enhancements.record_snapshot(first).expect("first snapshot ok");
+        enhancements
+            .record_snapshot(first)
+            .expect("first snapshot ok");
         assert_eq!(enhancements.meta.latest_version, 1);
         let mut duplicate = EnhancementSnapshot::default();
         duplicate.version = 1;
@@ -209,7 +211,9 @@ mod tests {
         second.version = 2;
         second.created_at_ms = 12;
         second.temporal.temporal_pattern_id = Some("beta".into());
-        enhancements.record_snapshot(second).expect("second snapshot ok");
+        enhancements
+            .record_snapshot(second)
+            .expect("second snapshot ok");
         assert_eq!(enhancements.meta.latest_version, 2);
         assert_eq!(enhancements.versions.len(), 2);
     }
@@ -560,7 +564,8 @@ impl LegacyEnhancementRecord {
             && self.cluster_method.is_none()
             && self.concept_distance_to_goal.is_none()
             && self.real_time_priority.is_none()
-            && self.notification_targets
+            && self
+                .notification_targets
                 .as_ref()
                 .map(|targets| targets.is_empty())
                 .unwrap_or(true)

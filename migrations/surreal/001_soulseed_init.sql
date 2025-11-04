@@ -23,7 +23,7 @@ DEFINE FIELD provenance            ON dialogue_event TYPE option<object>;
 DEFINE FIELD sequence_number       ON dialogue_event TYPE number;
 DEFINE FIELD trigger_event_id      ON dialogue_event TYPE option<string>;
 DEFINE FIELD temporal_pattern_id   ON dialogue_event TYPE option<string>;
-DEFINE FIELD metadata              ON dialogue_event TYPE object;
+DEFINE FIELD metadata              ON dialogue_event TYPE option<object>;
 DEFINE FIELD content_embedding     ON dialogue_event TYPE option<array>;
 DEFINE FIELD context_embedding     ON dialogue_event TYPE option<array>;
 DEFINE FIELD decision_embedding    ON dialogue_event TYPE option<array>;
@@ -31,7 +31,7 @@ DEFINE FIELD embedding_meta        ON dialogue_event TYPE option<object>;
 DEFINE FIELD concept_vector        ON dialogue_event TYPE option<array>;
 DEFINE FIELD real_time_priority    ON dialogue_event TYPE option<string>;
 DEFINE FIELD live_stream_id        ON dialogue_event TYPE option<string>;
-DEFINE FIELD evidence_pointer      ON dialogue_event TYPE option<string>;
+DEFINE FIELD evidence_pointer      ON dialogue_event TYPE option<object>;
 DEFINE FIELD content_digest_sha256 ON dialogue_event TYPE option<string>;
 DEFINE FIELD blob_ref              ON dialogue_event TYPE option<string>;
 DEFINE FIELD message_ref           ON dialogue_event TYPE option<object>;
@@ -138,6 +138,49 @@ DEFINE INDEX idx_context_manifest_anchor
 
 DEFINE INDEX idx_context_manifest_digest
     ON TABLE context_manifest FIELDS tenant_id, manifest_digest UNIQUE;
+
+-- =====================
+-- ACE Persistence
+-- =====================
+DEFINE TABLE ace_dialogue_event SCHEMAFULL;
+DEFINE FIELD tenant             ON ace_dialogue_event TYPE string ASSERT != "";
+DEFINE FIELD event_id           ON ace_dialogue_event TYPE string ASSERT != "";
+DEFINE FIELD cycle_id           ON ace_dialogue_event TYPE string ASSERT != "";
+DEFINE FIELD occurred_at        ON ace_dialogue_event TYPE number;
+DEFINE FIELD lane               ON ace_dialogue_event TYPE string;
+DEFINE FIELD payload            ON ace_dialogue_event TYPE object;
+DEFINE FIELD manifest_digest    ON ace_dialogue_event TYPE option<string>;
+DEFINE FIELD explain_fingerprint ON ace_dialogue_event TYPE option<string>;
+DEFINE FIELD created_at         ON ace_dialogue_event TYPE number;
+
+DEFINE INDEX idx_ace_dialogue_event_lookup
+    ON TABLE ace_dialogue_event FIELDS tenant, event_id UNIQUE;
+
+DEFINE INDEX idx_ace_dialogue_event_cycle
+    ON TABLE ace_dialogue_event FIELDS tenant, cycle_id;
+
+DEFINE INDEX idx_ace_dialogue_event_created
+    ON TABLE ace_dialogue_event FIELDS tenant, created_at;
+
+DEFINE TABLE ace_awareness_event SCHEMAFULL;
+DEFINE FIELD tenant             ON ace_awareness_event TYPE string ASSERT != "";
+DEFINE FIELD event_id           ON ace_awareness_event TYPE string ASSERT != "";
+DEFINE FIELD cycle_id           ON ace_awareness_event TYPE string ASSERT != "";
+DEFINE FIELD event_type         ON ace_awareness_event TYPE string;
+DEFINE FIELD occurred_at        ON ace_awareness_event TYPE number;
+DEFINE FIELD parent_cycle_id    ON ace_awareness_event TYPE option<string>;
+DEFINE FIELD collab_scope_id    ON ace_awareness_event TYPE option<string>;
+DEFINE FIELD payload            ON ace_awareness_event TYPE object;
+DEFINE FIELD created_at         ON ace_awareness_event TYPE number;
+
+DEFINE INDEX idx_ace_awareness_event_lookup
+    ON TABLE ace_awareness_event FIELDS tenant, event_id UNIQUE;
+
+DEFINE INDEX idx_ace_awareness_event_cycle
+    ON TABLE ace_awareness_event FIELDS tenant, cycle_id;
+
+DEFINE INDEX idx_ace_awareness_event_type
+    ON TABLE ace_awareness_event FIELDS tenant, event_type;
 
 -- =====================
 -- Outbox & Replay (ACE → Soulbase)

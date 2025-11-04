@@ -55,16 +55,18 @@ Anchor 还包含：
 
 | `event_type` | 说明 |
 | ------------ | ---- |
-| `ac_started` / `ic_started` / `ic_ended` | AC/IC 时钟事件，记录 routing_seed、ic 序号、walltime 统计。 |
-| `assessment_produced` | DFR 评估摘要，外泄评估得分与阻断原因。 |
-| `decision_routed` | 主分叉选择结果，附 `DecisionPath` 三指纹（Plan/Budget/Explain）。 |
+| `awareness_cycle_started` / `awareness_cycle_ended` | AC 生命周期事件，标记新的 AC 启动/封印。 |
+| `inference_cycle_started` / `inference_cycle_completed` | IC 时钟事件，记录 routing_seed、ic 序号、walltime 统计。 |
+| `assessment_produced` | DFR 评估摘要，外泄得分与阻断原因。 |
+| `decision_routed` / `tool_path_decided` | 主分叉选择结果，附 `DecisionPath` 三指纹（Plan/Budget/Explain）。 |
 | `route_reconsidered` / `route_switched` | 路由重评或切换，附 degrade/explain。 |
 | `tool_called` / `tool_responded` / `tool_failed` | 工具执行链，包含 `ToolPlan` 节点、evidence 指针、迟到标记。 |
+| `tool_barrier_reached` / `tool_barrier_released` / `tool_barrier_timeout` | 工具 Barrier 生命周期，驱动 Saga/补偿。 |
 | `collab_requested` / `collab_resolved` | 协同发起与回合归并，追踪 `collab_scope_id`、Barrier 状态。 |
 | `clarification_issued` / `clarification_answered` | Clarify 闸门记录，含问题内容与回答摘要。 |
-| `human_injection_received` / `injection_applied` / `injection_deferred` / `injection_ignored` | HITL 注入生命周期，关联队列优先级与 `DeltaPatch` 状态。 |
-| `delta_patch_generated` | CA `merge_delta` 输出的 `DeltaPatch`（why_included/score_stats/manifest_digest）。 |
-| `sync_point_reported` | SyncPoint 吸收结果，写入 `SyncPointReport`（inbox_stats、budget_snapshot）。 |
+| `human_injection_received` / `human_injection_applied` / `human_injection_deferred` / `human_injection_ignored` | HITL 注入生命周期，关联队列优先级与 `DeltaPatch` 状态。 |
+| `delta_patch_generated` / `context_built` / `delta_merged` | CA `merge_delta` 输出、ContextManifest 生成与合流。 |
+| `sync_point_merged` / `sync_point_reported` | SyncPoint 吸收结果，写入 `SyncPointReport`（inbox_stats、budget_snapshot）。 |
 | `finalized` / `rejected` | AC 收敛结果（Final 唯一语义）或拒绝，记录最终 Explain/指纹。 |
 | `late_receipt_observed` | Final 之后迟到回执审计，标注原因与补救动作。 |
 | `environment_snapshot_recorded` | EnvCtx 稳定快照，包含 `ENVIRONMENT_SNAPSHOT_EVENT` digest。 |
@@ -77,8 +79,4 @@ Anchor 还包含：
 - 新增字段遵循 Append-Only 原则，保持向后兼容；弃用字段使用 `deprecated` 注解并保留一版兼容期。
 - 重大变更（例如 payload 结构重构）需要新增 `schema_v` 与 JSON Schema 版本，并在运行时依据 `schema_v` 或 `event_type` 进行兼容处理。
 
-## TODO
-
-- 将 payload 子结构在 JSON Schema 中通过 `$ref` 细化（计划拆分 `decision_path`, `delta_patch`, `sync_point_report` 等）。
-- 在 `docs/schema-updates` 补充典型事件样例，供回放测试使用。
-- 在 CI 中增加 schema 校验，确保 Append-Only 结构与说明文档同步。
+> 后续工作：将 `payload` 子结构拆分 `$ref`、补充事件样例，并在 CI 中加入 schema 校验，用于保障与 `AwarenessEventType` 枚举的同步。

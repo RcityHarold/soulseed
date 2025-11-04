@@ -99,9 +99,14 @@ pub enum AwarenessOutcome {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AwarenessEventType {
-    AcStarted,
-    IcStarted,
-    IcEnded,
+    #[serde(alias = "ac_started")]
+    AwarenessCycleStarted,
+    #[serde(alias = "ac_ended")]
+    AwarenessCycleEnded,
+    #[serde(alias = "ic_started")]
+    InferenceCycleStarted,
+    #[serde(alias = "ic_ended")]
+    InferenceCycleCompleted,
     AssessmentProduced,
     DecisionRouted,
     ToolPathDecided,
@@ -118,9 +123,12 @@ pub enum AwarenessEventType {
     ClarificationIssued,
     ClarificationAnswered,
     HumanInjectionReceived,
-    InjectionApplied,
-    InjectionDeferred,
-    InjectionIgnored,
+    #[serde(alias = "injection_applied")]
+    HumanInjectionApplied,
+    #[serde(alias = "injection_deferred")]
+    HumanInjectionDeferred,
+    #[serde(alias = "injection_ignored")]
+    HumanInjectionIgnored,
     DeltaPatchGenerated,
     ContextBuilt,
     DeltaMerged,

@@ -774,9 +774,15 @@ impl DialoguePayloadData for AwarenessPayload {
         }
 
         let expected = match kind {
-            DialogueEventPayloadKind::AwarenessAcStarted => AwarenessEventType::AcStarted,
-            DialogueEventPayloadKind::AwarenessIcStarted => AwarenessEventType::IcStarted,
-            DialogueEventPayloadKind::AwarenessIcEnded => AwarenessEventType::IcEnded,
+            DialogueEventPayloadKind::AwarenessAcStarted => {
+                AwarenessEventType::AwarenessCycleStarted
+            }
+            DialogueEventPayloadKind::AwarenessIcStarted => {
+                AwarenessEventType::InferenceCycleStarted
+            }
+            DialogueEventPayloadKind::AwarenessIcEnded => {
+                AwarenessEventType::InferenceCycleCompleted
+            }
             DialogueEventPayloadKind::AwarenessAssessmentProduced => {
                 AwarenessEventType::AssessmentProduced
             }
@@ -1030,14 +1036,12 @@ impl DialogueEventPayload {
             | DialogueEventPayload::ToolBarrierReached(inner)
             | DialogueEventPayload::ToolBarrierReleased(inner)
             | DialogueEventPayload::ToolBarrierTimeout(inner)
-            | DialogueEventPayload::ToolRouteSwitched(inner) =>
-                inner.output_digest_sha256.as_ref(),
+            | DialogueEventPayload::ToolRouteSwitched(inner) => inner.output_digest_sha256.as_ref(),
             DialogueEventPayload::SelfReflectionLogged(inner)
             | DialogueEventPayload::SelfReflectionHypothesisFormed(inner)
             | DialogueEventPayload::SelfReflectionActionCommitted(inner)
             | DialogueEventPayload::SelfReflectionScoreAdjusted(inner)
-            | DialogueEventPayload::SelfReflectionArchived(inner) =>
-                inner.insight_digest.as_ref(),
+            | DialogueEventPayload::SelfReflectionArchived(inner) => inner.insight_digest.as_ref(),
             _ => None,
         }
     }
@@ -1058,8 +1062,9 @@ impl DialogueEventPayload {
             | DialogueEventPayload::MessageAttachmentLinked(inner)
             | DialogueEventPayload::MessageAttachmentRemoved(inner)
             | DialogueEventPayload::MessageTranslated(inner)
-            | DialogueEventPayload::MessageBroadcast(inner) =>
-                inner.content_ref.as_ref().and_then(|c| c.blob_ref.as_ref()),
+            | DialogueEventPayload::MessageBroadcast(inner) => {
+                inner.content_ref.as_ref().and_then(|c| c.blob_ref.as_ref())
+            }
             DialogueEventPayload::ToolPlanDrafted(inner)
             | DialogueEventPayload::ToolPlanValidated(inner)
             | DialogueEventPayload::ToolPlanRejected(inner)
@@ -1098,10 +1103,9 @@ impl DialogueEventPayload {
             | DialogueEventPayload::MessageAttachmentLinked(inner)
             | DialogueEventPayload::MessageAttachmentRemoved(inner)
             | DialogueEventPayload::MessageTranslated(inner)
-            | DialogueEventPayload::MessageBroadcast(inner) => inner
-                .content_ref
-                .as_ref()
-                .and_then(|c| c.evidence.as_ref()),
+            | DialogueEventPayload::MessageBroadcast(inner) => {
+                inner.content_ref.as_ref().and_then(|c| c.evidence.as_ref())
+            }
             DialogueEventPayload::ToolPlanDrafted(inner)
             | DialogueEventPayload::ToolPlanValidated(inner)
             | DialogueEventPayload::ToolPlanRejected(inner)
@@ -1119,8 +1123,7 @@ impl DialogueEventPayload {
             | DialogueEventPayload::ToolBarrierReached(inner)
             | DialogueEventPayload::ToolBarrierReleased(inner)
             | DialogueEventPayload::ToolBarrierTimeout(inner)
-            | DialogueEventPayload::ToolRouteSwitched(inner) =>
-                inner.evidence.first(),
+            | DialogueEventPayload::ToolRouteSwitched(inner) => inner.evidence.first(),
             _ => None,
         }
     }

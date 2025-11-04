@@ -1,4 +1,3 @@
-use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use crate::aggregator::SyncPointAggregator;
 use crate::budget::BudgetManager;
 use crate::ca::InjectionAction;
@@ -8,15 +7,17 @@ use crate::errors::AceError;
 use crate::hitl::HitlService;
 use crate::metrics::AceMetrics;
 use crate::outbox::OutboxService;
+use crate::persistence::AcePersistence;
 use crate::scheduler::CycleScheduler;
 use crate::types::{
-    AggregationOutcome, BudgetSnapshot, CycleEmission, CycleLane, CycleRequest, ScheduleOutcome,
-    SyncPointInput,
+    AggregationOutcome, BudgetSnapshot, CycleEmission, CycleLane, CycleRequest, CycleSchedule,
+    CycleStatus, ScheduleOutcome, SyncPointInput,
 };
 use serde_json::{Map, Value, json};
-use soulseed_agi_core_models::AwarenessCycleId;
-use soulseed_agi_core_models::awareness::AwarenessEventType;
+use soulseed_agi_core_models::awareness::{AwarenessEventType, SyncPointKind};
 use soulseed_agi_core_models::common::EvidencePointer;
+use soulseed_agi_core_models::{AwarenessCycleId, DialogueEvent};
+use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -34,6 +35,7 @@ pub struct AceEngine<'a> {
     pub router: &'a RouterService,
     pub route_planner: &'a RoutePlanner,
     pub lane_cooldown: Duration,
+    pub persistence: Option<Arc<dyn AcePersistence>>,
     finalized: Arc<Mutex<HashSet<u64>>>,
 }
 
@@ -63,8 +65,13 @@ impl<'a> AceEngine<'a> {
             router,
             route_planner,
             lane_cooldown: Duration::seconds(2),
+            persistence: None,
             finalized: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub fn set_persistence(&mut self, persistence: Arc<dyn AcePersistence>) {
+        self.persistence = Some(persistence);
     }
 
     pub fn schedule_cycle(&self, request: CycleRequest) -> Result<ScheduleOutcome, AceError> {
@@ -86,9 +93,12 @@ impl<'a> AceEngine<'a> {
             &[("lane", format!("{:?}", lane))],
         );
 
-        let outcome = self
-            .scheduler
-            .schedule(decision, request.budget.clone())?;
+        let outcome = self.scheduler.schedule(
+            decision,
+            request.budget.clone(),
+            request.parent_cycle_id,
+            request.collab_scope_id.clone(),
+        )?;
 
         if let Some(cycle) = &outcome.cycle {
             self.checkpointer.record(crate::types::CheckpointState {
@@ -103,10 +113,7 @@ impl<'a> AceEngine<'a> {
             }
             let labels = vec![
                 ("lane", format!("{:?}", cycle.lane)),
-                (
-                    "fork",
-                    format!("{:?}", cycle.router_decision.plan.fork),
-                ),
+                ("fork", format!("{:?}", cycle.router_decision.plan.fork)),
             ];
             self.metrics.counter("ace.schedule.accepted", 1.0, &labels);
         } else {
@@ -169,7 +176,21 @@ impl<'a> AceEngine<'a> {
                 input.pending_injections = topk.into_iter().map(|entry| entry.injection).collect();
             }
         }
+        let (pre_status, _) = status_transition_for_syncpoint(input.kind);
+        if let Some(status) = pre_status {
+            self.scheduler.mark_status(input.cycle_id, status);
+        }
         let outcome = self.aggregator.aggregate(input)?;
+        let (_, post_status) = status_transition_for_syncpoint(outcome.report.kind);
+        if let Some(status) = post_status {
+            self.scheduler.mark_status(outcome.report.cycle_id, status);
+        } else if matches!(
+            self.scheduler.status_of(outcome.report.cycle_id),
+            Some(CycleStatus::AwaitingExternal | CycleStatus::Suspended)
+        ) {
+            self.scheduler
+                .mark_status(outcome.report.cycle_id, CycleStatus::Running);
+        }
         for decision in &outcome.injections {
             if matches!(
                 decision.action,
@@ -188,7 +209,20 @@ impl<'a> AceEngine<'a> {
 
     pub fn finalize_cycle(&self, mut emission: CycleEmission) -> Result<(), AceError> {
         let tenant_id = emission.anchor.tenant_id.into_inner();
+
+        if emission.final_event.base.ac_id.is_none() {
+            emission.final_event.base.ac_id = Some(emission.cycle_id);
+        }
+        if emission.final_event.base.parent_ac_id.is_none() {
+            emission.final_event.base.parent_ac_id = emission.parent_cycle_id;
+        }
         emission.final_event = sanitize_final_event(&emission.lane, &emission.final_event);
+        if emission.final_event.base.ac_id.is_none() {
+            emission.final_event.base.ac_id = Some(emission.cycle_id);
+        }
+        if emission.final_event.base.parent_ac_id.is_none() {
+            emission.final_event.base.parent_ac_id = emission.parent_cycle_id;
+        }
 
         let cycle_key = emission.cycle_id.as_u64();
         let mut registry = self.finalized.lock().unwrap();
@@ -228,12 +262,17 @@ impl<'a> AceEngine<'a> {
         registry.insert(cycle_key);
         drop(registry);
 
+        if let Some(store) = self.persistence.as_ref() {
+            store.persist_cycle(&emission)?;
+        }
+
         let result = (|| -> Result<(), AceError> {
             let envelope = self.emitter.emit(emission.clone())?;
             let mut reservation = self.outbox.reserve(envelope);
             reservation.commit()?;
             self.checkpointer.finish(tenant_id);
-            self.scheduler.finish(tenant_id);
+            self.scheduler
+                .finish(tenant_id, emission.cycle_id, emission.status);
             if matches!(emission.lane, CycleLane::Clarify) {
                 self.hitl.clear_cycle_active(emission.anchor.tenant_id);
             }
@@ -294,5 +333,138 @@ fn merge_metadata(original: &Value, lane: &CycleLane) -> Value {
 fn validate_event(event: &soulseed_agi_core_models::DialogueEvent) {
     if let Err(err) = soulseed_agi_core_models::validate_dialogue_event(event) {
         debug_assert!(false, "dialogue event validation failed: {:?}", err);
+    }
+}
+
+fn status_transition_for_syncpoint(
+    kind: SyncPointKind,
+) -> (Option<CycleStatus>, Option<CycleStatus>) {
+    use CycleStatus::*;
+    match kind {
+        SyncPointKind::ClarifyWindowOpened | SyncPointKind::HitlWindowOpened => {
+            (Some(AwaitingExternal), None)
+        }
+        SyncPointKind::ToolWindowOpened
+        | SyncPointKind::ToolBarrier
+        | SyncPointKind::ToolBarrierReached
+        | SyncPointKind::ToolBarrierTimeout
+        | SyncPointKind::BudgetExceeded => (Some(Suspended), None),
+        SyncPointKind::ClarifyAnswered
+        | SyncPointKind::ClarifyWindowClosed
+        | SyncPointKind::ToolWindowClosed
+        | SyncPointKind::ToolBarrierReleased
+        | SyncPointKind::CollabTurnEnd
+        | SyncPointKind::HitlAbsorb
+        | SyncPointKind::HitlWindowClosed
+        | SyncPointKind::Merged
+        | SyncPointKind::LateSignalObserved
+        | SyncPointKind::DriftDetected
+        | SyncPointKind::BudgetRecovered
+        | SyncPointKind::ToolChainNext
+        | SyncPointKind::DegradationRecorded => (None, Some(Running)),
+        _ => (None, None),
+    }
+}
+
+pub trait CycleRuntime {
+    fn prepare_sync_point(&mut self, schedule: &CycleSchedule) -> Result<SyncPointInput, AceError>;
+
+    fn produce_final_event(
+        &mut self,
+        schedule: &CycleSchedule,
+        aggregation: &AggregationOutcome,
+    ) -> Result<(DialogueEvent, CycleStatus), AceError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct CycleOutcome {
+    pub cycle_id: AwarenessCycleId,
+    pub status: CycleStatus,
+    pub manifest_digest: Option<String>,
+}
+
+pub struct AceOrchestrator<'a, R> {
+    engine: &'a AceEngine<'a>,
+    runtime: R,
+}
+
+impl<'a, R> AceOrchestrator<'a, R>
+where
+    R: CycleRuntime,
+{
+    pub fn new(engine: &'a AceEngine<'a>, runtime: R) -> Self {
+        Self { engine, runtime }
+    }
+
+    pub fn drive_once(&mut self, tenant: u64) -> Result<Option<CycleOutcome>, AceError> {
+        let Some(schedule) = self.engine.scheduler.start_next(tenant) else {
+            return Ok(None);
+        };
+
+        let mut syncpoint = self.runtime.prepare_sync_point(&schedule)?;
+        if syncpoint.parent_cycle_id.is_none() {
+            syncpoint.parent_cycle_id = schedule.parent_cycle_id;
+        }
+        if syncpoint.collab_scope_id.is_none() {
+            syncpoint.collab_scope_id = schedule.collab_scope_id.clone();
+        }
+
+        let aggregation = self.engine.absorb_sync_point(syncpoint)?;
+        let (mut final_event, status) =
+            self.runtime.produce_final_event(&schedule, &aggregation)?;
+
+        if final_event.base.ac_id.is_none() {
+            final_event.base.ac_id = Some(schedule.cycle_id);
+        }
+        if final_event.base.parent_ac_id.is_none() {
+            final_event.base.parent_ac_id = schedule.parent_cycle_id;
+        }
+
+        let mut awareness_events = schedule.decision_events.clone();
+        awareness_events.extend(aggregation.awareness_events.clone());
+
+        let explain_fingerprint = aggregation
+            .explain_fingerprint
+            .clone()
+            .or(schedule.explain_fingerprint.clone());
+
+        let manifest_digest = aggregation
+            .context_manifest
+            .as_ref()
+            .and_then(|val| val.get("manifest_digest"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let emission = CycleEmission {
+            cycle_id: schedule.cycle_id,
+            lane: schedule.lane.clone(),
+            final_event,
+            awareness_events,
+            budget: aggregation.report.budget_snapshot.clone(),
+            anchor: schedule.anchor.clone(),
+            explain_fingerprint,
+            router_decision: schedule.router_decision.clone(),
+            status,
+            parent_cycle_id: schedule.parent_cycle_id,
+            collab_scope_id: schedule.collab_scope_id.clone(),
+            manifest_digest: manifest_digest.clone(),
+            context_manifest: aggregation.context_manifest.clone(),
+        };
+
+        self.engine.finalize_cycle(emission)?;
+
+        Ok(Some(CycleOutcome {
+            cycle_id: schedule.cycle_id,
+            status,
+            manifest_digest,
+        }))
+    }
+
+    pub fn drive_until_idle(&mut self, tenant: u64) -> Result<Vec<CycleOutcome>, AceError> {
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = self.drive_once(tenant)? {
+            outcomes.push(outcome);
+        }
+        Ok(outcomes)
     }
 }

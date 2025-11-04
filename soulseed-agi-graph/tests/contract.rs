@@ -103,8 +103,8 @@ fn awareness_query_base() -> AwarenessQuery {
             env_mode: None,
             inference_cycle_sequence: Some(1),
             event_types: Some(vec![
-                AwarenessEventType::AcStarted,
-                AwarenessEventType::IcEnded,
+                AwarenessEventType::AwarenessCycleStarted,
+                AwarenessEventType::InferenceCycleCompleted,
             ]),
             degradation_reasons: None,
             sync_point_kinds: None,
@@ -426,7 +426,7 @@ fn awareness_parent_scope_mismatch_rejected() {
 fn awareness_hitl_filters_require_subset() {
     let planner = Planner::new(PlannerConfig::default());
     let mut query = awareness_query_base();
-    query.filters.event_types = Some(vec![AwarenessEventType::InjectionApplied]);
+    query.filters.event_types = Some(vec![AwarenessEventType::HumanInjectionApplied]);
     query.filters.degradation_reasons = Some(vec![AwarenessDegradationReason::ClarifyExhausted]);
     query.filters.sync_point_kinds = Some(vec![SyncPointKind::HitlAbsorb]);
     let (plan, _, _) = planner.plan_awareness(&query).unwrap();
