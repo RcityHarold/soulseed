@@ -25,11 +25,7 @@ impl OpenAiClient {
         }))
     }
 
-    pub fn clarify_answer(
-        &self,
-        plan: &ClarifyPlan,
-        context: &str,
-    ) -> Result<String, AceError> {
+    pub fn clarify_answer(&self, plan: &ClarifyPlan, context: &str) -> Result<String, AceError> {
         let mut questions = String::new();
         for (idx, q) in plan.questions.iter().enumerate() {
             questions.push_str(&format!("{}. {}\n", idx + 1, q.text));
@@ -38,22 +34,19 @@ impl OpenAiClient {
             "用户输入：\n{}\n\n请逐条回答以下澄清问题，使用中文，保持简洁：\n{}",
             context, questions
         );
-        self.chat_completion("你是一名智能澄清助手，需针对用户问题逐条给出明确回答。", &user_prompt, 512)
+        self.chat_completion(
+            "你是一名智能澄清助手，需针对用户问题逐条给出明确回答。",
+            &user_prompt,
+            512,
+        )
     }
 
-    pub fn self_reflection(
-        &self,
-        plan: &SelfPlan,
-        context: &str,
-    ) -> Result<String, AceError> {
+    pub fn self_reflection(&self, plan: &SelfPlan, context: &str) -> Result<String, AceError> {
         let hint = plan
             .hint
             .clone()
             .unwrap_or_else(|| "总结核心要点并给出下一步推理建议。".into());
-        let user_prompt = format!(
-            "上下文：{}\n\n请按照提示进行自我反思：{}",
-            context, hint
-        );
+        let user_prompt = format!("上下文：{}\n\n请按照提示进行自我反思：{}", context, hint);
         self.chat_completion(
             "你是 Soulseed AGI 的自省模块，请输出结构化自省结论，包含问题洞察与下一步建议。",
             &user_prompt,
@@ -93,9 +86,7 @@ impl OpenAiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let text = response
-                .text()
-                .unwrap_or_else(|_| "<no body>".into());
+            let text = response.text().unwrap_or_else(|_| "<no body>".into());
             return Err(AceError::ThinWaist(format!(
                 "openai error {status}: {text}"
             )));

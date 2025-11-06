@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 use soulseed_agi_core_models::awareness::AwarenessDegradationReason;
 use soulseed_agi_core_models::common::EvidencePointer;
 use soulseed_agi_core_models::dialogue_event::payload::{CollaborationPayload, ToolPayload};
@@ -134,7 +134,9 @@ impl SoulbaseGateway {
             .headers(headers)
             .json(&body)
             .send()
-            .map_err(|err| AceError::ThinWaist(format!("soulbase gateway request failed: {err}")))?;
+            .map_err(|err| {
+                AceError::ThinWaist(format!("soulbase gateway request failed: {err}"))
+            })?;
 
         let status = response.status();
         let envelope: GatewayEnvelope<T> = response.json().map_err(|err| {
@@ -251,17 +253,15 @@ impl ToolSynthesis {
                 .entry("tool_latency_ms")
                 .or_insert_with(|| Value::Number(latency.into()));
         }
-        metadata
-            .entry("tool_invocation_id")
-            .or_insert_with(|| {
-                Value::String(
-                    payload
-                        .invocation
-                        .as_ref()
-                        .map(|inv| inv.call_id.clone())
-                        .unwrap_or_else(|| default_fragment),
-                )
-            });
+        metadata.entry("tool_invocation_id").or_insert_with(|| {
+            Value::String(
+                payload
+                    .invocation
+                    .as_ref()
+                    .map(|inv| inv.call_id.clone())
+                    .unwrap_or_else(|| default_fragment),
+            )
+        });
 
         let manifest = manifest.unwrap_or_default();
 

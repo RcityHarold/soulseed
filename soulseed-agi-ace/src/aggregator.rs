@@ -7,11 +7,11 @@ use crate::ca::{
     CaService, CaServiceDefault, InjectionAction, MergeDeltaRequest, MergeDeltaResponse,
 };
 use crate::errors::AceError;
+use crate::tw_gateway::GatewayAwareness;
 use crate::types::{
     AggregationOutcome, SyncPointFailureSummary, SyncPointInput, SyncPointMergeSummary,
     SyncPointReport, SyncPointSourceSummary,
 };
-use crate::tw_gateway::GatewayAwareness;
 #[cfg(feature = "vectors-extra")]
 use soulseed_agi_core_models::ExtraVectors;
 use soulseed_agi_core_models::awareness::{
@@ -779,10 +779,7 @@ fn collect_gateway_awareness(
                 collab_scope_id: input.collab_scope_id.clone(),
                 barrier_id: entry.barrier_id.clone(),
                 env_mode: None,
-                inference_cycle_sequence: event
-                    .base
-                    .ic_sequence
-                    .unwrap_or(1),
+                inference_cycle_sequence: event.base.ic_sequence.unwrap_or(1),
                 degradation_reason: map_degradation(entry.degradation_reason.as_deref()),
                 payload: entry.payload.clone(),
             };

@@ -4,14 +4,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration as StdDuration;
 
 use dotenvy::from_path_iter;
-use serde_json::{json, Map as JsonMap, Value as JsonValue};
-use soulseed_agi_core_models::legacy::dialogue_event as legacy;
-use soulseed_agi_core_models::legacy::dialogue_event::SelfReflectionRecord;
-use soulseed_agi_core_models::{
-    AccessClass, AwarenessCycleId, ConversationScenario, CorrelationId, DialogueEvent,
-    DialogueEventBase, DialogueEventType, EnvelopeHead, EventId, Provenance, Snapshot, Subject,
-    SubjectRef, TenantId, TraceId,
-};
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use soulseed_agi_core_models::awareness::{
     AwarenessAnchor, AwarenessDegradationReason, DecisionPlan, SyncPointKind,
 };
@@ -19,18 +12,25 @@ use soulseed_agi_core_models::dialogue_event::payload::{
     ClarificationPayload, CollaborationPayload, DialogueEventPayload, SelfReflectionPayload,
     ToolPayload,
 };
+use soulseed_agi_core_models::legacy::dialogue_event as legacy;
+use soulseed_agi_core_models::legacy::dialogue_event::SelfReflectionRecord;
 use soulseed_agi_core_models::{AIId, HumanId};
+use soulseed_agi_core_models::{
+    AccessClass, AwarenessCycleId, ConversationScenario, CorrelationId, DialogueEvent,
+    DialogueEventBase, DialogueEventType, EnvelopeHead, EventId, Provenance, Snapshot, Subject,
+    SubjectRef, TenantId, TraceId,
+};
 use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::engine::{AceEngine, AceOrchestrator, CycleOutcome, CycleRuntime};
 use crate::errors::AceError;
-use crate::persistence::AcePersistence;
 use crate::llm::OpenAiClient;
+use crate::persistence::AcePersistence;
 use crate::tw_gateway::{CollabSynthesis, SoulbaseGateway, ToolSynthesis};
 use crate::types::{
-    BudgetSnapshot, CycleLane, CycleRequest, CycleSchedule, CycleStatus, CycleEmission,
+    BudgetSnapshot, CycleEmission, CycleLane, CycleRequest, CycleSchedule, CycleStatus,
     SyncPointInput,
 };
 
@@ -323,31 +323,17 @@ fn build_sync_input_with_synthesis(
     let mut manifest = JsonMap::new();
     manifest.insert("manifest_digest".into(), json!(manifest_digest));
     manifest.insert("auto_generated".into(), json!(true));
-    manifest.insert(
-        "prepared_at_ms".into(),
-        json!(now.unix_timestamp() * 1000),
-    );
+    manifest.insert("prepared_at_ms".into(), json!(now.unix_timestamp() * 1000));
     manifest.insert(
         "router_digest".into(),
-        json!(schedule
-            .router_decision
-            .plan
-            .explain
-            .router_digest
-            .clone()),
+        json!(schedule.router_decision.plan.explain.router_digest.clone()),
     );
     manifest.insert(
         "context_digest".into(),
         json!(schedule.router_decision.context_digest.clone()),
     );
-    manifest.insert(
-        "cycle_lane".into(),
-        json!(lane_label(&schedule.lane)),
-    );
-    manifest.insert(
-        "cycle_id".into(),
-        json!(schedule.cycle_id.as_u64()),
-    );
+    manifest.insert("cycle_lane".into(), json!(lane_label(&schedule.lane)));
+    manifest.insert("cycle_id".into(), json!(schedule.cycle_id.as_u64()));
     if let Some(answer) = synthesis.clarify_answer.as_ref() {
         manifest.insert("clarify_answer".into(), json!(answer));
     }
@@ -385,9 +371,9 @@ fn build_final_event(
 ) -> Result<DialogueEvent, AceError> {
     let now = OffsetDateTime::now_utc();
     let anchor = &schedule.anchor;
-    let session_id = anchor.session_id.unwrap_or_else(|| {
-        soulseed_agi_core_models::SessionId::from_raw_unchecked(1)
-    });
+    let session_id = anchor
+        .session_id
+        .unwrap_or_else(|| soulseed_agi_core_models::SessionId::from_raw_unchecked(1));
     let sequence = anchor.sequence_number.unwrap_or(0).saturating_add(1);
     let subject = Subject::AI(AIId::from_raw_unchecked(0));
     let participants = vec![SubjectRef {
@@ -443,18 +429,10 @@ fn build_final_event(
 
     metadata.insert("auto_generated".into(), json!(true));
     metadata.insert("cycle_lane".into(), json!(lane_label(&schedule.lane)));
-    metadata.insert(
-        "cycle_id".into(),
-        json!(schedule.cycle_id.as_u64()),
-    );
+    metadata.insert("cycle_id".into(), json!(schedule.cycle_id.as_u64()));
     metadata.insert(
         "router_digest".into(),
-        json!(schedule
-            .router_decision
-            .plan
-            .explain
-            .router_digest
-            .clone()),
+        json!(schedule.router_decision.plan.explain.router_digest.clone()),
     );
     metadata.insert(
         "context_digest".into(),
@@ -462,17 +440,10 @@ fn build_final_event(
     );
     metadata.insert(
         "decision_issued_at_ms".into(),
-        json!(schedule
-            .router_decision
-            .issued_at
-            .unix_timestamp() * 1000),
+        json!(schedule.router_decision.issued_at.unix_timestamp() * 1000),
     );
 
-    if let Some(reason) = schedule
-        .router_decision
-        .decision_path
-        .degradation_reason
-    {
+    if let Some(reason) = schedule.router_decision.decision_path.degradation_reason {
         metadata.insert(
             "degradation_reason".into(),
             json!(degradation_to_string(reason)),
@@ -489,17 +460,20 @@ fn payload_for_lane(
     decision_plan: &DecisionPlan,
     schedule: &CycleSchedule,
     synthesis: &LaneSynthesis,
-) -> Result<(DialogueEventType, DialogueEventPayload, JsonMap<String, JsonValue>), AceError> {
-    let degradation = schedule
-        .router_decision
-        .decision_path
-        .degradation_reason;
+) -> Result<
+    (
+        DialogueEventType,
+        DialogueEventPayload,
+        JsonMap<String, JsonValue>,
+    ),
+    AceError,
+> {
+    let degradation = schedule.router_decision.decision_path.degradation_reason;
 
     match (lane, decision_plan) {
         (CycleLane::Clarify, DecisionPlan::Clarify { plan }) => {
             let clar_id = format!("clarify-{}", schedule.cycle_id.as_u64());
-            let questions: Vec<String> =
-                plan.questions.iter().map(|q| q.text.clone()).collect();
+            let questions: Vec<String> = plan.questions.iter().map(|q| q.text.clone()).collect();
             let payload = DialogueEventPayload::ClarificationAnswered(ClarificationPayload {
                 clarification_id: clar_id.clone(),
                 question_ref: None,
@@ -543,16 +517,12 @@ fn payload_for_lane(
                 }),
                 confidence: Some(schedule.router_decision.decision_path.confidence),
             };
-            let payload =
-                DialogueEventPayload::SelfReflectionLogged(SelfReflectionPayload {
-                    record,
-                    insight_digest: Some(format!(
-                        "self-reflection:{}",
-                        schedule.cycle_id.as_u64()
-                    )),
-                    related_event_id: None,
-                    attributes: JsonValue::Null,
-                });
+            let payload = DialogueEventPayload::SelfReflectionLogged(SelfReflectionPayload {
+                record,
+                insight_digest: Some(format!("self-reflection:{}", schedule.cycle_id.as_u64())),
+                related_event_id: None,
+                attributes: JsonValue::Null,
+            });
 
             let mut meta = JsonMap::new();
             meta.insert("self_reflection_topic".into(), json!(topic));
@@ -658,9 +628,7 @@ fn payload_for_lane(
                 Ok((DialogueEventType::Decision, payload, meta))
             }
         }
-        _ => Err(AceError::InvalidRequest(
-        "decision_plan_mismatch".into(),
-    )),
+        _ => Err(AceError::InvalidRequest("decision_plan_mismatch".into())),
     }
 }
 
@@ -679,11 +647,7 @@ fn schedule_context(schedule: &CycleSchedule) -> String {
         schedule.cycle_id.as_u64(),
         schedule.anchor.tenant_id.as_u64(),
         fork,
-        schedule
-            .router_decision
-            .plan
-            .explain
-            .router_digest
+        schedule.router_decision.plan.explain.router_digest
     )
 }
 
@@ -872,7 +836,9 @@ impl<'a> AceService<'a> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .map_err(|err| AceError::Persistence(format!("tokio runtime init failed: {err}")))?;
+                .map_err(|err| {
+                    AceError::Persistence(format!("tokio runtime init failed: {err}"))
+                })?;
             let persistence =
                 SurrealPersistence::new_with_owned_runtime(runtime, persistence_config)?;
             Ok(Arc::new(persistence))
@@ -890,18 +856,14 @@ impl<'a> AceService<'a> {
 pub struct TriggerComposer;
 
 pub fn load_surreal_dotenv_settings() -> Result<HashMap<String, String>, AceError> {
-    let origin = env::current_dir().map_err(|err| {
-        AceError::Persistence(format!("无法获取当前工作目录：{err}"))
-    })?;
+    let origin = env::current_dir()
+        .map_err(|err| AceError::Persistence(format!("无法获取当前工作目录：{err}")))?;
     let mut cursor = origin.as_path();
     loop {
         let candidate = cursor.join(".env");
         if candidate.exists() {
             let iter = from_path_iter(&candidate).map_err(|err| {
-                AceError::Persistence(format!(
-                    "读取配置文件 {} 失败：{err}",
-                    candidate.display()
-                ))
+                AceError::Persistence(format!("读取配置文件 {} 失败：{err}", candidate.display()))
             })?;
             let mut map = HashMap::new();
             for entry in iter {
@@ -926,10 +888,7 @@ pub fn load_surreal_dotenv_settings() -> Result<HashMap<String, String>, AceErro
 }
 
 fn lookup_setting(settings: &HashMap<String, String>, key: &str) -> Option<String> {
-    settings
-        .get(key)
-        .cloned()
-        .or_else(|| env::var(key).ok())
+    settings.get(key).cloned().or_else(|| env::var(key).ok())
 }
 
 impl TriggerComposer {

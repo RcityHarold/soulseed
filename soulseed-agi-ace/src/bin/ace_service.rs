@@ -7,51 +7,58 @@ use std::{
 };
 
 use async_stream::stream;
-use futures_core::stream::Stream;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{sse::{Event, Sse}, IntoResponse, Response},
-    routing::{get, post},
     Json, Router,
+    extract::{Path, State},
+    http::{
+        HeaderName, Method, StatusCode,
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    },
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+    routing::{get, post},
 };
+use futures_core::stream::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use soulseed_agi_ace::aggregator::SyncPointAggregator;
 use soulseed_agi_ace::budget::BudgetManager;
 use soulseed_agi_ace::ca::CaServiceDefault;
 use soulseed_agi_ace::checkpointer::Checkpointer;
 use soulseed_agi_ace::emitter::Emitter;
+use soulseed_agi_ace::engine::AceEngine;
 use soulseed_agi_ace::errors::AceError;
 use soulseed_agi_ace::hitl::{HitlInjection, HitlPriority, HitlQueueConfig, HitlService};
 use soulseed_agi_ace::metrics::NoopMetrics;
 use soulseed_agi_ace::outbox::OutboxService;
-use soulseed_agi_ace::runtime::{load_surreal_dotenv_settings, AceService, TriggerComposer};
+use soulseed_agi_ace::runtime::{AceService, TriggerComposer, load_surreal_dotenv_settings};
 use soulseed_agi_ace::scheduler::{CycleScheduler, SchedulerConfig};
-use soulseed_agi_ace::engine::AceEngine;
 use soulseed_agi_ace::types::{CycleSchedule, OutboxMessage, SyncPointInput};
 use soulseed_agi_core_models::DialogueEvent;
 use soulseed_agi_dfr::filter::CandidateFilter;
 use soulseed_agi_dfr::hardgate::HardGate;
 use soulseed_agi_dfr::scorer::CandidateScorer;
 use soulseed_agi_dfr::{RoutePlanner, RouterService};
-use tokio::signal;
 use tokio::net::TcpListener;
+use tokio::signal;
 use tokio::time::sleep;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 #[cfg(feature = "outbox-redis")]
-use std::sync::Arc as StdArc;
-#[cfg(feature = "outbox-redis")]
-use soulseed_agi_ace::outbox::redis::{RedisForwarderConfig, RedisOutboxForwarder};
+use sb_storage::surreal::config::{SurrealConfig, SurrealCredentials, SurrealProtocol};
 #[cfg(feature = "outbox-redis")]
 use sb_tx::config::TxConfig;
 #[cfg(feature = "outbox-redis")]
 use sb_tx::transport::redis::RedisTransportConfig;
 #[cfg(feature = "outbox-redis")]
-use sb_storage::surreal::config::{SurrealConfig, SurrealCredentials, SurrealProtocol};
+use soulseed_agi_ace::outbox::redis::{RedisForwarderConfig, RedisOutboxForwarder};
 #[cfg(feature = "outbox-redis")]
 use soulseed_agi_core_models::TenantId;
+#[cfg(feature = "outbox-redis")]
+use std::sync::Arc as StdArc;
 
 #[derive(Clone)]
 struct AppState {
@@ -124,11 +131,9 @@ impl IntoResponse for AppError {
                 Json(json!({ "error": message })),
             )
                 .into_response(),
-            AppError::NotFound(message) => (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": message })),
-            )
-                .into_response(),
+            AppError::NotFound(message) => {
+                (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
+            }
         }
     }
 }
@@ -165,19 +170,24 @@ async fn main() -> Result<(), AppError> {
         .map_err(|err| AppError::Service(format!("invalid ACE_SERVICE_ADDR: {err}")))?;
     info!("ACE service listening on {addr}");
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            ACCEPT,
+            HeaderName::from_static("x-tenant-id"),
+        ]);
+
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/api/v1/triggers/dialogue", post(trigger_dialogue))
         .route("/api/v1/ace/injections", post(post_injection))
         .route("/api/v1/ace/cycles/:cycle_id", get(get_cycle))
-        .route(
-            "/api/v1/ace/cycles/:cycle_id/outbox",
-            get(get_cycle_outbox),
-        )
-        .route(
-            "/api/v1/ace/cycles/:cycle_id/stream",
-            get(stream_cycle),
-        )
+        .route("/api/v1/ace/cycles/:cycle_id/outbox", get(get_cycle_outbox))
+        .route("/api/v1/ace/cycles/:cycle_id/stream", get(stream_cycle))
+        .layer(cors)
         .with_state(state);
 
     let listener = TcpListener::bind(addr)
@@ -227,9 +237,7 @@ async fn trigger_dialogue(
         .last()
         .and_then(|s| s.manifest_digest.clone());
 
-    let outbox_messages = app
-        .outbox
-        .peek(schedule.anchor.tenant_id);
+    let outbox_messages = app.outbox.peek(schedule.anchor.tenant_id);
 
     let snapshot = CycleSnapshot {
         schedule: schedule.clone(),
@@ -513,9 +521,10 @@ fn surreal_config_from_settings(settings: &HashMap<String, String>) -> SurrealCo
     {
         config = config.with_pool(pool);
     }
-    if let (Ok(username), Ok(password)) =
-        (std::env::var("ACE_SURREAL_USERNAME"), std::env::var("ACE_SURREAL_PASSWORD"))
-    {
+    if let (Ok(username), Ok(password)) = (
+        std::env::var("ACE_SURREAL_USERNAME"),
+        std::env::var("ACE_SURREAL_PASSWORD"),
+    ) {
         config = config.with_credentials(SurrealCredentials::new(username, password));
     }
     config

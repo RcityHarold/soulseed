@@ -3,8 +3,10 @@ use std::{
     fmt::{self, Display, Formatter},
     str::FromStr,
     sync::{Mutex, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EPOCH_UNIX_MS: i64 = 1_704_064_000_000; // 2024-01-01T00:00:00Z
 const TIMESTAMP_BITS: u64 = 42;
@@ -76,11 +78,18 @@ impl GlobalIdFactory {
     }
 
     fn now_millis(&self) -> IdResult<u64> {
-        let now = SystemTime::now();
-        let since_epoch = now
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_millis(0));
-        let millis = since_epoch.as_millis() as i64;
+        #[cfg(not(target_arch = "wasm32"))]
+        let millis = {
+            let now = SystemTime::now();
+            let since_epoch = now
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_else(|_| Duration::from_millis(0));
+            since_epoch.as_millis() as i64
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        let millis = js_sys::Date::now() as i64;
+
         let adjusted = millis - EPOCH_UNIX_MS;
         if adjusted < 0 {
             return Err(IdError::ClockWentBackwards(adjusted.unsigned_abs()));
@@ -93,12 +102,28 @@ impl GlobalIdFactory {
     }
 
     fn wait_for_next_millis(&self, current: u64) -> IdResult<u64> {
-        loop {
-            let ts = self.now_millis()?;
-            if ts > current {
-                return Ok(ts);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            loop {
+                let ts = self.now_millis()?;
+                if ts > current {
+                    return Ok(ts);
+                }
+                std::thread::yield_now();
             }
-            std::thread::yield_now();
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // In WASM, we can't block, so just try a few times
+            for _ in 0..100 {
+                let ts = self.now_millis()?;
+                if ts > current {
+                    return Ok(ts);
+                }
+            }
+            // If still same millisecond, just return current + 1
+            Ok(current + 1)
         }
     }
 

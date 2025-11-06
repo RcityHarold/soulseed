@@ -6,14 +6,14 @@ pub mod emitter;
 pub mod engine;
 pub mod errors;
 pub mod hitl;
+mod llm;
 pub mod metrics;
 pub mod outbox;
 pub mod persistence;
 pub mod runtime;
 pub mod scheduler;
-pub mod types;
-mod llm;
 mod tw_gateway;
+pub mod types;
 
 pub use aggregator::*;
 pub use budget::*;

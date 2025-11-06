@@ -69,27 +69,29 @@ DEFINE INDEX idx_dialogue_event_v2_semantic_cluster
 DEFINE INDEX idx_dialogue_event_v2_content_vec
     ON TABLE dialogue_event_v2
     COLUMNS tenant_id, enhancements.content_embedding
-    TYPE hnsw
+    HNSW DIMENSION 1536 TYPE F32 M 16 EFC 200
     COMMENT "内容向量索引（需 SurrealDB 向量能力）";
 
 -- 10. 灰度迁移视图：读取 legacy 表并映射至新结构（仅示例）
-DEFINE VIEW dialogue_event_v2_legacy_mirror ON dialogue_event_v2
-    FROM dialogue_event
-    WITH
-        tenant_id: tenant_id,
-        session_id: session_id,
-        event_id: event_id,
-        scenario: scenario,
-        event_type: event_type,
-        sequence_number: sequence_number,
-        timestamp_ms: timestamp_ms,
-        access_class: access_class,
-        base: {
+DEFINE TABLE dialogue_event_v2_legacy_mirror
+    SCHEMALESS
+    COMMENT "Legacy dialogue_event 映射视图"
+    AS SELECT
+        id,
+        tenant_id,
+        session_id,
+        event_id,
+        scenario,
+        event_type,
+        sequence_number,
+        timestamp_ms,
+        access_class,
+        {
             event_id: event_id,
             supersedes: supersedes,
             superseded_by: superseded_by
-        },
-        payload: {
+        } AS base,
+        {
             message_ref: message_ref,
             tool_invocation: tool_invocation,
             tool_result: tool_result,
@@ -97,8 +99,8 @@ DEFINE VIEW dialogue_event_v2_legacy_mirror ON dialogue_event_v2
             evidence_pointer: evidence_pointer,
             content_digest_sha256: content_digest_sha256,
             blob_ref: blob_ref
-        },
-        enhancements: {
+        } AS payload,
+        {
             time_window: time_window,
             temporal_pattern_id: temporal_pattern_id,
             causal_links: causal_links,
@@ -110,7 +112,9 @@ DEFINE VIEW dialogue_event_v2_legacy_mirror ON dialogue_event_v2
             processing_latency_ms: processing_latency_ms,
             influence_score: influence_score,
             community_impact: community_impact
-        },
-        metadata: metadata;
+        } AS enhancements,
+        metadata,
+        NONE AS vectors
+    FROM dialogue_event;
 
 COMMIT;

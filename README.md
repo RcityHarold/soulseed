@@ -86,6 +86,7 @@ cd ../soulseed-agi-authz && cargo test
 1. **准备数据库与配置**
    - 启动 SurrealDB（建议 v2.3+），并执行仓库提供的迁移脚本：
      ```bash
+     surreal start  --user root --pass 123456 --bind 127.0.0.1:8686 file://./data/rainbow.db
      surreal sql --conn ws://127.0.0.1:8000 -f migrations/surreal/001_soulseed_init.sql
      surreal sql --conn ws://127.0.0.1:8000 -f migrations/surreal/002_dialogue_event_v2.sql
      ```

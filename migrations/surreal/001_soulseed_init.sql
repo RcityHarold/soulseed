@@ -7,9 +7,9 @@ BEGIN TRANSACTION;
 -- Dialogue Events
 -- =====================
 DEFINE TABLE dialogue_event SCHEMAFULL;
-DEFINE FIELD tenant_id             ON dialogue_event TYPE string ASSERT  != "";
-DEFINE FIELD event_id              ON dialogue_event TYPE string ASSERT  != "";
-DEFINE FIELD session_id            ON dialogue_event TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id             ON dialogue_event TYPE string ASSERT $value != "";
+DEFINE FIELD event_id              ON dialogue_event TYPE string ASSERT $value != "";
+DEFINE FIELD session_id            ON dialogue_event TYPE string ASSERT $value != "";
 DEFINE FIELD subject               ON dialogue_event TYPE object;
 DEFINE FIELD participants          ON dialogue_event TYPE array;
 DEFINE FIELD head                  ON dialogue_event TYPE object;
@@ -54,12 +54,12 @@ DEFINE INDEX idx_dialogue_event_causal
 -- semantic vector search (optional)
 DEFINE INDEX idx_dialogue_event_vector
     ON TABLE dialogue_event FIELDS concept_vector
-    TYPE HNSW DIM 1536 M 16 EF 200;
+    HNSW DIMENSION 1536 M 16 EFC 200;
 
 -- sparse BM25 fallback on textual metadata
 DEFINE INDEX idx_dialogue_event_sparse
     ON TABLE dialogue_event FIELDS metadata
-    TYPE BM25;
+    SEARCH BM25;
 
 -- ensure tenant scoped uniqueness
 DEFINE INDEX idx_dialogue_event_event_uniq
@@ -69,9 +69,9 @@ DEFINE INDEX idx_dialogue_event_event_uniq
 -- Awareness Events
 -- =====================
 DEFINE TABLE awareness_event SCHEMAFULL;
-DEFINE FIELD tenant_id            ON awareness_event TYPE string ASSERT  != "";
-DEFINE FIELD event_id             ON awareness_event TYPE string ASSERT  != "";
-DEFINE FIELD awareness_cycle_id   ON awareness_event TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id            ON awareness_event TYPE string ASSERT $value != "";
+DEFINE FIELD event_id             ON awareness_event TYPE string ASSERT $value != "";
+DEFINE FIELD awareness_cycle_id   ON awareness_event TYPE string ASSERT $value != "";
 DEFINE FIELD event_type           ON awareness_event TYPE string;
 DEFINE FIELD occurred_at_ms       ON awareness_event TYPE number;
 DEFINE FIELD parent_cycle_id      ON awareness_event TYPE option<string>;
@@ -105,9 +105,9 @@ DEFINE INDEX ix_awareness_event_uniq
 -- Context Assembly artefacts
 -- =====================
 DEFINE TABLE context_item SCHEMAFULL;
-DEFINE FIELD tenant_id       ON context_item TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id       ON context_item TYPE string ASSERT $value != "";
 DEFINE FIELD anchor          ON context_item TYPE object;
-DEFINE FIELD context_id      ON context_item TYPE string ASSERT  != "";
+DEFINE FIELD context_id      ON context_item TYPE string ASSERT $value != "";
 DEFINE FIELD partition_hint  ON context_item TYPE option<string>;
 DEFINE FIELD source_event_id ON context_item TYPE string;
 DEFINE FIELD source_message_id ON context_item TYPE option<string>;
@@ -124,8 +124,8 @@ DEFINE INDEX idx_context_item_partition
     ON TABLE context_item FIELDS tenant_id, partition_hint;
 
 DEFINE TABLE context_manifest SCHEMAFULL;
-DEFINE FIELD tenant_id      ON context_manifest TYPE string ASSERT  != "";
-DEFINE FIELD manifest_id    ON context_manifest TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id      ON context_manifest TYPE string ASSERT $value != "";
+DEFINE FIELD manifest_id    ON context_manifest TYPE string ASSERT $value != "";
 DEFINE FIELD anchor         ON context_manifest TYPE object;
 DEFINE FIELD version        ON context_manifest TYPE number;
 DEFINE FIELD manifest_digest ON context_manifest TYPE string;
@@ -143,9 +143,9 @@ DEFINE INDEX idx_context_manifest_digest
 -- ACE Persistence
 -- =====================
 DEFINE TABLE ace_dialogue_event SCHEMAFULL;
-DEFINE FIELD tenant             ON ace_dialogue_event TYPE string ASSERT != "";
-DEFINE FIELD event_id           ON ace_dialogue_event TYPE string ASSERT != "";
-DEFINE FIELD cycle_id           ON ace_dialogue_event TYPE string ASSERT != "";
+DEFINE FIELD tenant             ON ace_dialogue_event TYPE string ASSERT $value != "";
+DEFINE FIELD event_id           ON ace_dialogue_event TYPE string ASSERT $value != "";
+DEFINE FIELD cycle_id           ON ace_dialogue_event TYPE string ASSERT $value != "";
 DEFINE FIELD occurred_at        ON ace_dialogue_event TYPE number;
 DEFINE FIELD lane               ON ace_dialogue_event TYPE string;
 DEFINE FIELD payload            ON ace_dialogue_event TYPE object;
@@ -163,9 +163,9 @@ DEFINE INDEX idx_ace_dialogue_event_created
     ON TABLE ace_dialogue_event FIELDS tenant, created_at;
 
 DEFINE TABLE ace_awareness_event SCHEMAFULL;
-DEFINE FIELD tenant             ON ace_awareness_event TYPE string ASSERT != "";
-DEFINE FIELD event_id           ON ace_awareness_event TYPE string ASSERT != "";
-DEFINE FIELD cycle_id           ON ace_awareness_event TYPE string ASSERT != "";
+DEFINE FIELD tenant             ON ace_awareness_event TYPE string ASSERT $value != "";
+DEFINE FIELD event_id           ON ace_awareness_event TYPE string ASSERT $value != "";
+DEFINE FIELD cycle_id           ON ace_awareness_event TYPE string ASSERT $value != "";
 DEFINE FIELD event_type         ON ace_awareness_event TYPE string;
 DEFINE FIELD occurred_at        ON ace_awareness_event TYPE number;
 DEFINE FIELD parent_cycle_id    ON ace_awareness_event TYPE option<string>;
@@ -186,8 +186,8 @@ DEFINE INDEX idx_ace_awareness_event_type
 -- Outbox & Replay (ACE → Soulbase)
 -- =====================
 DEFINE TABLE outbox_envelope SCHEMAFULL;
-DEFINE FIELD tenant_id    ON outbox_envelope TYPE string ASSERT  != "";
-DEFINE FIELD cycle_id     ON outbox_envelope TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id    ON outbox_envelope TYPE string ASSERT $value != "";
+DEFINE FIELD cycle_id     ON outbox_envelope TYPE string ASSERT $value != "";
 DEFINE FIELD state        ON outbox_envelope TYPE string;
 DEFINE FIELD created_at_ms ON outbox_envelope TYPE number;
 DEFINE FIELD updated_at_ms ON outbox_envelope TYPE number;
@@ -200,7 +200,7 @@ DEFINE INDEX idx_outbox_state
     ON TABLE outbox_envelope FIELDS tenant_id, state;
 
 DEFINE TABLE replay_cursor SCHEMAFULL;
-DEFINE FIELD tenant_id     ON replay_cursor TYPE string ASSERT  != "";
+DEFINE FIELD tenant_id     ON replay_cursor TYPE string ASSERT $value != "";
 DEFINE FIELD stream_kind   ON replay_cursor TYPE string;
 DEFINE FIELD last_event_id ON replay_cursor TYPE string;
 DEFINE FIELD updated_at_ms ON replay_cursor TYPE number;
