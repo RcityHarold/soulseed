@@ -142,13 +142,15 @@ DEFINE INDEX idx_context_manifest_digest
 -- =====================
 -- ACE Persistence
 -- =====================
-DEFINE TABLE ace_dialogue_event SCHEMAFULL;
+-- 注意：使用 SCHEMALESS 以支持灵活的 JSON 对象存储
+-- payload 和 metadata 包含复杂的枚举和嵌套结构，不适合严格的类型定义
+DEFINE TABLE ace_dialogue_event SCHEMALESS;
 DEFINE FIELD tenant             ON ace_dialogue_event TYPE string ASSERT $value != "";
 DEFINE FIELD event_id           ON ace_dialogue_event TYPE string ASSERT $value != "";
 DEFINE FIELD cycle_id           ON ace_dialogue_event TYPE string ASSERT $value != "";
 DEFINE FIELD occurred_at        ON ace_dialogue_event TYPE number;
 DEFINE FIELD lane               ON ace_dialogue_event TYPE string;
-DEFINE FIELD payload            ON ace_dialogue_event TYPE object;
+-- payload 和 metadata 字段不定义类型，允许任意 JSON 结构
 DEFINE FIELD manifest_digest    ON ace_dialogue_event TYPE option<string>;
 DEFINE FIELD explain_fingerprint ON ace_dialogue_event TYPE option<string>;
 DEFINE FIELD created_at         ON ace_dialogue_event TYPE number;
@@ -162,7 +164,7 @@ DEFINE INDEX idx_ace_dialogue_event_cycle
 DEFINE INDEX idx_ace_dialogue_event_created
     ON TABLE ace_dialogue_event FIELDS tenant, created_at;
 
-DEFINE TABLE ace_awareness_event SCHEMAFULL;
+DEFINE TABLE ace_awareness_event SCHEMALESS;
 DEFINE FIELD tenant             ON ace_awareness_event TYPE string ASSERT $value != "";
 DEFINE FIELD event_id           ON ace_awareness_event TYPE string ASSERT $value != "";
 DEFINE FIELD cycle_id           ON ace_awareness_event TYPE string ASSERT $value != "";
@@ -170,7 +172,7 @@ DEFINE FIELD event_type         ON ace_awareness_event TYPE string;
 DEFINE FIELD occurred_at        ON ace_awareness_event TYPE number;
 DEFINE FIELD parent_cycle_id    ON ace_awareness_event TYPE option<string>;
 DEFINE FIELD collab_scope_id    ON ace_awareness_event TYPE option<string>;
-DEFINE FIELD payload            ON ace_awareness_event TYPE object;
+-- payload 字段不定义类型，允许任意 JSON 结构
 DEFINE FIELD created_at         ON ace_awareness_event TYPE number;
 
 DEFINE INDEX idx_ace_awareness_event_lookup
@@ -181,6 +183,19 @@ DEFINE INDEX idx_ace_awareness_event_cycle
 
 DEFINE INDEX idx_ace_awareness_event_type
     ON TABLE ace_awareness_event FIELDS tenant, event_type;
+
+DEFINE TABLE ace_cycle_snapshot SCHEMALESS;
+DEFINE FIELD tenant             ON ace_cycle_snapshot TYPE string ASSERT $value != "";
+DEFINE FIELD cycle_id           ON ace_cycle_snapshot TYPE string ASSERT $value != "";
+-- snapshot 字段不定义类型，允许任意 JSON 结构
+DEFINE FIELD created_at         ON ace_cycle_snapshot TYPE number;
+DEFINE FIELD updated_at         ON ace_cycle_snapshot TYPE number;
+
+DEFINE INDEX idx_ace_cycle_snapshot_lookup
+    ON TABLE ace_cycle_snapshot FIELDS tenant, cycle_id UNIQUE;
+
+DEFINE INDEX idx_ace_cycle_snapshot_created
+    ON TABLE ace_cycle_snapshot FIELDS tenant, created_at;
 
 -- =====================
 -- Outbox & Replay (ACE → Soulbase)

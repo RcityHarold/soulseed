@@ -20,7 +20,7 @@ event-v2 = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-time = { version = "0.3", features = ["serde", "wasm-bindgen"] }
+time = { version = "0.3", features = ["serde", "serde-well-known", "wasm-bindgen"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
 thiserror = "1"
 semver = { version = "1", features = ["serde"] }

@@ -33,6 +33,7 @@ use soulseed_agi_ace::errors::AceError;
 use soulseed_agi_ace::hitl::{HitlInjection, HitlPriority, HitlQueueConfig, HitlService};
 use soulseed_agi_ace::metrics::NoopMetrics;
 use soulseed_agi_ace::outbox::OutboxService;
+use soulseed_agi_ace::persistence::AcePersistence;
 use soulseed_agi_ace::runtime::{AceService, TriggerComposer, load_surreal_dotenv_settings};
 use soulseed_agi_ace::scheduler::{CycleScheduler, SchedulerConfig};
 use soulseed_agi_ace::types::{CycleSchedule, OutboxMessage, SyncPointInput};
@@ -47,7 +48,7 @@ use tokio::time::sleep;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
-#[cfg(feature = "outbox-redis")]
+#[cfg(any(feature = "outbox-redis", feature = "persistence-surreal"))]
 use sb_storage::surreal::config::{SurrealConfig, SurrealCredentials, SurrealProtocol};
 #[cfg(feature = "outbox-redis")]
 use sb_tx::config::TxConfig;
@@ -65,6 +66,7 @@ struct AppState {
     service: Arc<Mutex<AceService<'static>>>,
     outbox: OutboxService,
     cycles: Arc<Mutex<HashMap<u64, CycleSnapshot>>>,
+    persistence: Arc<dyn AcePersistence>,
 }
 
 #[derive(Serialize)]
@@ -79,14 +81,14 @@ struct CycleResponse {
     manifest_digest: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CycleOutcomeSummary {
     cycle_id: u64,
     status: String,
     manifest_digest: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct CycleSnapshot {
     schedule: CycleSchedule,
     sync_point: SyncPointInput,
@@ -158,10 +160,14 @@ async fn main() -> Result<(), AppError> {
     let engine = build_engine(&outbox);
     let service = AceService::new(engine)?;
 
+    // 获取 persistence 引用用于从数据库加载快照（异步初始化）
+    let persistence = init_persistence_for_api().await?;
+
     let state = AppState {
         service: Arc::new(Mutex::new(service)),
         outbox: outbox_handle,
         cycles: cycles.clone(),
+        persistence,
     };
 
     let bind_addr = std::env::var("ACE_SERVICE_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -245,10 +251,24 @@ async fn trigger_dialogue(
         outcomes: outcome_summaries.clone(),
         outbox: outbox_messages.clone(),
     };
+
+    // 保存到内存缓存
     app.cycles
         .lock()
         .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
-        .insert(schedule.cycle_id.as_u64(), snapshot);
+        .insert(schedule.cycle_id.as_u64(), snapshot.clone());
+
+    // 持久化到数据库
+    let snapshot_value = serde_json::to_value(&snapshot)
+        .map_err(|e| AppError::Service(format!("serialize snapshot failed: {e}")))?;
+    if let Err(e) = app.persistence.persist_cycle_snapshot(
+        schedule.anchor.tenant_id,
+        schedule.cycle_id,
+        &snapshot_value,
+    ) {
+        // 持久化失败只记录警告，不影响请求
+        tracing::warn!("persist cycle snapshot failed: {}", e);
+    }
 
     Ok(Json(CycleResponse {
         cycle_id: schedule.cycle_id.as_u64(),
@@ -299,16 +319,31 @@ async fn post_injection(
     let outbox_messages = app.outbox.peek(existing.schedule.anchor.tenant_id);
 
     let updated = CycleSnapshot {
-        schedule: existing.schedule,
+        schedule: existing.schedule.clone(),
         sync_point: sync_point.clone(),
         outcomes: outcome_summaries,
         outbox: outbox_messages,
     };
 
+    // 保存到内存缓存
     app.cycles
         .lock()
         .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
         .insert(req.cycle_id, updated.clone());
+
+    // 持久化到数据库
+    let snapshot_value = serde_json::to_value(&updated)
+        .map_err(|e| AppError::Service(format!("serialize snapshot failed: {e}")))?;
+    use soulseed_agi_core_models::AwarenessCycleId;
+    let cycle_id_typed = AwarenessCycleId::from_raw(req.cycle_id)
+        .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
+    if let Err(e) = app.persistence.persist_cycle_snapshot(
+        existing.schedule.anchor.tenant_id,
+        cycle_id_typed,
+        &snapshot_value,
+    ) {
+        tracing::warn!("persist cycle snapshot failed: {}", e);
+    }
 
     Ok(Json(updated))
 }
@@ -317,30 +352,77 @@ async fn get_cycle(
     State(app): State<AppState>,
     Path(cycle_id): Path<u64>,
 ) -> Result<Json<CycleSnapshot>, AppError> {
+    // 首先从内存缓存查找
     let guard = app
         .cycles
         .lock()
         .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?;
-    let snapshot = guard
-        .get(&cycle_id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("cycle {cycle_id} not found")))?;
-    Ok(Json(snapshot))
+    if let Some(snapshot) = guard.get(&cycle_id).cloned() {
+        return Ok(Json(snapshot));
+    }
+    drop(guard);
+
+    // 内存中没有，尝试从数据库加载
+    use soulseed_agi_core_models::{AwarenessCycleId, TenantId};
+
+    // 这里假设使用租户 ID 1，实际应该从请求头或其他地方获取
+    let tenant_id = TenantId::from_raw_unchecked(1);
+    let cycle_id_typed = AwarenessCycleId::from_raw(cycle_id)
+        .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
+
+    match app.persistence.load_cycle_snapshot(tenant_id, cycle_id_typed)? {
+        Some(snapshot_value) => {
+            let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
+                .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
+
+            // 将加载的快照放入缓存
+            app.cycles
+                .lock()
+                .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
+                .insert(cycle_id, snapshot.clone());
+
+            Ok(Json(snapshot))
+        }
+        None => Err(AppError::NotFound(format!("cycle {cycle_id} not found"))),
+    }
 }
 
 async fn get_cycle_outbox(
     State(app): State<AppState>,
     Path(cycle_id): Path<u64>,
 ) -> Result<Json<Vec<OutboxMessage>>, AppError> {
+    // 复用 get_cycle 的逻辑，先查缓存再查数据库
     let guard = app
         .cycles
         .lock()
         .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?;
-    let snapshot = guard
-        .get(&cycle_id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("cycle {cycle_id} not found")))?;
-    Ok(Json(snapshot.outbox))
+    if let Some(snapshot) = guard.get(&cycle_id).cloned() {
+        return Ok(Json(snapshot.outbox));
+    }
+    drop(guard);
+
+    // 内存中没有，尝试从数据库加载
+    use soulseed_agi_core_models::{AwarenessCycleId, TenantId};
+
+    let tenant_id = TenantId::from_raw_unchecked(1);
+    let cycle_id_typed = AwarenessCycleId::from_raw(cycle_id)
+        .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
+
+    match app.persistence.load_cycle_snapshot(tenant_id, cycle_id_typed)? {
+        Some(snapshot_value) => {
+            let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
+                .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
+
+            // 将加载的快照放入缓存
+            app.cycles
+                .lock()
+                .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
+                .insert(cycle_id, snapshot.clone());
+
+            Ok(Json(snapshot.outbox))
+        }
+        None => Err(AppError::NotFound(format!("cycle {cycle_id} not found"))),
+    }
 }
 
 async fn stream_cycle(
@@ -416,7 +498,10 @@ async fn shutdown_signal() {
 }
 
 fn build_engine(outbox: &OutboxService) -> AceEngine<'static> {
-    let scheduler = Box::leak(Box::new(CycleScheduler::new(SchedulerConfig::default())));
+    let scheduler = Box::leak(Box::new(CycleScheduler::new(SchedulerConfig {
+        allow_parallel_lanes: true,  // 启用并行车道支持，允许多个 Clarify 周期同时运行
+        ..SchedulerConfig::default()
+    })));
     let budget_mgr = Box::leak(Box::new(BudgetManager::default()));
     let ca_backend = Arc::new(CaServiceDefault::default());
     let aggregator = Box::leak(Box::new(SyncPointAggregator::new(ca_backend)));
@@ -484,7 +569,7 @@ fn build_outbox_service(
     Ok(OutboxService::default())
 }
 
-#[cfg(feature = "outbox-redis")]
+#[cfg(any(feature = "outbox-redis", feature = "persistence-surreal"))]
 fn surreal_config_from_settings(settings: &HashMap<String, String>) -> SurrealConfig {
     let mut config = SurrealConfig::default();
 
@@ -528,4 +613,63 @@ fn surreal_config_from_settings(settings: &HashMap<String, String>) -> SurrealCo
         config = config.with_credentials(SurrealCredentials::new(username, password));
     }
     config
+}
+
+// 初始化持久化层（用于 API 查询）
+#[cfg(feature = "persistence-surreal")]
+async fn init_persistence_for_api() -> Result<Arc<dyn AcePersistence>, AppError> {
+    use soulseed_agi_ace::persistence::surreal::{SurrealPersistence, SurrealPersistenceConfig};
+
+    let settings = load_surreal_dotenv_settings()
+        .map_err(|e| AppError::Service(format!("load settings failed: {e}")))?;
+
+    if settings
+        .get("ACE_PERSISTENCE_DISABLED")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return Ok(Arc::new(NoopPersistence));
+    }
+
+    let config = surreal_config_from_settings(&settings);
+    let persistence_config = SurrealPersistenceConfig {
+        datastore: config,
+    };
+
+    let persistence = SurrealPersistence::new_async(persistence_config)
+        .await
+        .map_err(|e| AppError::Service(format!("init persistence failed: {e}")))?;
+
+    Ok(Arc::new(persistence))
+}
+
+#[cfg(not(feature = "persistence-surreal"))]
+async fn init_persistence_for_api() -> Result<Arc<dyn AcePersistence>, AppError> {
+    Ok(Arc::new(NoopPersistence))
+}
+
+// Noop persistence implementation
+struct NoopPersistence;
+
+impl AcePersistence for NoopPersistence {
+    fn persist_cycle(&self, _emission: &soulseed_agi_ace::types::CycleEmission) -> Result<(), AceError> {
+        Ok(())
+    }
+
+    fn persist_cycle_snapshot(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+        _snapshot: &Value,
+    ) -> Result<(), AceError> {
+        Ok(())
+    }
+
+    fn load_cycle_snapshot(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+    ) -> Result<Option<Value>, AceError> {
+        Ok(None)
+    }
 }

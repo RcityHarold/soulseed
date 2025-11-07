@@ -705,6 +705,23 @@ impl AcePersistence for NoopPersistence {
     fn persist_cycle(&self, _emission: &CycleEmission) -> Result<(), AceError> {
         Ok(())
     }
+
+    fn persist_cycle_snapshot(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+        _snapshot: &serde_json::Value,
+    ) -> Result<(), AceError> {
+        Ok(())
+    }
+
+    fn load_cycle_snapshot(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+    ) -> Result<Option<serde_json::Value>, AceError> {
+        Ok(None)
+    }
 }
 
 pub struct AceService<'a> {
@@ -740,9 +757,22 @@ impl<'a> AceService<'a> {
         request: CycleRequest,
     ) -> Result<(CycleSchedule, SyncPointInput), AceError> {
         let outcome = self.engine.schedule_cycle(request)?;
-        let schedule = outcome
-            .cycle
-            .ok_or_else(|| AceError::InvalidRequest("cycle_rejected".into()))?;
+        let schedule = match outcome.cycle {
+            Some(cycle) => cycle,
+            None => {
+                let reason = outcome
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into());
+                tracing::warn!(
+                    reason = %reason,
+                    "cycle rejected by scheduler"
+                );
+                return Err(AceError::InvalidRequest(format!(
+                    "cycle_rejected:{reason}"
+                )));
+            }
+        };
         let prepared = self.auto_driver.prepare(&schedule)?;
         Ok((schedule, prepared))
     }

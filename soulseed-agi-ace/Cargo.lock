@@ -3638,6 +3638,7 @@ dependencies = [
 name = "soulseed-agi-core-models"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "semver",
  "serde",
  "serde_json",
