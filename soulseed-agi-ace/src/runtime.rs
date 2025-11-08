@@ -722,6 +722,14 @@ impl AcePersistence for NoopPersistence {
     ) -> Result<Option<serde_json::Value>, AceError> {
         Ok(None)
     }
+
+    fn list_awareness_events(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _limit: usize,
+    ) -> Result<Vec<soulseed_agi_core_models::awareness::AwarenessEvent>, AceError> {
+        Ok(Vec::new())
+    }
 }
 
 pub struct AceService<'a> {
@@ -760,17 +768,12 @@ impl<'a> AceService<'a> {
         let schedule = match outcome.cycle {
             Some(cycle) => cycle,
             None => {
-                let reason = outcome
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into());
+                let reason = outcome.reason.clone().unwrap_or_else(|| "unknown".into());
                 tracing::warn!(
                     reason = %reason,
                     "cycle rejected by scheduler"
                 );
-                return Err(AceError::InvalidRequest(format!(
-                    "cycle_rejected:{reason}"
-                )));
+                return Err(AceError::InvalidRequest(format!("cycle_rejected:{reason}")));
             }
         };
         let prepared = self.auto_driver.prepare(&schedule)?;

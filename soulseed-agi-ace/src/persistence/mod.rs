@@ -1,7 +1,7 @@
 use crate::errors::AceError;
 use crate::types::CycleEmission;
-use soulseed_agi_core_models::{AwarenessCycleId, TenantId};
 use serde_json::Value;
+use soulseed_agi_core_models::{AwarenessCycleId, TenantId, awareness::AwarenessEvent};
 
 pub trait AcePersistence: Send + Sync {
     fn persist_cycle(&self, emission: &CycleEmission) -> Result<(), AceError>;
@@ -20,6 +20,12 @@ pub trait AcePersistence: Send + Sync {
         tenant_id: TenantId,
         cycle_id: AwarenessCycleId,
     ) -> Result<Option<Value>, AceError>;
+
+    fn list_awareness_events(
+        &self,
+        tenant_id: TenantId,
+        limit: usize,
+    ) -> Result<Vec<AwarenessEvent>, AceError>;
 }
 
 #[cfg(feature = "persistence-surreal")]

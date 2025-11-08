@@ -3,13 +3,13 @@ use std::{
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{
         HeaderName, Method, StatusCode,
         header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
@@ -37,7 +37,7 @@ use soulseed_agi_ace::persistence::AcePersistence;
 use soulseed_agi_ace::runtime::{AceService, TriggerComposer, load_surreal_dotenv_settings};
 use soulseed_agi_ace::scheduler::{CycleScheduler, SchedulerConfig};
 use soulseed_agi_ace::types::{CycleSchedule, OutboxMessage, SyncPointInput};
-use soulseed_agi_core_models::DialogueEvent;
+use soulseed_agi_core_models::{DialogueEvent, TenantId, awareness::AwarenessEvent};
 use soulseed_agi_dfr::filter::CandidateFilter;
 use soulseed_agi_dfr::hardgate::HardGate;
 use soulseed_agi_dfr::scorer::CandidateScorer;
@@ -56,8 +56,6 @@ use sb_tx::config::TxConfig;
 use sb_tx::transport::redis::RedisTransportConfig;
 #[cfg(feature = "outbox-redis")]
 use soulseed_agi_ace::outbox::redis::{RedisForwarderConfig, RedisOutboxForwarder};
-#[cfg(feature = "outbox-redis")]
-use soulseed_agi_core_models::TenantId;
 #[cfg(feature = "outbox-redis")]
 use std::sync::Arc as StdArc;
 
@@ -81,6 +79,37 @@ struct CycleResponse {
     manifest_digest: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ApiEnvelope<T> {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ApiErrorBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ApiErrorBody {
+    code: String,
+    message: String,
+}
+
+impl<T> ApiEnvelope<T> {
+    fn success(data: T, duration: Duration) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+            trace_id: None,
+            duration_ms: Some(duration.as_millis() as u64),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CycleOutcomeSummary {
     cycle_id: u64,
@@ -102,6 +131,17 @@ struct InjectionRequest {
     priority: String,
     author_role: String,
     payload: Value,
+}
+
+#[derive(Deserialize, Default)]
+struct AwarenessEventsQuery {
+    limit: Option<usize>,
+}
+
+impl AwarenessEventsQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(200).clamp(1, 500)
+    }
 }
 
 #[derive(Debug)]
@@ -193,6 +233,10 @@ async fn main() -> Result<(), AppError> {
         .route("/api/v1/ace/cycles/:cycle_id", get(get_cycle))
         .route("/api/v1/ace/cycles/:cycle_id/outbox", get(get_cycle_outbox))
         .route("/api/v1/ace/cycles/:cycle_id/stream", get(stream_cycle))
+        .route(
+            "/api/v1/tenants/:tenant_id/awareness/events",
+            get(list_awareness_events),
+        )
         .layer(cors)
         .with_state(state);
 
@@ -275,6 +319,19 @@ async fn trigger_dialogue(
         status: latest_status,
         manifest_digest: latest_manifest,
     }))
+}
+
+async fn list_awareness_events(
+    State(app): State<AppState>,
+    Path(tenant_id): Path<u64>,
+    Query(query): Query<AwarenessEventsQuery>,
+) -> Result<Json<ApiEnvelope<Vec<AwarenessEvent>>>, AppError> {
+    let tenant = TenantId::from_raw(tenant_id)
+        .map_err(|err| AppError::Service(format!("invalid tenant_id: {err}")))?;
+    let limit = query.limit();
+    let start = Instant::now();
+    let events = app.persistence.list_awareness_events(tenant, limit)?;
+    Ok(Json(ApiEnvelope::success(events, start.elapsed())))
 }
 
 async fn post_injection(
@@ -370,7 +427,10 @@ async fn get_cycle(
     let cycle_id_typed = AwarenessCycleId::from_raw(cycle_id)
         .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
 
-    match app.persistence.load_cycle_snapshot(tenant_id, cycle_id_typed)? {
+    match app
+        .persistence
+        .load_cycle_snapshot(tenant_id, cycle_id_typed)?
+    {
         Some(snapshot_value) => {
             let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
                 .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
@@ -408,7 +468,10 @@ async fn get_cycle_outbox(
     let cycle_id_typed = AwarenessCycleId::from_raw(cycle_id)
         .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
 
-    match app.persistence.load_cycle_snapshot(tenant_id, cycle_id_typed)? {
+    match app
+        .persistence
+        .load_cycle_snapshot(tenant_id, cycle_id_typed)?
+    {
         Some(snapshot_value) => {
             let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
                 .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
@@ -499,7 +562,7 @@ async fn shutdown_signal() {
 
 fn build_engine(outbox: &OutboxService) -> AceEngine<'static> {
     let scheduler = Box::leak(Box::new(CycleScheduler::new(SchedulerConfig {
-        allow_parallel_lanes: true,  // 启用并行车道支持，允许多个 Clarify 周期同时运行
+        allow_parallel_lanes: true, // 启用并行车道支持，允许多个 Clarify 周期同时运行
         ..SchedulerConfig::default()
     })));
     let budget_mgr = Box::leak(Box::new(BudgetManager::default()));
@@ -632,9 +695,7 @@ async fn init_persistence_for_api() -> Result<Arc<dyn AcePersistence>, AppError>
     }
 
     let config = surreal_config_from_settings(&settings);
-    let persistence_config = SurrealPersistenceConfig {
-        datastore: config,
-    };
+    let persistence_config = SurrealPersistenceConfig { datastore: config };
 
     let persistence = SurrealPersistence::new_async(persistence_config)
         .await
@@ -652,7 +713,10 @@ async fn init_persistence_for_api() -> Result<Arc<dyn AcePersistence>, AppError>
 struct NoopPersistence;
 
 impl AcePersistence for NoopPersistence {
-    fn persist_cycle(&self, _emission: &soulseed_agi_ace::types::CycleEmission) -> Result<(), AceError> {
+    fn persist_cycle(
+        &self,
+        _emission: &soulseed_agi_ace::types::CycleEmission,
+    ) -> Result<(), AceError> {
         Ok(())
     }
 
@@ -671,5 +735,13 @@ impl AcePersistence for NoopPersistence {
         _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
     ) -> Result<Option<Value>, AceError> {
         Ok(None)
+    }
+
+    fn list_awareness_events(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _limit: usize,
+    ) -> Result<Vec<AwarenessEvent>, AceError> {
+        Ok(Vec::new())
     }
 }

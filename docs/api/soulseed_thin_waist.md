@@ -49,6 +49,7 @@
 | Preview | GET /api/v1/ace/cycles/{cycle_id} | 返回 `CycleSchedule`、`SyncPointInput`、Outbox 摘要等快照 |
 | Preview | GET /api/v1/ace/cycles/{cycle_id}/outbox | 拉取待发送的 Final / DeltaPatch / LateReceipt |
 | Preview | GET /api/v1/ace/cycles/{cycle_id}/stream | SSE 订阅周期状态（pending/complete/timeout） |
+| Preview | GET /api/v1/tenants/{tenant_id}/awareness/events | 按时间倒序列出近期 Awareness 事件 |
 | Preview | POST /api/v1/ace/injections | 追加 HITL 注入，驱动后续 Clarify/协作流程 |
 | TODO（规划中） | POST /api/v1/ace/cycles | 直接提交 `CycleRequest`，适合内部编排器 |
 
@@ -138,7 +139,37 @@
 - `event: complete`：发送完整 `CycleSnapshot` JSON，并结束流。
 - `event: timeout`：等待超时（默认 60 次轮询）后推送超时事件。
 
-### 4.6 POST /api/v1/ace/injections
+### 4.6 GET /api/v1/tenants/{tenant_id}/awareness/events
+列出指定租户最近的 Awareness/Inference/SyncPoint 事件，默认返回最新 200 条，支持 `?limit=`（1~500）。
+
+请求示例：`GET /api/v1/tenants/1/awareness/events?limit=100`
+
+响应示例：
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "tenant_id": 1,
+      "event_id": 245040459783602176,
+      "event_type": "awareness_cycle_started",
+      "awareness_cycle_id": 245040459783602176,
+      "occurred_at_ms": 1762486198000,
+      "payload": {"lane": "Clarify"}
+    }
+  ],
+  "error": null,
+  "trace_id": null,
+  "duration_ms": 2
+}
+```
+
+> **Notes**
+> - 数据来源于 `ace_awareness_event` 表，包含 AC/IC/SyncPoint 的完整 `AwarenessEvent` 结构。
+> - `limit` 建议控制在 500 条以内，若未提供则默认返回 200 条。
+> - 若租户不存在或服务端未开启持久化，会返回 4xx/5xx，并由 `error.code` 给出诊断。
+
+### 4.7 POST /api/v1/ace/injections
 向指定周期追加 HITL 注入，用于覆盖 Clarify 或人工补充指令。
 
 请求示例：

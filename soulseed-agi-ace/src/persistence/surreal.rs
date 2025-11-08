@@ -1,15 +1,15 @@
-﻿#![cfg(feature = "persistence-surreal")]
+#![cfg(feature = "persistence-surreal")]
 
 use std::future::Future;
 use std::sync::Arc;
 
-use sb_storage::model::{Entity, make_record_id};
+use sb_storage::model::{Entity, Sort, make_record_id};
 use sb_storage::prelude::Repository;
 use sb_storage::surreal::config::SurrealConfig;
 use sb_storage::surreal::datastore::SurrealDatastore;
 use sb_types::prelude::TenantId as SbTenantId;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::errors::AceError;
 use crate::persistence::AcePersistence;
@@ -64,7 +64,8 @@ struct AwarenessEventDoc {
     pub parent_cycle_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collab_scope_id: Option<String>,
-    pub payload: Value,
+    // 重命名为 event_data 避免与 AwarenessEvent.payload 字段冲突
+    pub event_data: Value,
     pub created_at: i64,
 }
 
@@ -83,7 +84,8 @@ struct CycleSnapshotDoc {
     pub id: String,
     pub tenant: String,
     pub cycle_id: String,
-    pub snapshot: Value,
+    // 改名为 snapshot_data 避免与 CycleSnapshot 中可能存在的 snapshot 字段冲突
+    pub snapshot_data: Value,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -256,9 +258,12 @@ impl SurrealPersistence {
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_owned()))
             .unwrap_or_else(|| format!("{:?}", event.event_type));
-        let payload = serde_json::to_value(event).map_err(|err| {
+
+        // 直接序列化整个 AwarenessEvent
+        let event_data = serde_json::to_value(event).map_err(|err| {
             AceError::Persistence(format!("serialize awareness event failed: {err}"))
         })?;
+
         Ok(AwarenessEventDoc {
             id: make_record_id(
                 AwarenessEventDoc::TABLE,
@@ -272,7 +277,7 @@ impl SurrealPersistence {
             occurred_at: event.occurred_at_ms,
             parent_cycle_id: event.parent_cycle_id.map(|id| id.as_u64().to_string()),
             collab_scope_id: event.collab_scope_id.clone(),
-            payload,
+            event_data,
             created_at: current_millis(),
         })
     }
@@ -301,8 +306,9 @@ impl AcePersistence for SurrealPersistence {
             let mut patch = serde_json::to_value(&dialogue).map_err(|err| {
                 AceError::Persistence(format!("serialize dialogue patch failed: {err}"))
             })?;
-            let _patch_json = serde_json::to_string(&patch)
-                .map_err(|err| AceError::Persistence(format!("dialogue patch stringify failed: {err}")))?;
+            let _patch_json = serde_json::to_string(&patch).map_err(|err| {
+                AceError::Persistence(format!("dialogue patch stringify failed: {err}"))
+            })?;
             if let serde_json::Value::Object(ref mut map) = patch {
                 map.remove("id");
             }
@@ -314,10 +320,7 @@ impl AcePersistence for SurrealPersistence {
                     let err_obj = err.into_inner();
                     let public = err_obj.to_public();
                     let audit = err_obj.to_audit();
-                    let detail = audit
-                        .message_dev
-                        .unwrap_or(&public.message)
-                        .to_string();
+                    let detail = audit.message_dev.unwrap_or(&public.message).to_string();
                     tracing::error!(
                         code = %public.code,
                         message = %public.message,
@@ -333,11 +336,43 @@ impl AcePersistence for SurrealPersistence {
                 })?;
 
             for doc in awareness {
+                // 添加调试日志：检查 event_data 是否为空
+                tracing::debug!(
+                    "Building awareness doc: event_id={}, event_type={}, event_data_is_null={}, event_data_size={}",
+                    doc.event_id,
+                    doc.event_type,
+                    doc.event_data.is_null(),
+                    serde_json::to_string(&doc.event_data).map(|s| s.len()).unwrap_or(0)
+                );
+
                 let mut patch = serde_json::to_value(&doc).map_err(|err| {
                     AceError::Persistence(format!("serialize awareness patch failed: {err}"))
                 })?;
-                let _patch_json = serde_json::to_string(&patch)
-                    .map_err(|err| AceError::Persistence(format!("awareness patch stringify failed: {err}")))?;
+
+                // 添加调试日志：检查序列化后的 patch
+                if let Some(event_data_field) = patch.get("event_data") {
+                    tracing::debug!(
+                        "Serialized patch for {}: event_data_is_null={}, event_data_is_object={}, event_data_keys={:?}",
+                        doc.event_id,
+                        event_data_field.is_null(),
+                        event_data_field.is_object(),
+                        event_data_field.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                    );
+                } else {
+                    tracing::warn!("Serialized patch for {} has no event_data field!", doc.event_id);
+                }
+
+                let patch_json = serde_json::to_string(&patch).map_err(|err| {
+                    AceError::Persistence(format!("awareness patch stringify failed: {err}"))
+                })?;
+
+                tracing::debug!(
+                    "Patch JSON for {}: length={}, preview={}",
+                    doc.event_id,
+                    patch_json.len(),
+                    &patch_json[..patch_json.len().min(200)]
+                );
+
                 if let serde_json::Value::Object(ref mut map) = patch {
                     map.remove("id");
                 }
@@ -349,10 +384,7 @@ impl AcePersistence for SurrealPersistence {
                         let err_obj = err.into_inner();
                         let public = err_obj.to_public();
                         let audit = err_obj.to_audit();
-                        let detail = audit
-                            .message_dev
-                            .unwrap_or(&public.message)
-                            .to_string();
+                        let detail = audit.message_dev.unwrap_or(&public.message).to_string();
                         tracing::error!(
                             code = %public.code,
                             message = %public.message,
@@ -366,9 +398,56 @@ impl AcePersistence for SurrealPersistence {
                         );
                         AceError::Persistence(format!("persist awareness event failed: {}", detail))
                     })?;
+
+                tracing::info!(
+                    "Successfully persisted awareness event: tenant={}, event_id={}, event_type={}",
+                    doc.tenant,
+                    doc.event_id,
+                    doc.event_type
+                );
             }
 
             Ok::<_, AceError>(())
+        })
+    }
+
+    fn list_awareness_events(
+        &self,
+        tenant_id: soulseed_agi_core_models::TenantId,
+        limit: usize,
+    ) -> Result<Vec<AwarenessEvent>, AceError> {
+        let limit = limit.clamp(1, 500);
+        let sb_tenant = tenant_to_sb(tenant_id);
+        let repo = self.awareness_repo.clone();
+        self.block_on(async move {
+            let page = repo
+                .select(
+                    &sb_tenant,
+                    serde_json::Value::Null,
+                    Some(vec![Sort::descending("occurred_at")]),
+                    limit,
+                    None,
+                )
+                .await
+                .map_err(|err| {
+                    AceError::Persistence(format!("list awareness events failed: {err}"))
+                })?;
+            let mut events = Vec::with_capacity(page.items.len());
+            for doc in page.items {
+                match serde_json::from_value::<AwarenessEvent>(doc.event_data.clone()) {
+                    Ok(event) => events.push(event),
+                    Err(err) => {
+                        tracing::warn!(
+                            tenant = %doc.tenant,
+                            event_id = %doc.event_id,
+                            error = %err,
+                            "skip awareness event row due to deserialize failure"
+                        );
+                        continue;
+                    }
+                }
+            }
+            Ok(events)
         })
     }
 
@@ -392,7 +471,7 @@ impl AcePersistence for SurrealPersistence {
             ),
             tenant: tenant.clone(),
             cycle_id: cycle_id_str.clone(),
-            snapshot: snapshot.clone(),
+            snapshot_data: snapshot.clone(),
             created_at: now,
             updated_at: now,
         };
@@ -404,8 +483,9 @@ impl AcePersistence for SurrealPersistence {
             let mut patch = serde_json::to_value(&doc).map_err(|err| {
                 AceError::Persistence(format!("serialize snapshot patch failed: {err}"))
             })?;
-            let _patch_json = serde_json::to_string(&patch)
-                .map_err(|err| AceError::Persistence(format!("snapshot patch stringify failed: {err}")))?;
+            let _patch_json = serde_json::to_string(&patch).map_err(|err| {
+                AceError::Persistence(format!("snapshot patch stringify failed: {err}"))
+            })?;
             if let serde_json::Value::Object(ref mut map) = patch {
                 map.remove("id");
             }
@@ -417,10 +497,7 @@ impl AcePersistence for SurrealPersistence {
                     let err_obj = err.into_inner();
                     let public = err_obj.to_public();
                     let audit = err_obj.to_audit();
-                    let detail = audit
-                        .message_dev
-                        .unwrap_or(&public.message)
-                        .to_string();
+                    let detail = audit.message_dev.unwrap_or(&public.message).to_string();
                     tracing::error!(
                         code = %public.code,
                         message = %public.message,
@@ -458,7 +535,7 @@ impl AcePersistence for SurrealPersistence {
                     AceError::Persistence(format!("load cycle snapshot failed: {err}"))
                 })?;
 
-            Ok(result.map(|doc| doc.snapshot))
+            Ok(result.map(|doc| doc.snapshot_data))
         })
     }
 }

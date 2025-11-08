@@ -164,6 +164,8 @@ DEFINE INDEX idx_ace_dialogue_event_cycle
 DEFINE INDEX idx_ace_dialogue_event_created
     ON TABLE ace_dialogue_event FIELDS tenant, created_at;
 
+-- ACE Awareness Events 表
+-- SCHEMALESS 模式允许动态字段如 event_data，payload 等
 DEFINE TABLE ace_awareness_event SCHEMALESS;
 DEFINE FIELD tenant             ON ace_awareness_event TYPE string ASSERT $value != "";
 DEFINE FIELD event_id           ON ace_awareness_event TYPE string ASSERT $value != "";
@@ -172,7 +174,7 @@ DEFINE FIELD event_type         ON ace_awareness_event TYPE string;
 DEFINE FIELD occurred_at        ON ace_awareness_event TYPE number;
 DEFINE FIELD parent_cycle_id    ON ace_awareness_event TYPE option<string>;
 DEFINE FIELD collab_scope_id    ON ace_awareness_event TYPE option<string>;
--- payload 字段不定义类型，允许任意 JSON 结构
+-- event_data 字段在代码中动态填充，不需要在 SCHEMALESS 表中显式定义
 DEFINE FIELD created_at         ON ace_awareness_event TYPE number;
 
 DEFINE INDEX idx_ace_awareness_event_lookup
@@ -185,11 +187,11 @@ DEFINE INDEX idx_ace_awareness_event_type
     ON TABLE ace_awareness_event FIELDS tenant, event_type;
 
 DEFINE TABLE ace_cycle_snapshot SCHEMALESS;
-DEFINE FIELD tenant             ON ace_cycle_snapshot TYPE string ASSERT $value != "";
-DEFINE FIELD cycle_id           ON ace_cycle_snapshot TYPE string ASSERT $value != "";
--- snapshot 字段不定义类型，允许任意 JSON 结构
-DEFINE FIELD created_at         ON ace_cycle_snapshot TYPE number;
-DEFINE FIELD updated_at         ON ace_cycle_snapshot TYPE number;
+DEFINE FIELD tenant ON ace_cycle_snapshot TYPE string ASSERT $value != "";
+DEFINE FIELD cycle_id ON ace_cycle_snapshot TYPE string ASSERT $value != "";
+DEFINE FIELD snapshot_data ON ace_cycle_snapshot FLEXIBLE;
+DEFINE FIELD created_at ON ace_cycle_snapshot TYPE number;
+DEFINE FIELD updated_at ON ace_cycle_snapshot TYPE number;
 
 DEFINE INDEX idx_ace_cycle_snapshot_lookup
     ON TABLE ace_cycle_snapshot FIELDS tenant, cycle_id UNIQUE;
