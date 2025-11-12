@@ -53,6 +53,7 @@ pub(crate) struct CallbackRegistry {
 impl CallbackRegistry {
     fn enqueue(&self, input: SyncPointInput) {
         let key = input.cycle_id.as_u64();
+        tracing::info!("CallbackRegistry::enqueue cycle_id={} (u64={})", input.cycle_id, key);
         let (lock, cvar) = &*self.inner;
         let mut guard = lock.lock().unwrap();
         guard.entry(key).or_default().push_back(input);
@@ -61,16 +62,23 @@ impl CallbackRegistry {
 
     fn dequeue_blocking(&self, cycle_id: AwarenessCycleId) -> Result<SyncPointInput, AceError> {
         let key = cycle_id.as_u64();
+        tracing::info!("CallbackRegistry::dequeue_blocking cycle_id={} (u64={})", cycle_id, key);
         let (lock, cvar) = &*self.inner;
         let mut guard = lock.lock().unwrap();
+        let mut iterations = 0;
         loop {
             if let Some(queue) = guard.get_mut(&key) {
                 if let Some(next) = queue.pop_front() {
+                    tracing::info!("CallbackRegistry::dequeue_blocking found data for cycle_id={}", cycle_id);
                     if queue.is_empty() {
                         guard.remove(&key);
                     }
                     return Ok(next);
                 }
+            }
+            iterations += 1;
+            if iterations % 50 == 0 {
+                tracing::warn!("CallbackRegistry::dequeue_blocking still waiting for cycle_id={} after {} iterations", cycle_id, iterations);
             }
             let (tmp_guard, _) = cvar
                 .wait_timeout(guard, StdDuration::from_millis(WAIT_TIMEOUT_MS))
@@ -782,6 +790,10 @@ impl<'a> AceService<'a> {
 
     pub fn submit_callback(&self, input: SyncPointInput) {
         self.registry.enqueue(input);
+    }
+
+    pub fn reschedule_cycle(&self, schedule: CycleSchedule) {
+        self.engine.scheduler.reschedule(schedule);
     }
 
     pub fn drive_once(&mut self, tenant: u64) -> Result<Option<CycleOutcome>, AceError> {

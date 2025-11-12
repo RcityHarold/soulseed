@@ -144,6 +144,97 @@ impl AwarenessEventsQuery {
     }
 }
 
+#[derive(Deserialize, Default)]
+struct TimelineQuery {
+    limit: Option<usize>,
+    session_id: Option<String>,
+    cursor: Option<String>,
+}
+
+impl TimelineQuery {
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(50).clamp(1, 200)
+    }
+}
+
+#[derive(Serialize, Default)]
+struct TimelinePayload {
+    #[serde(default)]
+    items: Vec<DialogueEvent>,
+    #[serde(default)]
+    awareness: Vec<AwarenessEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct ContextBundleView {
+    anchor: ContextAnchor,
+    #[serde(default)]
+    segments: Vec<Value>,
+    #[serde(default)]
+    explain: ExplainBundle,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_digest: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct ContextAnchor {
+    tenant_id: i64,
+    envelope_id: String,
+    config_snapshot_hash: String,
+    config_snapshot_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<i64>,
+    schema_v: u16,
+}
+
+#[derive(Serialize, Default)]
+struct ExplainBundle {
+    #[serde(default)]
+    reasons: Vec<String>,
+    #[serde(default)]
+    indices_used: Vec<String>,
+}
+
+#[derive(Serialize, Default)]
+struct ExplainIndices {
+    #[serde(default)]
+    graph: ExplainSection,
+    #[serde(default)]
+    context: ExplainSection,
+    #[serde(default)]
+    dfr: DfrExplainSection,
+    #[serde(default)]
+    ace: AceExplainSection,
+}
+
+#[derive(Serialize, Default)]
+struct ExplainSection {
+    #[serde(default)]
+    indices_used: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degradation_reason: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct DfrExplainSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    router_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degradation_reason: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+struct AceExplainSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degradation_reason: Option<String>,
+}
+
 #[derive(Debug)]
 enum AppError {
     Ace(AceError),
@@ -237,6 +328,18 @@ async fn main() -> Result<(), AppError> {
             "/api/v1/tenants/:tenant_id/awareness/events",
             get(list_awareness_events),
         )
+        .route(
+            "/api/v1/tenants/:tenant_id/graph/timeline",
+            get(get_timeline),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id/context/bundle",
+            get(get_context_bundle),
+        )
+        .route(
+            "/api/v1/tenants/:tenant_id/explain/indices",
+            get(get_explain_indices),
+        )
         .layer(cors)
         .with_state(state);
 
@@ -267,6 +370,7 @@ async fn trigger_dialogue(
 
     let (schedule, sync_point) = service.submit_trigger(request)?;
     let tenant = schedule.anchor.tenant_id.into_inner();
+    service.submit_callback(sync_point.clone());  // 将 SyncPoint 入队
     let outcomes = service.drive_until_idle(tenant)?;
     drop(service);
 
@@ -334,17 +438,146 @@ async fn list_awareness_events(
     Ok(Json(ApiEnvelope::success(events, start.elapsed())))
 }
 
+async fn get_timeline(
+    State(app): State<AppState>,
+    Path(tenant_id): Path<u64>,
+    Query(query): Query<TimelineQuery>,
+) -> Result<Json<ApiEnvelope<TimelinePayload>>, AppError> {
+    let tenant = TenantId::from_raw(tenant_id)
+        .map_err(|err| AppError::Service(format!("invalid tenant_id: {err}")))?;
+    let limit = query.limit();
+    let start = Instant::now();
+
+    // 获取awareness events
+    let awareness = app.persistence.list_awareness_events(tenant, limit)?;
+
+    // TODO: 当实现DialogueEvent存储后,从数据库获取items
+    // 目前返回空的items列表
+    let items = Vec::new();
+
+    let payload = TimelinePayload {
+        items,
+        awareness,
+        next_cursor: None, // TODO: 实现分页游标
+    };
+
+    Ok(Json(ApiEnvelope::success(payload, start.elapsed())))
+}
+
+async fn get_context_bundle(
+    State(_app): State<AppState>,
+    Path(tenant_id): Path<u64>,
+) -> Result<Json<ApiEnvelope<ContextBundleView>>, AppError> {
+    let start = Instant::now();
+
+    // TODO: 实现实际的上下文bundle查询逻辑
+    // 目前返回stub数据
+    let bundle = ContextBundleView {
+        anchor: ContextAnchor {
+            tenant_id: tenant_id as i64,
+            envelope_id: format!("envelope_{}", tenant_id),
+            config_snapshot_hash: "stub_hash".to_string(),
+            config_snapshot_version: 1,
+            session_id: None,
+            schema_v: 1,
+        },
+        segments: Vec::new(),
+        explain: ExplainBundle {
+            reasons: vec!["Stub implementation: context bundle endpoint".to_string()],
+            indices_used: Vec::new(),
+        },
+        budget: None,
+        manifest_digest: None,
+    };
+
+    Ok(Json(ApiEnvelope::success(bundle, start.elapsed())))
+}
+
+async fn get_explain_indices(
+    State(_app): State<AppState>,
+    Path(_tenant_id): Path<u64>,
+) -> Result<Json<ApiEnvelope<ExplainIndices>>, AppError> {
+    let start = Instant::now();
+
+    // TODO: 实现实际的系统诊断数据查询
+    // 目前返回stub数据
+    let indices = ExplainIndices {
+        graph: ExplainSection {
+            indices_used: vec!["graph_timeline_idx".to_string(), "graph_causal_idx".to_string()],
+            query_hash: Some("stub_graph_hash".to_string()),
+            degradation_reason: None,
+        },
+        context: ExplainSection {
+            indices_used: vec!["context_bundle_idx".to_string()],
+            query_hash: Some("stub_context_hash".to_string()),
+            degradation_reason: None,
+        },
+        dfr: DfrExplainSection {
+            router_digest: Some("stub_dfr_digest".to_string()),
+            degradation_reason: None,
+        },
+        ace: AceExplainSection {
+            degradation_reason: None,
+        },
+    };
+
+    Ok(Json(ApiEnvelope::success(indices, start.elapsed())))
+}
+
 async fn post_injection(
     State(app): State<AppState>,
     Json(req): Json<InjectionRequest>,
 ) -> Result<Json<CycleSnapshot>, AppError> {
-    let existing = app
-        .cycles
-        .lock()
-        .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
-        .get(&req.cycle_id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("cycle {} not found", req.cycle_id)))?;
+    // 首先从内存缓存查找
+    let existing = {
+        let guard = app
+            .cycles
+            .lock()
+            .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?;
+
+        if let Some(snapshot) = guard.get(&req.cycle_id).cloned() {
+            drop(guard);  // ✅ 立即释放锁！
+            snapshot
+        } else {
+            drop(guard);  // ✅ 释放锁
+
+            // 内存中没有，尝试从数据库加载
+            use soulseed_agi_core_models::{AwarenessCycleId, TenantId};
+
+            let tenant_id = TenantId::from_raw_unchecked(1);
+            let cycle_id_typed = AwarenessCycleId::from_raw(req.cycle_id)
+                .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
+
+            match app.persistence.load_cycle_snapshot(tenant_id, cycle_id_typed)? {
+                Some(snapshot_value) => {
+                    // 尝试反序列化，如果失败则记录警告并返回NotFound
+                    let snapshot: CycleSnapshot = match serde_json::from_value(snapshot_value) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to deserialize snapshot for cycle {}: {}. This may be due to schema changes. Treating as not found.",
+                                req.cycle_id, e
+                            );
+                            return Err(AppError::NotFound(format!(
+                                "cycle {} snapshot is corrupted or incompatible", req.cycle_id
+                            )));
+                        }
+                    };
+
+                    // 将加载的快照放入缓存
+                    app.cycles
+                        .lock()
+                        .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
+                        .insert(req.cycle_id, snapshot.clone());
+
+                    snapshot
+                }
+                None => {
+                    return Err(AppError::NotFound(format!("cycle {} not found", req.cycle_id)));
+                }
+            }
+        }
+    };
 
     let priority = parse_priority(&req.priority)?;
     let tenant_id = existing.schedule.anchor.tenant_id;
@@ -355,53 +588,150 @@ async fn post_injection(
 
     let tenant_raw = tenant_id.into_inner();
 
-    let outcomes = {
-        let mut service = app
+    // 异步侧信道模式：提交注入但不等待执行完成
+    {
+        let service = app
             .service
             .lock()
             .map_err(|_| AppError::Service("service lock poisoned".into()))?;
+
+        tracing::info!(
+            "post_injection: cycle_id={} (u64={}), sync_point.cycle_id={} (u64={}), tenant={}",
+            existing.schedule.cycle_id,
+            existing.schedule.cycle_id.as_u64(),
+            sync_point.cycle_id,
+            sync_point.cycle_id.as_u64(),
+            tenant_raw
+        );
+
+        // 将周期重新加入调度器队列（服务重启后队列为空）
+        service.reschedule_cycle(existing.schedule.clone());
+
+        // 提交包含注入的 SyncPoint（异步侧信道）
         service.submit_callback(sync_point.clone());
-        service.drive_until_idle(tenant_raw)?
-    };
 
-    let outcome_summaries: Vec<CycleOutcomeSummary> = outcomes
-        .iter()
-        .map(|o| CycleOutcomeSummary {
-            cycle_id: o.cycle_id.as_u64(),
-            status: format!("{:?}", o.status).to_lowercase(),
-            manifest_digest: o.manifest_digest.clone(),
-        })
-        .collect();
+        tracing::info!(
+            "post_injection: HITL injection submitted to callback queue (async side-channel mode)"
+        );
+    }
 
+    // 启动后台任务驱动 AC 执行（不阻塞 API 响应）
+    let service_for_bg = app.service.clone();
+    let cycles_for_bg = app.cycles.clone();
+    let cycle_id_for_bg = req.cycle_id;
+    tokio::spawn(async move {
+        tracing::info!("post_injection: background task started for tenant={}", tenant_raw);
+
+        // 短暂延迟，确保 API 响应先返回
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        // 驱动执行
+        let result = {
+            let mut service = match service_for_bg.lock() {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("background task: service lock poisoned: {:?}", e);
+                    return;
+                }
+            };
+            service.drive_until_idle(tenant_raw)
+        };
+
+        match result {
+            Ok(outcomes) => {
+                tracing::info!("background task: drive_until_idle completed with {} outcomes", outcomes.len());
+
+                // 更新缓存中的快照（可选）
+                if let Some(last_outcome) = outcomes.last() {
+                    if let Ok(mut guard) = cycles_for_bg.lock() {
+                        if let Some(snapshot) = guard.get_mut(&cycle_id_for_bg) {
+                            snapshot.schedule.status = last_outcome.status;
+                            tracing::info!("background task: updated cached snapshot status to {:?}", last_outcome.status);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("background task: drive_until_idle failed: {:?}", e);
+            }
+        }
+    });
+
+    // 获取当前的 outbox 消息
     let outbox_messages = app.outbox.peek(existing.schedule.anchor.tenant_id);
 
+    // 注意：我们不调用 drive_until_idle，让后台 orchestrator 自然处理
+    // AC 的完成由 Agent 自己决定，而不是由外部注入触发
+    // 因此返回的快照表示"注入已提交"而非"注入已处理完成"
+
     let updated = CycleSnapshot {
-        schedule: existing.schedule.clone(),
-        sync_point: sync_point.clone(),
-        outcomes: outcome_summaries,
+        schedule: existing.schedule.clone(),  // 返回当前状态，不是执行后的状态
+        sync_point: sync_point.clone(),       // 包含新提交的注入
+        outcomes: existing.outcomes.clone(),   // 保留之前的 outcomes
         outbox: outbox_messages,
     };
 
-    // 保存到内存缓存
-    app.cycles
-        .lock()
-        .map_err(|_| AppError::Service("cycle cache lock poisoned".into()))?
-        .insert(req.cycle_id, updated.clone());
+    tracing::info!("post_injection: created CycleSnapshot, attempting to lock cycles cache");
 
-    // 持久化到数据库
-    let snapshot_value = serde_json::to_value(&updated)
-        .map_err(|e| AppError::Service(format!("serialize snapshot failed: {e}")))?;
+    // 保存到内存缓存
+    let lock_result = app.cycles.lock();
+    match lock_result {
+        Ok(mut guard) => {
+            tracing::info!("post_injection: cycles lock acquired successfully");
+            guard.insert(req.cycle_id, updated.clone());
+            drop(guard);
+            tracing::info!("post_injection: cycles lock released");
+        }
+        Err(e) => {
+            tracing::error!("post_injection: cycles lock poisoned: {:?}", e);
+            return Err(AppError::Service("cycle cache lock poisoned".into()));
+        }
+    }
+
+    // 持久化到数据库（异步后台任务，不阻塞响应）
+    tracing::info!("post_injection: spawning background task for persistence");
+    let persistence = app.persistence.clone();
+    let tenant_id = existing.schedule.anchor.tenant_id;
+    let snapshot_for_persist = updated.clone();
     use soulseed_agi_core_models::AwarenessCycleId;
     let cycle_id_typed = AwarenessCycleId::from_raw(req.cycle_id)
         .map_err(|e| AppError::Service(format!("invalid cycle_id: {e}")))?;
-    if let Err(e) = app.persistence.persist_cycle_snapshot(
-        existing.schedule.anchor.tenant_id,
-        cycle_id_typed,
-        &snapshot_value,
-    ) {
-        tracing::warn!("persist cycle snapshot failed: {}", e);
+
+    tokio::spawn(async move {
+        let snapshot_value = match serde_json::to_value(&snapshot_for_persist) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("serialize snapshot failed: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = persistence.persist_cycle_snapshot(
+            tenant_id,
+            cycle_id_typed,
+            &snapshot_value,
+        ) {
+            tracing::warn!("persist cycle snapshot failed: {}", e);
+        } else {
+            tracing::info!("post_injection: snapshot persisted successfully in background");
+        }
+    });
+
+    tracing::info!("post_injection: about to return response with status={:?}", updated.schedule.status);
+
+    // 测试：先序列化看看是否卡在这里
+    let json_result = serde_json::to_string(&updated);
+    match json_result {
+        Ok(json_str) => {
+            tracing::info!("post_injection: serialization successful, json length={}", json_str.len());
+        }
+        Err(e) => {
+            tracing::error!("post_injection: serialization failed: {}", e);
+            return Err(AppError::Service(format!("serialize response failed: {}", e)));
+        }
     }
 
+    tracing::info!("post_injection: returning Json response now");
     Ok(Json(updated))
 }
 
@@ -432,8 +762,19 @@ async fn get_cycle(
         .load_cycle_snapshot(tenant_id, cycle_id_typed)?
     {
         Some(snapshot_value) => {
-            let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
-                .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
+            // 尝试反序列化，如果失败则记录警告并返回NotFound
+            let snapshot: CycleSnapshot = match serde_json::from_value(snapshot_value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to deserialize snapshot for cycle {}: {}. This may be due to schema changes. Treating as not found.",
+                        cycle_id, e
+                    );
+                    return Err(AppError::NotFound(format!(
+                        "cycle {cycle_id} snapshot is corrupted or incompatible"
+                    )));
+                }
+            };
 
             // 将加载的快照放入缓存
             app.cycles
@@ -473,8 +814,19 @@ async fn get_cycle_outbox(
         .load_cycle_snapshot(tenant_id, cycle_id_typed)?
     {
         Some(snapshot_value) => {
-            let snapshot: CycleSnapshot = serde_json::from_value(snapshot_value)
-                .map_err(|e| AppError::Service(format!("deserialize snapshot failed: {e}")))?;
+            // 尝试反序列化，如果失败则记录警告并返回NotFound
+            let snapshot: CycleSnapshot = match serde_json::from_value(snapshot_value) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to deserialize snapshot for cycle {}: {}. This may be due to schema changes. Treating as not found.",
+                        cycle_id, e
+                    );
+                    return Err(AppError::NotFound(format!(
+                        "cycle {cycle_id} snapshot is corrupted or incompatible"
+                    )));
+                }
+            };
 
             // 将加载的快照放入缓存
             app.cycles

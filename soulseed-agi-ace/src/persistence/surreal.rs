@@ -9,7 +9,7 @@ use sb_storage::surreal::config::SurrealConfig;
 use sb_storage::surreal::datastore::SurrealDatastore;
 use sb_types::prelude::TenantId as SbTenantId;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::errors::AceError;
 use crate::persistence::AcePersistence;
@@ -524,18 +524,109 @@ impl AcePersistence for SurrealPersistence {
         // Schema 已通过 migrations/surreal/001_soulseed_init.sql 初始化
 
         let cycle_id_str = cycle_id.as_u64().to_string();
-        let sb_tenant = tenant_to_sb(tenant_id);
-        let snapshot_repo = self.snapshot_repo.clone();
+        let tenant = tenant_id.as_u64().to_string();
+        let datastore = self.datastore.clone();
+
+        tracing::debug!(
+            "Loading cycle snapshot: tenant_id={}, cycle_id={}, cycle_id_str={}",
+            tenant_id.as_u64(),
+            cycle_id.as_u64(),
+            cycle_id_str
+        );
 
         self.block_on(async move {
-            let result = snapshot_repo
-                .get(&sb_tenant, &cycle_id_str)
+            // 使用 WHERE 子句查询，避免记录 ID 格式问题
+            let query = format!(
+                "SELECT snapshot_data FROM {} WHERE cycle_id = '{}' AND tenant = '{}' LIMIT 1;",
+                CycleSnapshotDoc::TABLE,
+                cycle_id_str,
+                tenant
+            );
+
+            tracing::debug!("Executing query: {}", query);
+
+            use sb_storage::spi::query::NamedArgs;
+            let params = NamedArgs::default();
+
+            let mut result = datastore
+                .pool()
+                .run_raw(&query, &params)
                 .await
                 .map_err(|err| {
-                    AceError::Persistence(format!("load cycle snapshot failed: {err}"))
+                    tracing::error!(
+                        error = %err,
+                        tenant = %tenant,
+                        cycle_id = %cycle_id_str,
+                        query = %query,
+                        "SurrealDB query failed"
+                    );
+                    AceError::Persistence(format!("query cycle snapshot failed: {}", err))
                 })?;
 
-            Ok(result.map(|doc| doc.snapshot_data))
+            // 获取查询结果
+            let response: Option<Value> = result.take(0).map_err(|err| {
+                tracing::error!(
+                    error = %err,
+                    tenant = %tenant,
+                    cycle_id = %cycle_id_str,
+                    "Failed to extract query result"
+                );
+                AceError::Persistence(format!("extract query result failed: {}", err))
+            })?;
+
+            tracing::debug!("Query response: {:?}", response);
+
+            // 解析返回的结果
+            // SurrealDB 的 result.take(0) 返回单个对象（第一行），而不是数组
+            match response {
+                Some(Value::Object(obj)) => {
+                    // 直接从对象中提取 snapshot_data 字段
+                    if let Some(snapshot_data) = obj.get("snapshot_data") {
+                        tracing::debug!(
+                            "Loaded snapshot_data: is_null={}, is_object={}, keys={:?}",
+                            snapshot_data.is_null(),
+                            snapshot_data.is_object(),
+                            snapshot_data.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                        );
+                        Ok(Some(snapshot_data.clone()))
+                    } else {
+                        tracing::warn!("snapshot_data field not found in result");
+                        Ok(None)
+                    }
+                }
+                Some(Value::Array(arr)) if !arr.is_empty() => {
+                    // 兼容：如果返回的是数组，取第一个元素
+                    if let Some(Value::Object(obj)) = arr.get(0) {
+                        if let Some(snapshot_data) = obj.get("snapshot_data") {
+                            tracing::debug!(
+                                "Loaded snapshot_data from array: is_null={}, is_object={}, keys={:?}",
+                                snapshot_data.is_null(),
+                                snapshot_data.is_object(),
+                                snapshot_data.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                            );
+                            Ok(Some(snapshot_data.clone()))
+                        } else {
+                            tracing::warn!("snapshot_data field not found in array result");
+                            Ok(None)
+                        }
+                    } else {
+                        tracing::debug!("Empty result set in array");
+                        Ok(None)
+                    }
+                }
+                Some(Value::Array(_)) => {
+                    tracing::debug!("Empty array, no snapshot found for cycle_id={}", cycle_id_str);
+                    Ok(None)
+                }
+                Some(other) => {
+                    tracing::warn!("Unexpected response format: {:?}", other);
+                    Ok(None)
+                }
+                None => {
+                    tracing::debug!("No snapshot found for cycle_id={}", cycle_id_str);
+                    Ok(None)
+                }
+            }
         })
     }
 }

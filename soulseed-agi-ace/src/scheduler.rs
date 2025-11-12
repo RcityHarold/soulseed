@@ -205,8 +205,12 @@ impl CycleScheduler {
     pub fn start_next(&self, tenant: u64) -> Option<CycleSchedule> {
         let mut guard = self.state.lock().unwrap();
         let queue = guard.pending.get_mut(&tenant)?;
+        let queue_len = queue.len();
+        tracing::info!("Scheduler::start_next: tenant={}, queue_len={}", tenant, queue_len);
         let mut cycle = queue.pop_front()?;
         let current_status = guard.status.get(&cycle.cycle_id.as_u64()).copied();
+        tracing::info!("Scheduler::start_next: popped cycle_id={} (u64={}), current_status={:?}",
+            cycle.cycle_id, cycle.cycle_id.as_u64(), current_status);
         match current_status {
             Some(CycleStatus::AwaitingExternal | CycleStatus::Suspended) => {
                 cycle.status = current_status.unwrap();
@@ -248,6 +252,18 @@ impl CycleScheduler {
     pub fn status_of(&self, cycle_id: AwarenessCycleId) -> Option<CycleStatus> {
         let guard = self.state.lock().unwrap();
         guard.status.get(&cycle_id.as_u64()).copied()
+    }
+
+    /// 将已存在的周期重新加入pending队列（用于从数据库恢复）
+    pub fn reschedule(&self, cycle: CycleSchedule) {
+        let tenant = cycle.anchor.tenant_id.into_inner();
+        tracing::info!("Scheduler::reschedule: cycle_id={} (u64={}), tenant={}, status={:?}",
+            cycle.cycle_id, cycle.cycle_id.as_u64(), tenant, cycle.status);
+        let mut guard = self.state.lock().unwrap();
+        // 记录周期状态
+        guard.status.insert(cycle.cycle_id.as_u64(), cycle.status);
+        // 加入pending队列
+        guard.pending.entry(tenant).or_default().push_back(cycle);
     }
 }
 

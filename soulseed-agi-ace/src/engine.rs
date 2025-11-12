@@ -262,8 +262,17 @@ impl<'a> AceEngine<'a> {
         registry.insert(cycle_key);
         drop(registry);
 
+        // 持久化改为异步后台任务，避免在 axum handler 中阻塞
         if let Some(store) = self.persistence.as_ref() {
-            store.persist_cycle(&emission)?;
+            let store_clone = store.clone();
+            let emission_clone = emission.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = store_clone.persist_cycle(&emission_clone) {
+                    tracing::warn!("persist_cycle failed in background: {}", e);
+                } else {
+                    tracing::debug!("persist_cycle succeeded in background for cycle_id={}", emission_clone.cycle_id);
+                }
+            });
         }
 
         let result = (|| -> Result<(), AceError> {
@@ -422,6 +431,27 @@ where
 
         let mut awareness_events = schedule.decision_events.clone();
         awareness_events.extend(aggregation.awareness_events.clone());
+
+        // 添加 Finalized 事件到 awareness_events，以便持久化到数据库
+        // 这样前端可以通过查询觉知事件来判断周期是否完成
+        let finalized_event = soulseed_agi_core_models::awareness::AwarenessEvent {
+            anchor: schedule.anchor.clone(),
+            event_id: final_event.base.event_id,
+            event_type: soulseed_agi_core_models::awareness::AwarenessEventType::Finalized,
+            occurred_at_ms: final_event.base.timestamp_ms,
+            awareness_cycle_id: schedule.cycle_id,
+            parent_cycle_id: schedule.parent_cycle_id,
+            collab_scope_id: schedule.collab_scope_id.clone(),
+            barrier_id: None,
+            env_mode: None,
+            inference_cycle_sequence: 1,
+            degradation_reason: None,
+            payload: serde_json::json!({
+                "lane": format!("{:?}", schedule.lane),
+                "final_event_id": final_event.base.event_id.as_u64(),
+            }),
+        };
+        awareness_events.push(finalized_event);
 
         let explain_fingerprint = aggregation
             .explain_fingerprint
