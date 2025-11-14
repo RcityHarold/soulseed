@@ -22,18 +22,18 @@ event-v2 = [
     "soulseed-agi-tools/event-v2",
 ]
 persistence-surreal = [
-    "sb-storage",
-    "sb-storage/surreal",
-    "sb-types",
+    "soulbase-storage",
+    "soulbase-storage/surreal",
+    "soulbase-types",
     "tokio"
 ]
-outbox-redis = [
-    "persistence-surreal",
-    "sb-tx",
-    "sb-tx/surreal",
-    "sb-tx/transport-redis",
-    "tokio"
-]
+# outbox-redis = [
+#     "persistence-surreal",
+#     "sb-tx",
+#     "sb-tx/surreal",
+#     "sb-tx/transport-redis",
+#     "tokio"
+# ]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -49,9 +49,16 @@ soulseed-agi-context = { path = "../soulseed-agi-context" }
 soulseed-agi-authz = { path = "../soulseed-agi-authz" }
 soulseed-agi-dfr = { path = "../soulseed-agi-dfr" }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "time", "macros", "signal"] }
-sb-storage = { path = "../../soulbase/crates/sb-storage", optional = true }
-sb-tx = { path = "../../soulbase/crates/sb-tx", optional = true }
-sb-types = { path = "../../soulbase/crates/sb-types", optional = true }
+# 旧版本 soulbase 依赖（已废弃）
+# sb-storage = { path = "../../soulbase/crates/sb-storage", optional = true }
+# sb-tx = { path = "../../soulbase/crates/sb-tx", optional = true }
+# sb-types = { path = "../../soulbase/crates/sb-types", optional = true }
+
+# 新版本 soul-base 依赖
+soulbase-storage = { path = "../../soul-base/crates/soulbase-storage", version = "1.0.0", optional = true, features = ["surreal"] }
+soulbase-tx = { path = "../../soul-base/crates/soulbase-tx", version = "1.0.0", optional = true, features = ["surreal"] }
+soulbase-types = { path = "../../soul-base/crates/soulbase-types", version = "1.0.0", optional = true }
+soulbase-llm = { path = "../../soul-base/crates/soulbase-llm", version = "1.0.0", features = ["provider-openai", "provider-claude", "provider-gemini"] }
 dotenvy = "0.15"
 axum = { version = "0.7", features = ["json"] }
 tracing = "0.1"

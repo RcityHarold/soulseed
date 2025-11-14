@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::engine::{AceEngine, AceOrchestrator, CycleOutcome, CycleRuntime};
 use crate::errors::AceError;
-use crate::llm::OpenAiClient;
+use crate::llm::AceLlmClient;
 use crate::persistence::AcePersistence;
 use crate::tw_gateway::{CollabSynthesis, SoulbaseGateway, ToolSynthesis};
 use crate::types::{
@@ -91,16 +91,16 @@ impl CallbackRegistry {
 #[derive(Clone)]
 struct AutoSyncDriver {
     registry: CallbackRegistry,
-    llm: Option<OpenAiClient>,
+    llm: Option<AceLlmClient>,
     gateway: Option<SoulbaseGateway>,
 }
 
 impl AutoSyncDriver {
     fn new(registry: CallbackRegistry) -> Self {
-        let llm = match OpenAiClient::from_env() {
+        let llm = match AceLlmClient::from_env() {
             Some(Ok(client)) => Some(client),
             Some(Err(err)) => {
-                warn!("OpenAI 初始化失败，将使用合成 SyncPoint：{err}");
+                warn!("LLM 初始化失败，将使用合成 SyncPoint：{err}");
                 None
             }
             None => None,
@@ -138,18 +138,26 @@ impl AutoSyncDriver {
             DecisionPlan::Clarify { plan } => {
                 if let Some(client) = &self.llm {
                     let context = schedule_context(schedule);
-                    match client.clarify_answer(plan, &context) {
+                    // 使用 tokio runtime 执行 async 调用
+                    let result = tokio::runtime::Handle::current().block_on(async {
+                        client.clarify_answer(plan, &context).await
+                    });
+                    match result {
                         Ok(answer) => synthesis.clarify_answer = Some(answer),
-                        Err(err) => warn!("OpenAI Clarify 调用失败，回退为合成答案：{err}"),
+                        Err(err) => warn!("LLM Clarify 调用失败，回退为合成答案：{err}"),
                     }
                 }
             }
             DecisionPlan::SelfReason { plan } => {
                 if let Some(client) = &self.llm {
                     let context = schedule_context(schedule);
-                    match client.self_reflection(plan, &context) {
+                    // 使用 tokio runtime 执行 async 调用
+                    let result = tokio::runtime::Handle::current().block_on(async {
+                        client.self_reflection(plan, &context).await
+                    });
+                    match result {
                         Ok(text) => synthesis.self_reflection = Some(text),
-                        Err(err) => warn!("OpenAI SelfReason 调用失败，回退为合成答案：{err}"),
+                        Err(err) => warn!("LLM SelfReason 调用失败，回退为合成答案：{err}"),
                     }
                 }
             }
@@ -809,7 +817,7 @@ impl<'a> AceService<'a> {
     #[cfg(feature = "persistence-surreal")]
     fn init_persistence() -> Result<Arc<dyn AcePersistence>, AceError> {
         use crate::persistence::surreal::{SurrealPersistence, SurrealPersistenceConfig};
-        use sb_storage::surreal::config::{SurrealConfig, SurrealCredentials, SurrealProtocol};
+        use soulbase_storage::surreal::config::SurrealConfig;
 
         let settings = load_surreal_dotenv_settings()?;
         if lookup_setting(&settings, "ACE_PERSISTENCE_DISABLED")
@@ -840,20 +848,18 @@ impl<'a> AceService<'a> {
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
         {
+            // New version: protocol is specified in endpoint string (mem://, http://, ws://)
             if url.starts_with("memory://") {
-                config.endpoint = url;
-                config.protocol = SurrealProtocol::Memory;
+                // Convert memory:// to mem:// for new version
+                config.endpoint = url.replace("memory://", "mem://");
                 config = config.strict_mode(false);
-            } else if url.starts_with("http://") || url.starts_with("https://") {
+            } else if url.starts_with("http://") || url.starts_with("https://")
+                || url.starts_with("ws://") || url.starts_with("wss://")
+                || url.starts_with("mem://") {
                 config.endpoint = url;
-                config.protocol = SurrealProtocol::Http;
-            } else if url.starts_with("ws://") || url.starts_with("wss://") {
-                config.endpoint = url;
-                config.protocol = SurrealProtocol::Ws;
             } else {
                 // 默认使用 WebSocket 协议，允许传入简写/自定义协议头
-                config.endpoint = url;
-                config.protocol = SurrealProtocol::Ws;
+                config.endpoint = format!("ws://{}", url);
             }
         }
 
@@ -865,7 +871,8 @@ impl<'a> AceService<'a> {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty()),
         ) {
-            config = config.with_credentials(SurrealCredentials::new(username, password));
+            // New version: with_credentials takes username and password directly
+            config = config.with_credentials(username, password);
         }
 
         let persistence_config = SurrealPersistenceConfig { datastore: config };
@@ -1015,7 +1022,7 @@ fn build_router_input(anchor: &AwarenessAnchor, message: &DialogueEvent) -> Rout
         assessment: AssessmentSnapshot::default(),
         context_signals: RouterContextSignals::default(),
         policies: PolicySnapshot::default(),
-        catalogs: CatalogSnapshot::default(),
+        catalogs: build_default_catalog(),
         budget: BudgetTarget {
             max_tokens: 4_096,
             max_walltime_ms: 60_000,
@@ -1040,6 +1047,85 @@ fn bundle_item_from_message(message: &DialogueEvent) -> BundleItem {
         score_stats: BundleScoreStats::default(),
         supersedes: None,
         evidence_ptrs: Vec::new(),
+    }
+}
+
+fn build_default_catalog() -> CatalogSnapshot {
+    use soulseed_agi_dfr::types::{CatalogItem, CatalogSnapshot};
+    use soulseed_agi_core_models::AwarenessFork;
+
+    CatalogSnapshot {
+        items: vec![
+            // 工具类：搜索工具
+            CatalogItem {
+                id: "tool_web_search".into(),
+                fork: AwarenessFork::ToolPath,
+                label: Some("网络搜索".into()),
+                score_hint: Some(0.8),
+                risk: Some(0.1),
+                estimate: None,
+                metadata: json!({
+                    "description": "搜索互联网上的信息",
+                    "capabilities": ["搜索", "查询", "信息检索"]
+                }),
+            },
+            // 工具类：文件操作
+            CatalogItem {
+                id: "tool_file_ops".into(),
+                fork: AwarenessFork::ToolPath,
+                label: Some("文件操作".into()),
+                score_hint: Some(0.7),
+                risk: Some(0.3),
+                estimate: None,
+                metadata: json!({
+                    "description": "读取、写入或修改文件",
+                    "capabilities": ["文件读取", "文件写入", "文件管理"]
+                }),
+            },
+            // 工具类：计算器
+            CatalogItem {
+                id: "tool_calculator".into(),
+                fork: AwarenessFork::ToolPath,
+                label: Some("计算器".into()),
+                score_hint: Some(0.9),
+                risk: Some(0.0),
+                estimate: None,
+                metadata: json!({
+                    "description": "执行数学计算",
+                    "capabilities": ["数学运算", "计算", "公式求值"]
+                }),
+            },
+            // 自我推理类
+            CatalogItem {
+                id: "self_reasoning".into(),
+                fork: AwarenessFork::SelfReason,
+                label: Some("深度推理".into()),
+                score_hint: Some(0.85),
+                risk: Some(0.1),
+                estimate: None,
+                metadata: json!({
+                    "description": "进行深度逻辑推理和分析",
+                    "capabilities": ["逻辑推理", "问题分析", "方案规划"]
+                }),
+            },
+            // 协作类
+            CatalogItem {
+                id: "collab_expert".into(),
+                fork: AwarenessFork::Collab,
+                label: Some("专家协作".into()),
+                score_hint: Some(0.75),
+                risk: Some(0.2),
+                estimate: None,
+                metadata: json!({
+                    "description": "与领域专家协作解决问题",
+                    "capabilities": ["专家咨询", "协作讨论", "知识共享"]
+                }),
+            },
+        ],
+        metadata: json!({
+            "source": "default_catalog",
+            "version": "1.0.0"
+        }),
     }
 }
 

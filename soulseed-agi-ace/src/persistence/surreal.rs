@@ -3,11 +3,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use sb_storage::model::{Entity, Sort, make_record_id};
-use sb_storage::prelude::Repository;
-use sb_storage::surreal::config::SurrealConfig;
-use sb_storage::surreal::datastore::SurrealDatastore;
-use sb_types::prelude::TenantId as SbTenantId;
+use soulbase_storage::model::{Entity, Sort, make_record_id, QueryParams};
+use soulbase_storage::prelude::Repository;
+use soulbase_storage::surreal::config::SurrealConfig;
+use soulbase_storage::surreal::datastore::SurrealDatastore;
+use soulbase_types::prelude::TenantId as SbTenantId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -21,14 +21,15 @@ use time::OffsetDateTime;
 // 请手动运行 SQL 文件来初始化数据库 schema
 
 fn tenant_to_sb(tenant: soulseed_agi_core_models::TenantId) -> SbTenantId {
-    SbTenantId::from(tenant.as_u64().to_string())
+    SbTenantId(tenant.as_u64().to_string())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DialogueEventDoc {
     #[serde(skip_deserializing)]
     pub id: String,
-    pub tenant: String,
+    #[serde(serialize_with = "serialize_tenant_id", deserialize_with = "deserialize_tenant_id")]
+    pub tenant: SbTenantId,
     pub event_id: String,
     pub cycle_id: String,
     pub occurred_at: i64,
@@ -42,12 +43,31 @@ struct DialogueEventDoc {
     pub created_at: i64,
 }
 
+// Serde helpers for TenantId
+fn serialize_tenant_id<S>(tenant: &SbTenantId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&tenant.0)
+}
+
+fn deserialize_tenant_id<'de, D>(deserializer: D) -> Result<SbTenantId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    Ok(SbTenantId(s))
+}
+
 impl Entity for DialogueEventDoc {
     const TABLE: &'static str = "ace_dialogue_event";
-    type Key = String;
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn tenant(&self) -> &SbTenantId {
+        &self.tenant
     }
 }
 
@@ -55,7 +75,8 @@ impl Entity for DialogueEventDoc {
 struct AwarenessEventDoc {
     #[serde(skip_deserializing)]
     pub id: String,
-    pub tenant: String,
+    #[serde(serialize_with = "serialize_tenant_id", deserialize_with = "deserialize_tenant_id")]
+    pub tenant: SbTenantId,
     pub event_id: String,
     pub cycle_id: String,
     pub event_type: String,
@@ -71,10 +92,13 @@ struct AwarenessEventDoc {
 
 impl Entity for AwarenessEventDoc {
     const TABLE: &'static str = "ace_awareness_event";
-    type Key = String;
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn tenant(&self) -> &SbTenantId {
+        &self.tenant
     }
 }
 
@@ -82,7 +106,8 @@ impl Entity for AwarenessEventDoc {
 struct CycleSnapshotDoc {
     #[serde(skip_deserializing)]
     pub id: String,
-    pub tenant: String,
+    #[serde(serialize_with = "serialize_tenant_id", deserialize_with = "deserialize_tenant_id")]
+    pub tenant: SbTenantId,
     pub cycle_id: String,
     // 改名为 snapshot_data 避免与 CycleSnapshot 中可能存在的 snapshot 字段冲突
     pub snapshot_data: Value,
@@ -92,19 +117,22 @@ struct CycleSnapshotDoc {
 
 impl Entity for CycleSnapshotDoc {
     const TABLE: &'static str = "ace_cycle_snapshot";
-    type Key = String;
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn tenant(&self) -> &SbTenantId {
+        &self.tenant
     }
 }
 
 pub struct SurrealPersistence {
     handle: tokio::runtime::Handle,
     owned_runtime: Option<tokio::runtime::Runtime>,
-    dialogue_repo: Arc<sb_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
-    awareness_repo: Arc<sb_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
-    snapshot_repo: Arc<sb_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
+    dialogue_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
+    awareness_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
+    snapshot_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
     datastore: SurrealDatastore,
 }
 
@@ -127,24 +155,24 @@ impl SurrealPersistence {
     ) -> Result<
         (
             SurrealDatastore,
-            Arc<sb_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
-            Arc<sb_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
-            Arc<sb_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
+            Arc<soulbase_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
+            Arc<soulbase_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
+            Arc<soulbase_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
         ),
         AceError,
     > {
         let datastore = SurrealDatastore::connect(datastore_cfg.clone())
             .await
             .map_err(|err| AceError::Persistence(format!("surreal connect failed: {err}")))?;
-        let dialogue_repo = Arc::new(sb_storage::surreal::repo::SurrealRepository::<
+        let dialogue_repo = Arc::new(soulbase_storage::surreal::repo::SurrealRepository::<
             DialogueEventDoc,
-        >::new(datastore.clone()));
-        let awareness_repo = Arc::new(sb_storage::surreal::repo::SurrealRepository::<
+        >::new(&datastore));
+        let awareness_repo = Arc::new(soulbase_storage::surreal::repo::SurrealRepository::<
             AwarenessEventDoc,
-        >::new(datastore.clone()));
-        let snapshot_repo = Arc::new(sb_storage::surreal::repo::SurrealRepository::<
+        >::new(&datastore));
+        let snapshot_repo = Arc::new(soulbase_storage::surreal::repo::SurrealRepository::<
             CycleSnapshotDoc,
-        >::new(datastore.clone()));
+        >::new(&datastore));
         Ok((datastore, dialogue_repo, awareness_repo, snapshot_repo))
     }
 
@@ -216,7 +244,7 @@ impl SurrealPersistence {
     }
 
     fn build_dialogue_doc(emission: &CycleEmission) -> Result<DialogueEventDoc, AceError> {
-        let tenant = emission.anchor.tenant_id.as_u64().to_string();
+        let tenant = tenant_to_sb(emission.anchor.tenant_id);
         let cycle_id = emission.cycle_id.as_u64().to_string();
         let event_id = emission.final_event.base.event_id.as_u64().to_string();
         let lane = format!("{:?}", emission.lane);
@@ -231,7 +259,7 @@ impl SurrealPersistence {
         Ok(DialogueEventDoc {
             id: make_record_id(
                 DialogueEventDoc::TABLE,
-                &SbTenantId::from(tenant.clone()),
+                &tenant,
                 &event_id,
             ),
             tenant,
@@ -251,7 +279,7 @@ impl SurrealPersistence {
         emission: &CycleEmission,
         event: &AwarenessEvent,
     ) -> Result<AwarenessEventDoc, AceError> {
-        let tenant = emission.anchor.tenant_id.as_u64().to_string();
+        let tenant = tenant_to_sb(emission.anchor.tenant_id);
         let cycle_id = emission.cycle_id.as_u64().to_string();
         let event_id = event.event_id.as_u64().to_string();
         let event_type = serde_json::to_value(event.event_type)
@@ -267,7 +295,7 @@ impl SurrealPersistence {
         Ok(AwarenessEventDoc {
             id: make_record_id(
                 AwarenessEventDoc::TABLE,
-                &SbTenantId::from(tenant.clone()),
+                &tenant,
                 &event_id,
             ),
             tenant,
@@ -311,23 +339,24 @@ impl AcePersistence for SurrealPersistence {
             })?;
             if let serde_json::Value::Object(ref mut map) = patch {
                 map.remove("id");
+                map.remove("tenant");  // tenant field cannot be updated
             }
             let patch_for_log = patch.clone();
             dialogue_repo
-                .upsert_returning_none(&sb_tenant, dialogue.event_id.as_str(), patch)
+                .upsert_or_create(&sb_tenant, dialogue.event_id.as_str(), patch)
                 .await
                 .map_err(|err| {
                     let err_obj = err.into_inner();
                     let public = err_obj.to_public();
                     let audit = err_obj.to_audit();
-                    let detail = audit.message_dev.unwrap_or(&public.message).to_string();
+                    let detail = audit.message_dev.as_ref().unwrap_or(&public.message).to_string();
                     tracing::error!(
                         code = %public.code,
                         message = %public.message,
-                        message_dev = audit.message_dev.unwrap_or(""),
-                        correlation_id = audit.correlation_id.unwrap_or(""),
+                        message_dev = audit.message_dev.unwrap_or_default(),
+                        correlation_id = audit.correlation_id.unwrap_or_default(),
                         meta = ?audit.meta,
-                        tenant = %dialogue.tenant,
+                        tenant = %dialogue.tenant.0,
                         event_id = %dialogue.event_id,
                         patch = ?patch_for_log,
                         "persist dialogue event failed"
@@ -375,23 +404,24 @@ impl AcePersistence for SurrealPersistence {
 
                 if let serde_json::Value::Object(ref mut map) = patch {
                     map.remove("id");
+                    map.remove("tenant");  // tenant field cannot be updated
                 }
                 let patch_for_log = patch.clone();
                 awareness_repo
-                    .upsert_returning_none(&sb_tenant, doc.event_id.as_str(), patch)
+                    .upsert_or_create(&sb_tenant, doc.event_id.as_str(), patch)
                     .await
                     .map_err(|err| {
                         let err_obj = err.into_inner();
                         let public = err_obj.to_public();
                         let audit = err_obj.to_audit();
-                        let detail = audit.message_dev.unwrap_or(&public.message).to_string();
+                        let detail = audit.message_dev.as_ref().unwrap_or(&public.message).to_string();
                         tracing::error!(
                             code = %public.code,
                             message = %public.message,
-                            message_dev = audit.message_dev.unwrap_or(""),
-                            correlation_id = audit.correlation_id.unwrap_or(""),
+                            message_dev = audit.message_dev.unwrap_or_default(),
+                            correlation_id = audit.correlation_id.unwrap_or_default(),
                             meta = ?audit.meta,
-                            tenant = %doc.tenant,
+                            tenant = %doc.tenant.0,
                             event_id = %doc.event_id,
                             patch = ?patch_for_log,
                             "persist awareness event failed"
@@ -401,7 +431,7 @@ impl AcePersistence for SurrealPersistence {
 
                 tracing::info!(
                     "Successfully persisted awareness event: tenant={}, event_id={}, event_type={}",
-                    doc.tenant,
+                    doc.tenant.0,
                     doc.event_id,
                     doc.event_type
                 );
@@ -420,14 +450,14 @@ impl AcePersistence for SurrealPersistence {
         let sb_tenant = tenant_to_sb(tenant_id);
         let repo = self.awareness_repo.clone();
         self.block_on(async move {
+            let params = QueryParams {
+                filter: serde_json::Value::Null,
+                order_by: Some("occurred_at DESC".to_string()),
+                limit: Some(limit as u32),
+                cursor: None,
+            };
             let page = repo
-                .select(
-                    &sb_tenant,
-                    serde_json::Value::Null,
-                    Some(vec![Sort::descending("occurred_at")]),
-                    limit,
-                    None,
-                )
+                .select(&sb_tenant, params)
                 .await
                 .map_err(|err| {
                     AceError::Persistence(format!("list awareness events failed: {err}"))
@@ -438,7 +468,7 @@ impl AcePersistence for SurrealPersistence {
                     Ok(event) => events.push(event),
                     Err(err) => {
                         tracing::warn!(
-                            tenant = %doc.tenant,
+                            tenant = %doc.tenant.0,
                             event_id = %doc.event_id,
                             error = %err,
                             "skip awareness event row due to deserialize failure"
@@ -459,24 +489,22 @@ impl AcePersistence for SurrealPersistence {
     ) -> Result<(), AceError> {
         // Schema 已通过 migrations/surreal/001_soulseed_init.sql 初始化
 
-        let tenant = tenant_id.as_u64().to_string();
+        let sb_tenant = tenant_to_sb(tenant_id);
         let cycle_id_str = cycle_id.as_u64().to_string();
         let now = current_millis();
 
         let doc = CycleSnapshotDoc {
             id: make_record_id(
                 CycleSnapshotDoc::TABLE,
-                &SbTenantId::from(tenant.clone()),
+                &sb_tenant,
                 &cycle_id_str,
             ),
-            tenant: tenant.clone(),
+            tenant: sb_tenant.clone(),
             cycle_id: cycle_id_str.clone(),
             snapshot_data: snapshot.clone(),
             created_at: now,
             updated_at: now,
         };
-
-        let sb_tenant = tenant_to_sb(tenant_id);
         let snapshot_repo = self.snapshot_repo.clone();
 
         self.block_on(async move {
@@ -488,6 +516,7 @@ impl AcePersistence for SurrealPersistence {
             })?;
             if let serde_json::Value::Object(ref mut map) = patch {
                 map.remove("id");
+                map.remove("tenant");  // tenant field cannot be updated
             }
             let patch_for_log = patch.clone();
             snapshot_repo
@@ -497,14 +526,14 @@ impl AcePersistence for SurrealPersistence {
                     let err_obj = err.into_inner();
                     let public = err_obj.to_public();
                     let audit = err_obj.to_audit();
-                    let detail = audit.message_dev.unwrap_or(&public.message).to_string();
+                    let detail = audit.message_dev.as_ref().unwrap_or(&public.message).to_string();
                     tracing::error!(
                         code = %public.code,
                         message = %public.message,
-                        message_dev = audit.message_dev.unwrap_or(""),
-                        correlation_id = audit.correlation_id.unwrap_or(""),
+                        message_dev = audit.message_dev.unwrap_or_default(),
+                        correlation_id = audit.correlation_id.unwrap_or_default(),
                         meta = ?audit.meta,
-                        tenant = %tenant,
+                        tenant = %sb_tenant.0,
                         cycle_id = %cycle_id_str,
                         patch = ?patch_for_log,
                         "persist cycle snapshot failed"
@@ -545,12 +574,23 @@ impl AcePersistence for SurrealPersistence {
 
             tracing::debug!("Executing query: {}", query);
 
-            use sb_storage::spi::query::NamedArgs;
-            let params = NamedArgs::default();
+            use soulbase_storage::spi::datastore::Datastore;
+            let session = datastore
+                .session()
+                .await
+                .map_err(|err| {
+                    tracing::error!(
+                        error = %err,
+                        tenant = %tenant,
+                        cycle_id = %cycle_id_str,
+                        "Failed to create session"
+                    );
+                    AceError::Persistence(format!("create session failed: {}", err))
+                })?;
 
-            let mut result = datastore
-                .pool()
-                .run_raw(&query, &params)
+            let mut result = session
+                .client()
+                .query(&query)
                 .await
                 .map_err(|err| {
                     tracing::error!(

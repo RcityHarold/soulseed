@@ -49,11 +49,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 #[cfg(any(feature = "outbox-redis", feature = "persistence-surreal"))]
-use sb_storage::surreal::config::{SurrealConfig, SurrealCredentials, SurrealProtocol};
+use soulbase_storage::surreal::config::SurrealConfig;
 #[cfg(feature = "outbox-redis")]
-use sb_tx::config::TxConfig;
+use soulbase_tx::config::TxConfig;
 #[cfg(feature = "outbox-redis")]
-use sb_tx::transport::redis::RedisTransportConfig;
+use soulbase_tx::transport::redis::RedisTransportConfig;
 #[cfg(feature = "outbox-redis")]
 use soulseed_agi_ace::outbox::redis::{RedisForwarderConfig, RedisOutboxForwarder};
 #[cfg(feature = "outbox-redis")]
@@ -1007,13 +1007,8 @@ fn surreal_config_from_settings(settings: &HashMap<String, String>) -> SurrealCo
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        if url.starts_with("http") {
-            config.endpoint = url.into();
-            config.protocol = SurrealProtocol::Http;
-        } else {
-            config.endpoint = url.into();
-            config.protocol = SurrealProtocol::Ws;
-        }
+        // Protocol is now embedded in the endpoint string (http://, ws://, etc.)
+        config.endpoint = url.into();
     }
     if let Some(pool) = settings
         .get("ACE_SURREAL_POOL_MAX")
@@ -1025,7 +1020,7 @@ fn surreal_config_from_settings(settings: &HashMap<String, String>) -> SurrealCo
         std::env::var("ACE_SURREAL_USERNAME"),
         std::env::var("ACE_SURREAL_PASSWORD"),
     ) {
-        config = config.with_credentials(SurrealCredentials::new(username, password));
+        config = config.with_credentials(username, password);
     }
     config
 }

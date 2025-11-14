@@ -2,17 +2,17 @@
 
 use std::sync::{Arc, Mutex};
 
-use sb_storage::surreal::config::SurrealConfig;
-use sb_storage::surreal::datastore::SurrealDatastore;
-use sb_tx::a2a::NoopA2AHooks;
-use sb_tx::config::TxConfig;
-use sb_tx::observe::{NoopTxMetrics, TxMetrics};
-use sb_tx::outbox::{Dispatcher, OutboxStore};
-use sb_tx::surreal::{SurrealTxStore, apply_migrations};
-use sb_tx::transport::redis::{RedisTransport, RedisTransportConfig};
-use sb_tx::util::now_ms;
-use sb_tx::worker::{TxRuntimeHandles, spawn_runtime};
-use sb_types::prelude::{Id as SbId, TenantId as SbTenantId};
+use soulbase_storage::surreal::config::SurrealConfig;
+use soulbase_storage::surreal::datastore::SurrealDatastore;
+use soulbase_tx::a2a::NoopA2AHooks;
+use soulbase_tx::config::TxConfig;
+use soulbase_tx::observe::{NoopTxMetrics, TxMetrics};
+use soulbase_tx::outbox::{Dispatcher, OutboxStore};
+use soulbase_tx::surreal::{SurrealTxStore, apply_migrations};
+use soulbase_tx::transport::redis::{RedisTransport, RedisTransportConfig};
+use soulbase_tx::util::now_ms;
+use soulbase_tx::worker::{TxRuntimeHandles, spawn_runtime};
+use soulbase_types::prelude::{Id as SbId, TenantId as SbTenantId};
 use soulseed_agi_core_models::TenantId;
 use soulseed_agi_core_models::awareness::AwarenessEvent;
 use tokio::runtime::{Builder, Runtime};
@@ -161,7 +161,7 @@ impl OutboxForwarder for RedisOutboxForwarder {
 
             let event_key = Self::event_topic(&message.payload);
             let topic = format!("redis://awareness/{event_key}");
-            let new_msg = sb_tx::model::NewOutboxMessage {
+            let new_msg = soulbase_tx::model::NewOutboxMessage {
                 id: SbId::from(format!(
                     "awareness:{}:{}",
                     message.cycle_id.as_u64(),
