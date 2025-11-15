@@ -253,6 +253,8 @@ pub struct BudgetDecision {
     pub snapshot: BudgetSnapshot,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_strategy: Option<crate::budget::DegradationStrategy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

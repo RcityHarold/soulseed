@@ -127,12 +127,40 @@ impl Entity for CycleSnapshotDoc {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OutboxMessageDoc {
+    #[serde(skip_deserializing)]
+    pub id: String,
+    #[serde(serialize_with = "serialize_tenant_id", deserialize_with = "deserialize_tenant_id")]
+    pub tenant: SbTenantId,
+    pub event_id: String,
+    pub cycle_id: String,
+    pub payload: Value,
+    pub status: String, // "pending" or "sent"
+    pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent_at: Option<i64>,
+}
+
+impl Entity for OutboxMessageDoc {
+    const TABLE: &'static str = "ace_outbox";
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn tenant(&self) -> &SbTenantId {
+        &self.tenant
+    }
+}
+
 pub struct SurrealPersistence {
     handle: tokio::runtime::Handle,
     owned_runtime: Option<tokio::runtime::Runtime>,
     dialogue_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
     awareness_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
     snapshot_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
+    outbox_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<OutboxMessageDoc>>,
     datastore: SurrealDatastore,
 }
 
@@ -158,6 +186,7 @@ impl SurrealPersistence {
             Arc<soulbase_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
             Arc<soulbase_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
             Arc<soulbase_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
+            Arc<soulbase_storage::surreal::repo::SurrealRepository<OutboxMessageDoc>>,
         ),
         AceError,
     > {
@@ -173,14 +202,17 @@ impl SurrealPersistence {
         let snapshot_repo = Arc::new(soulbase_storage::surreal::repo::SurrealRepository::<
             CycleSnapshotDoc,
         >::new(&datastore));
-        Ok((datastore, dialogue_repo, awareness_repo, snapshot_repo))
+        let outbox_repo = Arc::new(soulbase_storage::surreal::repo::SurrealRepository::<
+            OutboxMessageDoc,
+        >::new(&datastore));
+        Ok((datastore, dialogue_repo, awareness_repo, snapshot_repo, outbox_repo))
     }
 
     pub fn new_with_handle(
         handle: tokio::runtime::Handle,
         config: SurrealPersistenceConfig,
     ) -> Result<Self, AceError> {
-        let (datastore, dialogue_repo, awareness_repo, snapshot_repo) =
+        let (datastore, dialogue_repo, awareness_repo, snapshot_repo, outbox_repo) =
             handle.block_on(Self::init_components(config.datastore))?;
 
         Ok(Self {
@@ -189,13 +221,14 @@ impl SurrealPersistence {
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
+            outbox_repo,
             datastore,
         })
     }
 
     /// 异步初始化（用于已在 tokio runtime 中的场景）
     pub async fn new_async(config: SurrealPersistenceConfig) -> Result<Self, AceError> {
-        let (datastore, dialogue_repo, awareness_repo, snapshot_repo) =
+        let (datastore, dialogue_repo, awareness_repo, snapshot_repo, outbox_repo) =
             Self::init_components(config.datastore).await?;
 
         let handle = tokio::runtime::Handle::current();
@@ -206,6 +239,7 @@ impl SurrealPersistence {
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
+            outbox_repo,
             datastore,
         })
     }
@@ -215,7 +249,7 @@ impl SurrealPersistence {
         config: SurrealPersistenceConfig,
     ) -> Result<Self, AceError> {
         let handle = runtime.handle().clone();
-        let (datastore, dialogue_repo, awareness_repo, snapshot_repo) =
+        let (datastore, dialogue_repo, awareness_repo, snapshot_repo, outbox_repo) =
             runtime.block_on(Self::init_components(config.datastore))?;
 
         Ok(Self {
@@ -224,6 +258,7 @@ impl SurrealPersistence {
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
+            outbox_repo,
             datastore,
         })
     }
@@ -667,6 +702,204 @@ impl AcePersistence for SurrealPersistence {
                     Ok(None)
                 }
             }
+        })
+    }
+
+    fn transactional_checkpoint_and_outbox(
+        &self,
+        tenant_id: soulseed_agi_core_models::TenantId,
+        cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+        snapshot: &Value,
+        outbox_messages: &[crate::types::OutboxMessage],
+    ) -> Result<(), AceError> {
+        use crate::types::OutboxMessage;
+
+        let sb_tenant = tenant_to_sb(tenant_id);
+        let cycle_id_str = cycle_id.as_u64().to_string();
+        let now = current_millis();
+
+        // 首先保存checkpoint
+        let snapshot_doc = CycleSnapshotDoc {
+            id: make_record_id(
+                CycleSnapshotDoc::TABLE,
+                &sb_tenant,
+                &cycle_id_str,
+            ),
+            tenant: sb_tenant.clone(),
+            cycle_id: cycle_id_str.clone(),
+            snapshot_data: snapshot.clone(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // 构建outbox文档
+        let outbox_docs: Result<Vec<OutboxMessageDoc>, AceError> = outbox_messages
+            .iter()
+            .map(|msg| {
+                let event_id = msg.event_id.as_u64().to_string();
+                let payload = serde_json::to_value(&msg.payload).map_err(|err| {
+                    AceError::Persistence(format!("serialize outbox payload failed: {err}"))
+                })?;
+
+                Ok(OutboxMessageDoc {
+                    id: make_record_id(
+                        OutboxMessageDoc::TABLE,
+                        &sb_tenant,
+                        &event_id,
+                    ),
+                    tenant: sb_tenant.clone(),
+                    event_id: event_id.clone(),
+                    cycle_id: cycle_id_str.clone(),
+                    payload,
+                    status: "pending".to_string(),
+                    created_at: now,
+                    sent_at: None,
+                })
+            })
+            .collect();
+
+        let outbox_docs = outbox_docs?;
+
+        let snapshot_repo = self.snapshot_repo.clone();
+        let outbox_repo = self.outbox_repo.clone();
+
+        // TODO: 这里应该使用真正的数据库事务
+        // 目前的实现是先保存checkpoint，再保存outbox消息
+        // 如果outbox保存失败，checkpoint已经保存，不会回滚
+        // 在生产环境中应该使用SurrealDB的BEGIN TRANSACTION语法
+        self.block_on(async move {
+            // 保存checkpoint
+            let mut snapshot_patch = serde_json::to_value(&snapshot_doc).map_err(|err| {
+                AceError::Persistence(format!("serialize snapshot patch failed: {err}"))
+            })?;
+            if let serde_json::Value::Object(ref mut map) = snapshot_patch {
+                map.remove("id");
+                map.remove("tenant");
+            }
+            snapshot_repo
+                .upsert_or_create(&sb_tenant, &cycle_id_str, snapshot_patch)
+                .await
+                .map_err(|err| {
+                    AceError::Persistence(format!("persist checkpoint failed: {err}"))
+                })?;
+
+            // 保存outbox消息
+            for doc in outbox_docs {
+                let mut outbox_patch = serde_json::to_value(&doc).map_err(|err| {
+                    AceError::Persistence(format!("serialize outbox patch failed: {err}"))
+                })?;
+                if let serde_json::Value::Object(ref mut map) = outbox_patch {
+                    map.remove("id");
+                    map.remove("tenant");
+                }
+                outbox_repo
+                    .upsert_or_create(&sb_tenant, &doc.event_id, outbox_patch)
+                    .await
+                    .map_err(|err| {
+                        AceError::Persistence(format!("persist outbox message failed: {err}"))
+                    })?;
+            }
+
+            tracing::info!(
+                "Transactional checkpoint and outbox saved: tenant={}, cycle={}, outbox_count={}",
+                tenant_id.as_u64(),
+                cycle_id.as_u64(),
+                outbox_messages.len()
+            );
+
+            Ok(())
+        })
+    }
+
+    fn list_pending_outbox(
+        &self,
+        tenant_id: soulseed_agi_core_models::TenantId,
+        limit: usize,
+    ) -> Result<Vec<crate::types::OutboxMessage>, AceError> {
+        use crate::types::OutboxMessage;
+
+        let limit = limit.clamp(1, 500);
+        let sb_tenant = tenant_to_sb(tenant_id);
+        let repo = self.outbox_repo.clone();
+
+        self.block_on(async move {
+            // 查询status="pending"的消息
+            let filter = serde_json::json!({
+                "status": "pending"
+            });
+            let params = QueryParams {
+                filter,
+                order_by: Some("created_at ASC".to_string()),
+                limit: Some(limit as u32),
+                cursor: None,
+            };
+
+            let page = repo
+                .select(&sb_tenant, params)
+                .await
+                .map_err(|err| {
+                    AceError::Persistence(format!("list pending outbox failed: {err}"))
+                })?;
+
+            let mut messages = Vec::with_capacity(page.items.len());
+            for doc in page.items {
+                match serde_json::from_value(doc.payload.clone()) {
+                    Ok(payload) => {
+                        let cycle_id_val = doc.cycle_id.parse::<u64>().unwrap_or(0);
+                        let event_id_val = doc.event_id.parse::<u64>().unwrap_or(0);
+
+                        messages.push(OutboxMessage {
+                            cycle_id: soulseed_agi_core_models::AwarenessCycleId::from_raw_unchecked(cycle_id_val),
+                            event_id: soulseed_agi_core_models::EventId::from_raw_unchecked(event_id_val),
+                            payload,
+                        });
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            tenant = %doc.tenant.0,
+                            event_id = %doc.event_id,
+                            error = %err,
+                            "skip outbox message due to deserialize failure"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            Ok(messages)
+        })
+    }
+
+    fn mark_outbox_sent(
+        &self,
+        tenant_id: soulseed_agi_core_models::TenantId,
+        event_ids: &[soulseed_agi_core_models::EventId],
+    ) -> Result<(), AceError> {
+        let sb_tenant = tenant_to_sb(tenant_id);
+        let repo = self.outbox_repo.clone();
+        let now = current_millis();
+        let event_ids_str: Vec<String> = event_ids.iter().map(|id| id.as_u64().to_string()).collect();
+
+        self.block_on(async move {
+            for event_id_str in event_ids_str {
+                let update_patch = serde_json::json!({
+                    "status": "sent",
+                    "sent_at": now
+                });
+                repo.upsert_or_create(&sb_tenant, &event_id_str, update_patch)
+                    .await
+                    .map_err(|err| {
+                        AceError::Persistence(format!("mark outbox sent failed: {err}"))
+                    })?;
+            }
+
+            tracing::info!(
+                "Marked {} outbox messages as sent for tenant={}",
+                event_ids.len(),
+                tenant_id.as_u64()
+            );
+
+            Ok(())
         })
     }
 }

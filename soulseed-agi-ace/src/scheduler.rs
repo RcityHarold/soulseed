@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::budget::DegradationStrategy;
 use crate::errors::AceError;
 use crate::types::{
     BudgetSnapshot, CycleLane, CycleSchedule, CycleStatus, ScheduleOutcome, new_cycle_id,
@@ -50,6 +51,25 @@ struct ClarifyStats {
     first_enqueued_at: OffsetDateTime,
 }
 
+/// Clarify闸门降级评估结果
+#[derive(Clone, Debug)]
+pub struct ClarifyGateResult {
+    pub should_accept: bool,
+    pub degradation_strategy: Option<DegradationStrategy>,
+    pub reason: Option<String>,
+    pub metrics: ClarifyMetrics,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClarifyMetrics {
+    pub rounds: u32,
+    pub wait_ms: u64,
+    pub queue_depth: usize,
+    pub rounds_ratio: f32,
+    pub wait_ratio: f32,
+    pub queue_ratio: f32,
+}
+
 #[derive(Clone)]
 pub struct CycleScheduler {
     cfg: SchedulerConfig,
@@ -61,6 +81,86 @@ impl CycleScheduler {
         Self {
             cfg,
             state: Arc::new(Mutex::new(SchedulerState::default())),
+        }
+    }
+
+    /// 评估Clarify闸门状态并返回降级建议
+    pub fn evaluate_clarify_gate(
+        &self,
+        _tenant: u64,
+        predicted_queue: usize,
+        stats: &ClarifyStats,
+        now: OffsetDateTime,
+    ) -> ClarifyGateResult {
+        let waited_ms = (now - stats.first_enqueued_at)
+            .whole_milliseconds()
+            .max(0) as u64;
+        let predicted_rounds = stats.rounds.saturating_add(1);
+
+        // 计算各维度使用率
+        let rounds_ratio = predicted_rounds as f32 / self.cfg.clarify_round_limit as f32;
+        let wait_ratio = waited_ms as f32 / self.cfg.clarify_wait_limit_ms as f32;
+        let queue_ratio = predicted_queue as f32 / self.cfg.clarify_queue_threshold as f32;
+
+        // 取最高使用率作为整体评估指标
+        let max_ratio = rounds_ratio.max(wait_ratio).max(queue_ratio);
+
+        let metrics = ClarifyMetrics {
+            rounds: predicted_rounds,
+            wait_ms: waited_ms,
+            queue_depth: predicted_queue,
+            rounds_ratio,
+            wait_ratio,
+            queue_ratio,
+        };
+
+        // 完全超限，拒绝
+        if max_ratio >= 1.0 {
+            return ClarifyGateResult {
+                should_accept: false,
+                degradation_strategy: Some(DegradationStrategy::Reject),
+                reason: Some("clarify_exhausted".into()),
+                metrics,
+            };
+        }
+
+        // 根据使用率渐进式降级（类似P1-3预算降级树）
+        let degradation_strategy = if max_ratio >= 0.95 {
+            // 95%: 请求人工决策
+            Some(DegradationStrategy::AskHumanDecision)
+        } else if max_ratio >= 0.85 {
+            // 85%: 暂停等待或转协同
+            Some(DegradationStrategy::Pause)
+        } else if max_ratio >= 0.75 {
+            // 75%: 转工具执行
+            Some(DegradationStrategy::TransferToTool)
+        } else if max_ratio >= 0.60 {
+            // 60%: 提供保守答案
+            Some(DegradationStrategy::Conservative)
+        } else {
+            // < 60%: 正常执行
+            None
+        };
+
+        let reason = if degradation_strategy.is_some() {
+            Some(format!(
+                "clarify_degrading: rounds={}/{}, wait={}ms/{}ms, queue={}/{}",
+                predicted_rounds,
+                self.cfg.clarify_round_limit,
+                waited_ms,
+                self.cfg.clarify_wait_limit_ms,
+                predicted_queue,
+                self.cfg.clarify_queue_threshold
+            ))
+        } else {
+            None
+        };
+
+        ClarifyGateResult {
+            should_accept: true,
+            degradation_strategy,
+            reason,
+            metrics,
         }
     }
 
@@ -120,6 +220,7 @@ impl CycleScheduler {
             });
         }
 
+        // Clarify闸门检查和降级评估
         if matches!(lane, CycleLane::Clarify) {
             let queue = guard.pending.entry(tenant).or_default();
             let predicted_queue = queue
@@ -134,24 +235,36 @@ impl CycleScheduler {
             if stats_entry.rounds == 0 {
                 stats_entry.first_enqueued_at = now;
             }
-            let waited_ms = (now - stats_entry.first_enqueued_at)
-                .whole_milliseconds()
-                .max(0) as u64;
-            let predicted_rounds = stats_entry.rounds.saturating_add(1);
-            if predicted_rounds > self.cfg.clarify_round_limit
-                || waited_ms > self.cfg.clarify_wait_limit_ms
-                || predicted_queue > self.cfg.clarify_queue_threshold
-            {
-                let event =
-                    build_degradation_event(&anchor, predicted_rounds, waited_ms, predicted_queue);
+
+            // 使用降级树评估Clarify gate状态
+            let gate_result = self.evaluate_clarify_gate(tenant, predicted_queue, stats_entry, now);
+
+            if !gate_result.should_accept {
+                let event = build_degradation_event_with_strategy(
+                    &anchor,
+                    &gate_result.metrics,
+                    gate_result.degradation_strategy.as_ref(),
+                );
                 return Ok(ScheduleOutcome {
                     accepted: false,
-                    reason: Some("clarify_exhausted".into()),
+                    reason: gate_result.reason,
                     cycle: None,
                     awareness_events: vec![event],
                 });
             }
-            stats_entry.rounds = predicted_rounds;
+
+            // 即使接受，也可能有降级建议
+            if let Some(strategy) = &gate_result.degradation_strategy {
+                tracing::warn!(
+                    "Clarify gate degradation: tenant={}, strategy={:?}, metrics={:?}",
+                    tenant,
+                    strategy,
+                    gate_result.metrics
+                );
+                // TODO: 可以在未来将降级建议传递给runtime或aggregator使用
+            }
+
+            stats_entry.rounds = gate_result.metrics.rounds;
         }
 
         let prev_fork = guard.last_fork.get(&tenant).copied();
@@ -433,11 +546,10 @@ fn fingerprint_decision(decision: &RouterDecision) -> Option<String> {
     Some(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
-fn build_degradation_event(
+fn build_degradation_event_with_strategy(
     anchor: &AwarenessAnchor,
-    rounds: u32,
-    wait_ms: u64,
-    queue_depth: usize,
+    metrics: &ClarifyMetrics,
+    strategy: Option<&DegradationStrategy>,
 ) -> AwarenessEvent {
     let cycle_id = new_cycle_id();
     AwarenessEvent {
@@ -455,11 +567,33 @@ fn build_degradation_event(
         payload: json!({
             "lane": "clarify",
             "reason": "clarify_exhausted",
-            "rounds": rounds,
-            "wait_ms": wait_ms,
-            "queue_depth": queue_depth,
+            "rounds": metrics.rounds,
+            "wait_ms": metrics.wait_ms,
+            "queue_depth": metrics.queue_depth,
+            "rounds_ratio": metrics.rounds_ratio,
+            "wait_ratio": metrics.wait_ratio,
+            "queue_ratio": metrics.queue_ratio,
+            "degradation_strategy": strategy.as_ref().map(|s| format!("{:?}", s)),
         }),
     }
+}
+
+// 保留旧函数用于向后兼容
+fn build_degradation_event(
+    anchor: &AwarenessAnchor,
+    rounds: u32,
+    wait_ms: u64,
+    queue_depth: usize,
+) -> AwarenessEvent {
+    let metrics = ClarifyMetrics {
+        rounds,
+        wait_ms,
+        queue_depth,
+        rounds_ratio: 1.0,
+        wait_ratio: 1.0,
+        queue_ratio: 1.0,
+    };
+    build_degradation_event_with_strategy(anchor, &metrics, Some(&DegradationStrategy::Reject))
 }
 
 fn map_degradation(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
@@ -473,5 +607,312 @@ fn map_degradation(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
         Some("budget_external_cost") => Some(AwarenessDegradationReason::BudgetExternalCost),
         Some("invalid_plan") => Some(AwarenessDegradationReason::InvalidPlan),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn create_test_scheduler() -> CycleScheduler {
+        let cfg = SchedulerConfig {
+            max_pending_per_tenant: 8,
+            allow_parallel_lanes: false,
+            clarify_round_limit: 10,
+            clarify_wait_limit_ms: 10000,
+            clarify_queue_threshold: 100,
+        };
+        CycleScheduler::new(cfg)
+    }
+
+    #[test]
+    fn test_clarify_gate_normal_acceptance() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 3, // 30% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(2000), // 20% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            30, // 30% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept, "Should accept at < 60% usage");
+        assert!(result.degradation_strategy.is_none(), "No degradation at < 60%");
+        assert!(result.reason.is_none(), "No degradation reason at < 60%");
+    }
+
+    #[test]
+    fn test_clarify_gate_conservative_degradation() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 6, // 60% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(5000), // 50% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            60, // 60% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept, "Should accept but with degradation");
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::Conservative),
+            "Should use Conservative strategy at 60-75%"
+        );
+        assert!(result.reason.is_some());
+        assert!(result.reason.unwrap().contains("clarify_degrading"));
+    }
+
+    #[test]
+    fn test_clarify_gate_transfer_to_tool() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 6, // predicted_rounds = 7, 70% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(7600), // 76% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            75, // 75% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept, "Should accept but with degradation");
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::TransferToTool),
+            "Should use TransferToTool strategy at 75-85%"
+        );
+        assert!(result.reason.is_some());
+        assert!(result.reason.unwrap().contains("clarify_degrading"));
+    }
+
+    #[test]
+    fn test_clarify_gate_pause_degradation() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 7, // predicted_rounds = 8, 80% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(8600), // 86% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            85, // 85% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept, "Should accept but with degradation");
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::Pause),
+            "Should use Pause strategy at 85-95%"
+        );
+        assert!(result.reason.is_some());
+        assert!(result.reason.unwrap().contains("clarify_degrading"));
+    }
+
+    #[test]
+    fn test_clarify_gate_ask_human_decision() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 8, // predicted_rounds = 9, 90% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(9600), // 96% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            95, // 95% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept, "Should accept but with degradation");
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::AskHumanDecision),
+            "Should use AskHumanDecision strategy at 95-100%"
+        );
+        assert!(result.reason.is_some());
+        assert!(result.reason.unwrap().contains("clarify_degrading"));
+    }
+
+    #[test]
+    fn test_clarify_gate_rejection() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 10, // 100% of limit
+            first_enqueued_at: now - time::Duration::milliseconds(10000), // 100% of limit
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            100, // 100% of queue threshold
+            &stats,
+            now,
+        );
+
+        assert!(!result.should_accept, "Should reject at >= 100% usage");
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::Reject),
+            "Should use Reject strategy when >= 100%"
+        );
+        assert!(result.reason.is_some());
+        assert_eq!(result.reason.unwrap(), "clarify_exhausted");
+    }
+
+    #[test]
+    fn test_clarify_gate_multi_dimensional_rounds() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 6, // predicted_rounds = 7, 70% - but we want 80% to trigger TransferToTool
+            first_enqueued_at: now - time::Duration::milliseconds(5000), // 50%
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            80, // 80% - highest, triggers TransferToTool
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept);
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::TransferToTool),
+            "Should use strategy based on max dimension (queue at 80%)"
+        );
+        assert_eq!(result.metrics.queue_ratio, 0.8);
+    }
+
+    #[test]
+    fn test_clarify_gate_multi_dimensional_wait_time() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 3, // 30%
+            first_enqueued_at: now - time::Duration::milliseconds(9000), // 90% - highest
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            40, // 40%
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept);
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::Pause),
+            "Should use strategy based on max dimension (wait time at 90%)"
+        );
+        assert_eq!(result.metrics.wait_ratio, 0.9);
+    }
+
+    #[test]
+    fn test_clarify_gate_multi_dimensional_queue_depth() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 4, // 40%
+            first_enqueued_at: now - time::Duration::milliseconds(3000), // 30%
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            96, // 96% - highest
+            &stats,
+            now,
+        );
+
+        assert!(result.should_accept);
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::AskHumanDecision),
+            "Should use strategy based on max dimension (queue at 96%)"
+        );
+        assert_eq!(result.metrics.queue_ratio, 0.96);
+    }
+
+    #[test]
+    fn test_clarify_gate_metrics_calculation() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 5, // 50%
+            first_enqueued_at: now - time::Duration::milliseconds(7500), // 75%
+        };
+
+        let result = scheduler.evaluate_clarify_gate(
+            1,
+            80, // 80%
+            &stats,
+            now,
+        );
+
+        // Verify metrics are calculated correctly
+        assert_eq!(result.metrics.rounds, 6); // predicted_rounds = 5 + 1
+        assert_eq!(result.metrics.rounds_ratio, 0.6); // 6/10
+        assert_eq!(result.metrics.wait_ms, 7500);
+        assert_eq!(result.metrics.wait_ratio, 0.75); // 7500/10000
+        assert_eq!(result.metrics.queue_depth, 80);
+        assert_eq!(result.metrics.queue_ratio, 0.8); // 80/100
+        // Verify degradation is triggered at 80% (max ratio)
+        assert_eq!(
+            result.degradation_strategy,
+            Some(DegradationStrategy::TransferToTool)
+        );
+    }
+
+    #[test]
+    fn test_clarify_gate_edge_case_zero_wait() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 0,
+            first_enqueued_at: now, // Just enqueued
+        };
+
+        let result = scheduler.evaluate_clarify_gate(1, 0, &stats, now);
+
+        assert!(result.should_accept);
+        assert!(result.degradation_strategy.is_none());
+        assert_eq!(result.metrics.wait_ms, 0);
+        assert_eq!(result.metrics.wait_ratio, 0.0);
+    }
+
+    #[test]
+    fn test_clarify_gate_edge_case_negative_wait() {
+        let scheduler = create_test_scheduler();
+        let now = OffsetDateTime::now_utc();
+        let stats = ClarifyStats {
+            rounds: 2,
+            first_enqueued_at: now + time::Duration::milliseconds(1000), // Future time (shouldn't happen)
+        };
+
+        let result = scheduler.evaluate_clarify_gate(1, 20, &stats, now);
+
+        // Should handle gracefully with max(0)
+        assert!(result.should_accept);
+        assert_eq!(result.metrics.wait_ms, 0);
+        assert_eq!(result.metrics.wait_ratio, 0.0);
     }
 }

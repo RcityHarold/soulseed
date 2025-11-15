@@ -16,6 +16,7 @@ use soulseed_agi_core_models::{
         AwarenessAnchor, AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
         DeltaPatch, SyncPointKind,
     },
+    common::EvidencePointer,
 };
 use std::sync::Mutex;
 use time::{Duration, OffsetDateTime};
@@ -23,6 +24,62 @@ use time::{Duration, OffsetDateTime};
 use crate::errors::AceError;
 use crate::hitl::{HitlInjection, HitlPriority};
 use crate::types::{BudgetSnapshot, SyncPointInput};
+
+/// 上下文版本管理（用于Compact和版本一致性验证）
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextVersion {
+    /// 主版本号（Compact时递增）
+    pub major: u32,
+    /// 次版本号（小更新时递增）
+    pub minor: u32,
+    /// 内容校验和
+    pub checksum: String,
+}
+
+impl Default for ContextVersion {
+    fn default() -> Self {
+        Self {
+            major: 1,
+            minor: 0,
+            checksum: String::new(),
+        }
+    }
+}
+
+impl ContextVersion {
+    /// 创建新版本
+    pub fn new(major: u32, minor: u32, checksum: String) -> Self {
+        Self {
+            major,
+            minor,
+            checksum,
+        }
+    }
+
+    /// Compact时升级主版本
+    pub fn increment_major(&self) -> Self {
+        Self {
+            major: self.major + 1,
+            minor: 0,
+            checksum: String::new(), // 在实际compact后计算
+        }
+    }
+
+    /// 小更新时升级次版本
+    pub fn increment_minor(&self) -> Self {
+        Self {
+            major: self.major,
+            minor: self.minor + 1,
+            checksum: String::new(), // 在实际更新后计算
+        }
+    }
+
+    /// 检查版本兼容性
+    pub fn is_compatible_with(&self, other: &ContextVersion) -> bool {
+        // 主版本必须匹配
+        self.major == other.major
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -91,16 +148,134 @@ pub struct MergeDeltaResponse {
 
 pub trait CaService: Send + Sync {
     fn merge_delta(&self, request: MergeDeltaRequest) -> Result<MergeDeltaResponse, AceError>;
+
+    /// 请求上下文压缩，返回新版本
+    ///
+    /// Compact操作会：
+    /// 1. 压缩当前上下文（移除低相关性项）
+    /// 2. 升级主版本号
+    /// 3. 计算新的校验和
+    fn request_compact(&self) -> Result<ContextVersion, AceError> {
+        // 默认实现：返回新的主版本
+        Ok(ContextVersion::default().increment_major())
+    }
+
+    /// 验证上下文版本一致性
+    ///
+    /// 检查当前版本是否与要求的版本兼容
+    fn verify_version_consistency(
+        &self,
+        required_version: &ContextVersion,
+    ) -> Result<(), AceError> {
+        // 默认实现：始终兼容
+        let _ = required_version;
+        Ok(())
+    }
+
+    /// 获取当前上下文版本
+    fn get_current_version(&self) -> Result<ContextVersion, AceError> {
+        // 默认实现：返回默认版本
+        Ok(ContextVersion::default())
+    }
+
+    /// 为对话事件生成Evidence Pointer
+    ///
+    /// 生成一个指向上下文来源的Evidence Pointer，用于追踪和审计
+    ///
+    /// # Arguments
+    /// * `event_id` - 事件ID
+    /// * `content` - 内容（用于生成digest）
+    /// * `access_class` - 访问控制类别
+    ///
+    /// # Returns
+    /// Evidence Pointer，包含URI、digest、access_policy等信息
+    fn generate_evidence_pointer(
+        &self,
+        event_id: EventId,
+        content: &str,
+        access_class: Option<AccessClass>,
+    ) -> EvidencePointer {
+        // 计算内容摘要
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+
+        // 构造URI
+        let uri = format!("soul://context/event/{}", event_id.as_u64());
+
+        // 确定访问策略
+        let access_policy = match access_class {
+            Some(AccessClass::Restricted) => Some("restricted".into()),
+            Some(AccessClass::Internal) => Some("internal".into()),
+            Some(AccessClass::Public) | None => Some("public".into()),
+        };
+
+        EvidencePointer {
+            uri,
+            digest_sha256: Some(digest),
+            media_type: Some("text/plain".into()),
+            blob_ref: None,
+            span: None,
+            access_policy,
+        }
+    }
+
+    /// 验证Evidence Pointer链的完整性
+    ///
+    /// 检查一组Evidence Pointer是否形成完整的追踪链
+    ///
+    /// # Arguments
+    /// * `pointers` - Evidence Pointer列表
+    ///
+    /// # Returns
+    /// 如果链完整返回Ok，否则返回错误
+    fn verify_evidence_chain(&self, pointers: &[EvidencePointer]) -> Result<(), AceError> {
+        if pointers.is_empty() {
+            return Ok(()); // 空链也被认为是有效的
+        }
+
+        // 验证每个pointer都有必需的字段
+        for (idx, pointer) in pointers.iter().enumerate() {
+            if pointer.uri.is_empty() {
+                return Err(AceError::Ca(format!(
+                    "Evidence pointer at index {} has empty URI",
+                    idx
+                )));
+            }
+
+            // 如果有digest，验证格式（应该是64字符的hex）
+            if let Some(digest) = &pointer.digest_sha256 {
+                if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(AceError::Ca(format!(
+                        "Evidence pointer at index {} has invalid digest format: {}",
+                        idx, digest
+                    )));
+                }
+            }
+
+            // 验证URI格式（应该以soul://开头）
+            if !pointer.uri.starts_with("soul://") && !pointer.uri.starts_with("context://") {
+                return Err(AceError::Ca(format!(
+                    "Evidence pointer at index {} has invalid URI scheme: {}",
+                    idx, pointer.uri
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub struct CaServiceDefault {
     runtime: Mutex<LocalContextRuntime>,
+    version: Mutex<ContextVersion>,
 }
 
 impl Default for CaServiceDefault {
     fn default() -> Self {
         Self {
             runtime: Mutex::new(LocalContextRuntime::default()),
+            version: Mutex::new(ContextVersion::default()),
         }
     }
 }
@@ -182,6 +357,76 @@ impl CaService for CaServiceDefault {
             prompt_bundle: Some(prompt_bundle),
             explain_bundle: Some(explain_bundle),
         })
+    }
+
+    fn request_compact(&self) -> Result<ContextVersion, AceError> {
+        // 获取当前版本并升级主版本号
+        let mut version = self
+            .version
+            .lock()
+            .map_err(|_| AceError::Ca("version_lock_poisoned".into()))?;
+
+        // Compact操作：升级主版本
+        let new_version = version.increment_major();
+
+        // 计算新的校验和（基于当前时间戳作为简化实现）
+        let checksum = hash_json(&json!({
+            "major": new_version.major,
+            "minor": new_version.minor,
+            "timestamp": OffsetDateTime::now_utc().unix_timestamp(),
+        }));
+
+        let final_version = ContextVersion::new(new_version.major, new_version.minor, checksum);
+
+        // 更新存储的版本
+        *version = final_version.clone();
+
+        tracing::info!(
+            "Context compact: version upgraded to v{}.{}",
+            final_version.major,
+            final_version.minor
+        );
+
+        Ok(final_version)
+    }
+
+    fn verify_version_consistency(
+        &self,
+        required_version: &ContextVersion,
+    ) -> Result<(), AceError> {
+        let current_version = self
+            .version
+            .lock()
+            .map_err(|_| AceError::Ca("version_lock_poisoned".into()))?;
+
+        if !current_version.is_compatible_with(required_version) {
+            return Err(AceError::Ca(format!(
+                "Version mismatch: current v{}.{}, required v{}.{}",
+                current_version.major,
+                current_version.minor,
+                required_version.major,
+                required_version.minor
+            )));
+        }
+
+        tracing::debug!(
+            "Version consistency verified: v{}.{} compatible with v{}.{}",
+            current_version.major,
+            current_version.minor,
+            required_version.major,
+            required_version.minor
+        );
+
+        Ok(())
+    }
+
+    fn get_current_version(&self) -> Result<ContextVersion, AceError> {
+        let version = self
+            .version
+            .lock()
+            .map_err(|_| AceError::Ca("version_lock_poisoned".into()))?;
+
+        Ok(version.clone())
     }
 }
 

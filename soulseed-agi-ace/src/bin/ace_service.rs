@@ -1091,4 +1091,30 @@ impl AcePersistence for NoopPersistence {
     ) -> Result<Vec<AwarenessEvent>, AceError> {
         Ok(Vec::new())
     }
+
+    fn transactional_checkpoint_and_outbox(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _cycle_id: soulseed_agi_core_models::AwarenessCycleId,
+        _snapshot: &Value,
+        _outbox_messages: &[soulseed_agi_ace::types::OutboxMessage],
+    ) -> Result<(), AceError> {
+        Ok(())
+    }
+
+    fn list_pending_outbox(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _limit: usize,
+    ) -> Result<Vec<soulseed_agi_ace::types::OutboxMessage>, AceError> {
+        Ok(Vec::new())
+    }
+
+    fn mark_outbox_sent(
+        &self,
+        _tenant_id: soulseed_agi_core_models::TenantId,
+        _event_ids: &[soulseed_agi_core_models::EventId],
+    ) -> Result<(), AceError> {
+        Ok(())
+    }
 }

@@ -2,6 +2,7 @@ use crate::aggregator::SyncPointAggregator;
 use crate::budget::BudgetManager;
 use crate::ca::InjectionAction;
 use crate::checkpointer::Checkpointer;
+use crate::collab::BarrierManager;
 use crate::emitter::Emitter;
 use crate::errors::AceError;
 use crate::hitl::HitlService;
@@ -34,6 +35,7 @@ pub struct AceEngine<'a> {
     pub metrics: &'a dyn AceMetrics,
     pub router: &'a RouterService,
     pub route_planner: &'a RoutePlanner,
+    pub barrier_manager: BarrierManager,
     pub lane_cooldown: Duration,
     pub persistence: Option<Arc<dyn AcePersistence>>,
     finalized: Arc<Mutex<HashSet<u64>>>,
@@ -64,6 +66,7 @@ impl<'a> AceEngine<'a> {
             metrics,
             router,
             route_planner,
+            barrier_manager: BarrierManager::new(),
             lane_cooldown: Duration::seconds(2),
             persistence: None,
             finalized: Arc::new(Mutex::new(HashSet::new())),
@@ -124,6 +127,202 @@ impl<'a> AceEngine<'a> {
             self.metrics.counter("ace.schedule.rejected", 1.0, &labels);
         }
         Ok(outcome)
+    }
+
+    /// 生成子觉知周期（用于协同场景的分形递归）
+    ///
+    /// 在Collab路径下，可以为每个子Agent创建独立的觉知周期，
+    /// 这些子周期将继承父周期的上下文（按可见域裁剪），
+    /// 并通过Barrier机制聚合结果
+    pub fn spawn_child_cycle(
+        &self,
+        parent_schedule: &CycleSchedule,
+        collab_plan: &soulseed_agi_core_models::awareness::CollabPlan,
+        child_input: &soulseed_agi_dfr::types::RouterInput,
+        child_budget: BudgetSnapshot,
+    ) -> Result<ScheduleOutcome, AceError> {
+        // 1. 验证父周期是Collab路径
+        if !matches!(parent_schedule.lane, CycleLane::Collab) {
+            return Err(AceError::Dfr(
+                "spawn_child_cycle只能在Collab路径下调用".into(),
+            ));
+        }
+
+        let scope_id = parent_schedule.collab_scope_id.clone()
+            .unwrap_or_else(|| format!("collab_{}", parent_schedule.cycle_id.as_u64()));
+
+        // 2. 创建Barrier群组（如果还未创建）
+        // 使用 rounds 作为期望的子周期数量提示，如果没有则使用默认值10
+        // 实际的子周期数量在 absorb_child_result 时动态确定
+        let expected_children = collab_plan.rounds.unwrap_or(10) as usize;
+        if self.barrier_manager.get_group(parent_schedule.cycle_id).is_none() {
+            self.barrier_manager.create_group(
+                parent_schedule.cycle_id,
+                scope_id.clone(),
+                expected_children,
+            )?;
+
+            tracing::info!(
+                "Created barrier group for parent_cycle={}, expected_children={}",
+                parent_schedule.cycle_id.as_u64(),
+                expected_children
+            );
+        }
+
+        // 3. 构建子周期的CycleRequest
+        let child_request = CycleRequest {
+            router_input: child_input.clone(),
+            candidates: vec![], // 子周期使用默认候选路径
+            budget: child_budget,
+            parent_cycle_id: Some(parent_schedule.cycle_id),
+            collab_scope_id: Some(scope_id),
+        };
+
+        // 4. 调用schedule_cycle创建子周期
+        let outcome = self.schedule_cycle(child_request)?;
+
+        // 5. 注册子周期到Barrier群组
+        if let Some(cycle) = &outcome.cycle {
+            self.barrier_manager.register_child(
+                parent_schedule.cycle_id,
+                cycle.cycle_id,
+            )?;
+
+            self.metrics.counter(
+                "ace.child_cycle.spawned",
+                1.0,
+                &[
+                    ("parent_cycle_id", parent_schedule.cycle_id.as_u64().to_string()),
+                    ("child_cycle_id", cycle.cycle_id.as_u64().to_string()),
+                    ("child_lane", format!("{:?}", cycle.lane)),
+                ],
+            );
+        }
+
+        Ok(outcome)
+    }
+
+    /// 吸收子周期结果（Barrier聚合）
+    ///
+    /// 当一个子周期完成时，父周期通过此方法吸收子周期的结果。
+    /// 这是分形递归的关键步骤，实现了跨层级的状态聚合。
+    pub fn absorb_child_result(
+        &self,
+        parent_cycle_id: AwarenessCycleId,
+        child_cycle_id: AwarenessCycleId,
+        child_emission: &CycleEmission,
+    ) -> Result<(), AceError> {
+        // 1. 验证child_cycle_id确实是parent_cycle_id的子周期
+        if child_emission.parent_cycle_id != Some(parent_cycle_id) {
+            return Err(AceError::Dfr(format!(
+                "child_cycle {} 不是 parent_cycle {} 的子周期",
+                child_cycle_id.as_u64(),
+                parent_cycle_id.as_u64()
+            )));
+        }
+
+        // 2. 通过BarrierManager记录子周期完成
+        let is_barrier_ready = self.barrier_manager.complete_child(
+            parent_cycle_id,
+            child_cycle_id,
+            child_emission.clone(),
+        )?;
+
+        // 3. 记录子周期吸收指标
+        self.metrics.counter(
+            "ace.child_cycle.absorbed",
+            1.0,
+            &[
+                ("parent_cycle_id", parent_cycle_id.as_u64().to_string()),
+                ("child_cycle_id", child_cycle_id.as_u64().to_string()),
+                ("child_status", format!("{:?}", child_emission.status)),
+                ("barrier_ready", if is_barrier_ready { "true" } else { "false" }.to_string()),
+            ],
+        );
+
+        // 4. 如果Barrier就绪，执行聚合逻辑
+        if is_barrier_ready {
+            self.perform_barrier_aggregation(parent_cycle_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// 执行Barrier聚合
+    ///
+    /// 当所有子周期都完成时，将子周期结果聚合并注入到父周期
+    fn perform_barrier_aggregation(
+        &self,
+        parent_cycle_id: AwarenessCycleId,
+    ) -> Result<(), AceError> {
+        // 1. 获取Barrier群组
+        let group = self.barrier_manager.get_group(parent_cycle_id)
+            .ok_or_else(|| AceError::ScheduleConflict(format!(
+                "Barrier group not found for parent {}",
+                parent_cycle_id.as_u64()
+            )))?;
+
+        // 2. 收集所有子周期的结果
+        let completed_emissions = group.get_completed_emissions();
+
+        // 3. 构建聚合payload
+        let aggregated_results: Vec<Value> = completed_emissions
+            .iter()
+            .map(|emission| {
+                json!({
+                    "child_cycle_id": emission.cycle_id.as_u64(),
+                    "child_lane": format!("{:?}", emission.lane),
+                    "child_status": format!("{:?}", emission.status),
+                    "final_event": emission.final_event,
+                    "context_manifest": emission.context_manifest,
+                })
+            })
+            .collect();
+
+        // 4. 将聚合结果作为异步回执注入到父周期
+        let payload = json!({
+            "type": "barrier_aggregation",
+            "barrier_id": group.scope_id,
+            "total_children": group.expected_children,
+            "completed_children": completed_emissions.len(),
+            "results": aggregated_results,
+        });
+
+        // 使用第一个子周期的tenant_id（所有子周期应该有相同的tenant_id）
+        let tenant_id = completed_emissions
+            .first()
+            .map(|e| e.anchor.tenant_id)
+            .ok_or_else(|| AceError::ThinWaist("No completed children found".to_string()))?;
+
+        let injection = crate::hitl::HitlInjection::new(
+            tenant_id,
+            crate::hitl::HitlPriority::P1High,
+            "system:barrier_aggregation",
+            payload,
+        );
+
+        self.hitl.enqueue(injection);
+
+        // 5. 标记Barrier群组已完成并清理
+        self.barrier_manager.finish_group(parent_cycle_id)?;
+
+        // 6. 记录Barrier聚合完成指标
+        self.metrics.counter(
+            "ace.barrier.aggregated",
+            1.0,
+            &[
+                ("parent_cycle_id", parent_cycle_id.as_u64().to_string()),
+                ("children_count", completed_emissions.len().to_string()),
+            ],
+        );
+
+        tracing::info!(
+            "Barrier aggregation completed: parent_cycle={}, children_count={}",
+            parent_cycle_id.as_u64(),
+            completed_emissions.len()
+        );
+
+        Ok(())
     }
 
     pub fn evaluate_budget(

@@ -1,11 +1,11 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use soulseed_agi_core_models::TenantId;
+use soulseed_agi_core_models::{AwarenessCycleId, TenantId};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -59,6 +59,64 @@ impl HitlInjection {
     pub fn with_submitted_at(mut self, submitted_at: OffsetDateTime) -> Self {
         self.submitted_at = submitted_at;
         self
+    }
+}
+
+/// 延迟注入的触发条件
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerCondition {
+    /// 当预算超出阈值时触发
+    BudgetExceeded {
+        /// 预算使用率阈值 (0.0-1.0)
+        threshold: u8,
+    },
+    /// 当路由变更时触发
+    RouteChanged,
+    /// 当指定周期完成时触发
+    CycleCompleted {
+        cycle_id: AwarenessCycleId,
+    },
+    /// 当时间到期时触发（在expires_at字段中指定）
+    TimeElapsed,
+    /// 当任意SyncPoint完成时触发
+    AnySyncPointCompleted,
+}
+
+/// 延迟注入 - 满足条件后才会注入到HITL队列
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeferredInjection {
+    pub deferred_id: Uuid,
+    pub injection: HitlInjection,
+    pub trigger_condition: TriggerCondition,
+    pub created_at: OffsetDateTime,
+    pub expires_at: OffsetDateTime,
+}
+
+impl DeferredInjection {
+    pub fn new(
+        injection: HitlInjection,
+        trigger_condition: TriggerCondition,
+        ttl_seconds: i64,
+    ) -> Self {
+        let now = OffsetDateTime::now_utc();
+        Self {
+            deferred_id: Uuid::now_v7(),
+            injection,
+            trigger_condition,
+            created_at: now,
+            expires_at: now + time::Duration::seconds(ttl_seconds),
+        }
+    }
+
+    pub fn with_expires_at(mut self, expires_at: OffsetDateTime) -> Self {
+        self.expires_at = expires_at;
+        self
+    }
+
+    /// 检查是否已过期
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
+        now >= self.expires_at
     }
 }
 
@@ -391,6 +449,203 @@ impl HitlService {
     }
 }
 
+/// 延迟注入队列 - 管理条件化的HITL注入
+#[derive(Clone)]
+pub struct DeferredInjectionQueue {
+    state: Arc<Mutex<DeferredQueueState>>,
+}
+
+#[derive(Default)]
+struct DeferredQueueState {
+    /// 所有待触发的延迟注入
+    pending: VecDeque<DeferredInjection>,
+    /// 已触发并移入HITL队列的注入ID
+    triggered: HashSet<Uuid>,
+}
+
+impl DeferredInjectionQueue {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(DeferredQueueState::default())),
+        }
+    }
+
+    /// 添加延迟注入到队列
+    pub fn enqueue(&self, deferred: DeferredInjection) {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        guard.pending.push_back(deferred);
+        tracing::debug!(
+            "Deferred injection enqueued: {} items in queue",
+            guard.pending.len()
+        );
+    }
+
+    /// 检查并清理过期的延迟注入
+    pub fn expire_old(&self, now: OffsetDateTime) -> Vec<DeferredInjection> {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        let mut expired = Vec::new();
+        let mut retained = VecDeque::new();
+
+        while let Some(deferred) = guard.pending.pop_front() {
+            if deferred.is_expired(now) {
+                tracing::info!(
+                    "Deferred injection expired: deferred_id={}, trigger={:?}",
+                    deferred.deferred_id,
+                    deferred.trigger_condition
+                );
+                expired.push(deferred);
+            } else {
+                retained.push_back(deferred);
+            }
+        }
+
+        guard.pending = retained;
+        expired
+    }
+
+    /// 检查时间触发条件
+    pub fn check_time_triggers(&self, now: OffsetDateTime) -> Vec<HitlInjection> {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        let mut triggered = Vec::new();
+        let mut retained = VecDeque::new();
+
+        while let Some(deferred) = guard.pending.pop_front() {
+            let should_trigger = matches!(deferred.trigger_condition, TriggerCondition::TimeElapsed)
+                && now >= deferred.expires_at;
+
+            if should_trigger {
+                tracing::info!(
+                    "Time-based deferred injection triggered: deferred_id={}",
+                    deferred.deferred_id
+                );
+                guard.triggered.insert(deferred.deferred_id);
+                triggered.push(deferred.injection);
+            } else {
+                retained.push_back(deferred);
+            }
+        }
+
+        guard.pending = retained;
+        triggered
+    }
+
+    /// 检查预算超出触发条件
+    pub fn check_budget_triggers(&self, usage_ratio: f32) -> Vec<HitlInjection> {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        let mut triggered = Vec::new();
+        let mut retained = VecDeque::new();
+
+        while let Some(deferred) = guard.pending.pop_front() {
+            let should_trigger = match &deferred.trigger_condition {
+                TriggerCondition::BudgetExceeded { threshold } => {
+                    usage_ratio >= (*threshold as f32 / 100.0)
+                }
+                _ => false,
+            };
+
+            if should_trigger {
+                tracing::info!(
+                    "Budget-based deferred injection triggered: deferred_id={}, usage={}%",
+                    deferred.deferred_id,
+                    usage_ratio * 100.0
+                );
+                guard.triggered.insert(deferred.deferred_id);
+                triggered.push(deferred.injection);
+            } else {
+                retained.push_back(deferred);
+            }
+        }
+
+        guard.pending = retained;
+        triggered
+    }
+
+    /// 检查路由变更触发条件
+    pub fn check_route_change_triggers(&self) -> Vec<HitlInjection> {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        let mut triggered = Vec::new();
+        let mut retained = VecDeque::new();
+
+        while let Some(deferred) = guard.pending.pop_front() {
+            let should_trigger = matches!(deferred.trigger_condition, TriggerCondition::RouteChanged);
+
+            if should_trigger {
+                tracing::info!(
+                    "Route-change deferred injection triggered: deferred_id={}",
+                    deferred.deferred_id
+                );
+                guard.triggered.insert(deferred.deferred_id);
+                triggered.push(deferred.injection);
+            } else {
+                retained.push_back(deferred);
+            }
+        }
+
+        guard.pending = retained;
+        triggered
+    }
+
+    /// 检查周期完成触发条件
+    pub fn check_cycle_completed_triggers(&self, cycle_id: AwarenessCycleId) -> Vec<HitlInjection> {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        let mut triggered = Vec::new();
+        let mut retained = VecDeque::new();
+
+        while let Some(deferred) = guard.pending.pop_front() {
+            let should_trigger = match &deferred.trigger_condition {
+                TriggerCondition::CycleCompleted { cycle_id: target_id } => {
+                    *target_id == cycle_id
+                }
+                TriggerCondition::AnySyncPointCompleted => true,
+                _ => false,
+            };
+
+            if should_trigger {
+                tracing::info!(
+                    "Cycle-completion deferred injection triggered: deferred_id={}, cycle_id={}",
+                    deferred.deferred_id,
+                    cycle_id.as_u64()
+                );
+                guard.triggered.insert(deferred.deferred_id);
+                triggered.push(deferred.injection);
+            } else {
+                retained.push_back(deferred);
+            }
+        }
+
+        guard.pending = retained;
+        triggered
+    }
+
+    /// 获取队列中待处理的延迟注入数量
+    pub fn len(&self) -> usize {
+        self.state.lock().expect("deferred queue poisoned").pending.len()
+    }
+
+    /// 检查队列是否为空
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 获取已触发的注入数量
+    pub fn triggered_count(&self) -> usize {
+        self.state.lock().expect("deferred queue poisoned").triggered.len()
+    }
+
+    /// 清空队列（仅用于测试）
+    pub fn clear(&self) {
+        let mut guard = self.state.lock().expect("deferred queue poisoned");
+        guard.pending.clear();
+        guard.triggered.clear();
+    }
+}
+
+impl Default for DeferredInjectionQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +792,206 @@ mod tests {
 
         let clarify_next = service.next_ready_for_clarify().expect("clarify next");
         assert_eq!(clarify_next.payload["id"], 8);
+    }
+
+    #[test]
+    fn deferred_injection_time_trigger() {
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(10);
+        let now = OffsetDateTime::now_utc();
+
+        // 创建一个立即过期的延迟注入
+        let injection = HitlInjection::new(
+            tenant,
+            HitlPriority::P1High,
+            "system",
+            json!({"id": 100, "reason": "time_trigger"}),
+        );
+        let deferred = DeferredInjection::new(
+            injection,
+            TriggerCondition::TimeElapsed,
+            -1, // 已过期
+        );
+
+        queue.enqueue(deferred);
+        assert_eq!(queue.len(), 1);
+
+        // 检查时间触发
+        let triggered = queue.check_time_triggers(now);
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].payload["id"], 100);
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.triggered_count(), 1);
+    }
+
+    #[test]
+    fn deferred_injection_budget_trigger() {
+        use soulseed_agi_core_models::AwarenessCycleId;
+
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(11);
+
+        // 创建一个预算触发条件（阈值80%）
+        let injection = HitlInjection::new(
+            tenant,
+            HitlPriority::P0Critical,
+            "system",
+            json!({"id": 101, "reason": "budget_exceeded"}),
+        );
+        let deferred = DeferredInjection::new(
+            injection,
+            TriggerCondition::BudgetExceeded { threshold: 80 },
+            300, // 5分钟TTL
+        );
+
+        queue.enqueue(deferred);
+
+        // 预算使用率低于阈值，不应触发
+        let triggered = queue.check_budget_triggers(0.7);
+        assert_eq!(triggered.len(), 0);
+        assert_eq!(queue.len(), 1);
+
+        // 预算使用率达到阈值，应触发
+        let triggered = queue.check_budget_triggers(0.85);
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].payload["id"], 101);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn deferred_injection_cycle_completed_trigger() {
+        use soulseed_agi_core_models::AwarenessCycleId;
+
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(12);
+        let target_cycle = AwarenessCycleId::from_raw_unchecked(123);
+
+        // 创建周期完成触发条件
+        let injection = HitlInjection::new(
+            tenant,
+            HitlPriority::P2Medium,
+            "participant",
+            json!({"id": 102, "reason": "cycle_completed"}),
+        );
+        let deferred = DeferredInjection::new(
+            injection,
+            TriggerCondition::CycleCompleted { cycle_id: target_cycle },
+            600, // 10分钟TTL
+        );
+
+        queue.enqueue(deferred);
+
+        // 不同的周期完成，不应触发
+        let other_cycle = AwarenessCycleId::from_raw_unchecked(456);
+        let triggered = queue.check_cycle_completed_triggers(other_cycle);
+        assert_eq!(triggered.len(), 0);
+        assert_eq!(queue.len(), 1);
+
+        // 目标周期完成，应触发
+        let triggered = queue.check_cycle_completed_triggers(target_cycle);
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].payload["id"], 102);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn deferred_injection_any_syncpoint_trigger() {
+        use soulseed_agi_core_models::AwarenessCycleId;
+
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(13);
+
+        // 创建"任意SyncPoint完成"触发条件
+        let injection = HitlInjection::new(
+            tenant,
+            HitlPriority::P3Low,
+            "guest",
+            json!({"id": 103, "reason": "any_syncpoint"}),
+        );
+        let deferred = DeferredInjection::new(
+            injection,
+            TriggerCondition::AnySyncPointCompleted,
+            900, // 15分钟TTL
+        );
+
+        queue.enqueue(deferred);
+
+        // 任意周期完成都应触发
+        let any_cycle = AwarenessCycleId::from_raw_unchecked(999);
+        let triggered = queue.check_cycle_completed_triggers(any_cycle);
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].payload["id"], 103);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn deferred_injection_expiration() {
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(14);
+        let now = OffsetDateTime::now_utc();
+
+        // 创建已过期的延迟注入
+        let injection1 = HitlInjection::new(
+            tenant,
+            HitlPriority::P1High,
+            "system",
+            json!({"id": 104}),
+        );
+        let deferred1 = DeferredInjection::new(
+            injection1,
+            TriggerCondition::RouteChanged,
+            -10, // 已过期10秒
+        );
+
+        // 创建未过期的延迟注入
+        let injection2 = HitlInjection::new(
+            tenant,
+            HitlPriority::P2Medium,
+            "facilitator",
+            json!({"id": 105}),
+        );
+        let deferred2 = DeferredInjection::new(
+            injection2,
+            TriggerCondition::RouteChanged,
+            3600, // 1小时TTL
+        );
+
+        queue.enqueue(deferred1);
+        queue.enqueue(deferred2);
+        assert_eq!(queue.len(), 2);
+
+        // 清理过期项
+        let expired = queue.expire_old(now);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].injection.payload["id"], 104);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn deferred_injection_route_change_trigger() {
+        let queue = DeferredInjectionQueue::new();
+        let tenant = TenantId::new(15);
+
+        // 创建路由变更触发条件
+        let injection = HitlInjection::new(
+            tenant,
+            HitlPriority::P1High,
+            "system",
+            json!({"id": 106, "reason": "route_changed"}),
+        );
+        let deferred = DeferredInjection::new(
+            injection,
+            TriggerCondition::RouteChanged,
+            300,
+        );
+
+        queue.enqueue(deferred);
+        assert_eq!(queue.len(), 1);
+
+        // 检查路由变更触发
+        let triggered = queue.check_route_change_triggers();
+        assert_eq!(triggered.len(), 1);
+        assert_eq!(triggered[0].payload["id"], 106);
+        assert_eq!(queue.len(), 0);
     }
 }

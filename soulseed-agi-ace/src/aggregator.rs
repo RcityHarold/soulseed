@@ -1,7 +1,7 @@
 use blake3::Hasher;
 use serde_json::{Value, json, to_value};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::ca::{
     CaService, CaServiceDefault, InjectionAction, MergeDeltaRequest, MergeDeltaResponse,
@@ -18,16 +18,22 @@ use soulseed_agi_core_models::awareness::{
     AwarenessDegradationReason, AwarenessEvent, AwarenessEventType,
 };
 use soulseed_agi_core_models::{DialogueEvent, DialogueEventPayloadKind, DialoguePayloadDomain};
+use time::OffsetDateTime;
 use tracing::warn;
 
 pub struct SyncPointAggregator {
     ca: Arc<dyn CaService>,
+    /// 已经finalized的SyncPoint ID集合，用于检测late arrival
+    finalized_syncs: Mutex<HashSet<String>>,
 }
 
 impl Default for SyncPointAggregator {
     fn default() -> Self {
         let ca: Arc<dyn CaService> = Arc::new(CaServiceDefault::default());
-        Self { ca }
+        Self {
+            ca,
+            finalized_syncs: Mutex::new(HashSet::new()),
+        }
     }
 }
 
@@ -285,7 +291,48 @@ mod tests {
 
 impl SyncPointAggregator {
     pub fn new(ca: Arc<dyn CaService>) -> Self {
-        Self { ca }
+        Self {
+            ca,
+            finalized_syncs: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// 检查并处理迟到的SyncPoint
+    ///
+    /// 如果sync_id已经finalized，生成LateReceiptObserved事件
+    fn handle_late_receipt(&self, sync_id: &str, input: &SyncPointInput) -> Option<AwarenessEvent> {
+        let finalized = self.finalized_syncs.lock().unwrap();
+        if finalized.contains(sync_id) {
+            // 生成LateReceiptObserved事件
+            tracing::warn!(
+                "Late SyncPoint arrival detected: sync_id={}, cycle_id={}",
+                sync_id,
+                input.cycle_id.as_u64()
+            );
+
+            Some(AwarenessEvent {
+                anchor: input.anchor.clone(),
+                event_id: soulseed_agi_core_models::EventId::generate(),
+                event_type: AwarenessEventType::LateReceiptObserved,
+                occurred_at_ms: OffsetDateTime::now_utc().unix_timestamp() * 1000,
+                awareness_cycle_id: input.cycle_id,
+                parent_cycle_id: None,
+                collab_scope_id: None,
+                barrier_id: None,
+                env_mode: None,
+                inference_cycle_sequence: 1,
+                degradation_reason: None,
+                payload: json!({
+                    "sync_id": sync_id,
+                    "cycle_id": input.cycle_id.as_u64(),
+                    "kind": format!("{:?}", input.kind),
+                    "event_count": input.events.len(),
+                    "reason": "sync_point_already_finalized",
+                }),
+            })
+        } else {
+            None
+        }
     }
 
     pub fn aggregate(&self, input: SyncPointInput) -> Result<AggregationOutcome, AceError> {
@@ -293,6 +340,24 @@ impl SyncPointAggregator {
             return Err(AceError::InvalidRequest(
                 "sync point requires events".into(),
             ));
+        }
+
+        // 生成sync_id用于去重检测
+        let sync_id = format!(
+            "sync:{}:{}:{:?}",
+            input.cycle_id.as_u64(),
+            input.anchor.tenant_id.into_inner(),
+            input.kind
+        );
+
+        // 检查是否是late arrival
+        let mut late_receipt_event = None;
+        if let Some(event) = self.handle_late_receipt(&sync_id, &input) {
+            late_receipt_event = Some(event);
+            tracing::info!(
+                "Late SyncPoint detected and LateReceiptObserved event generated for sync_id: {}",
+                sync_id
+            );
         }
 
         let mut events = input.events.clone();
@@ -620,6 +685,20 @@ impl SyncPointAggregator {
             delta_patch_digest: delta_digest.clone(),
             explain_fingerprint: explain_fingerprint.clone(),
         };
+
+        // 如果有late receipt事件，添加到awareness_events
+        let is_late_receipt = late_receipt_event.is_some();
+        if let Some(late_event) = late_receipt_event {
+            awareness_events.insert(0, late_event); // 插入到最前面
+        }
+
+        // 标记这个SyncPoint为已finalized
+        if !is_late_receipt {
+            // 只有不是late arrival时才标记为finalized
+            let mut finalized = self.finalized_syncs.lock().unwrap();
+            finalized.insert(sync_id.clone());
+            tracing::debug!("SyncPoint finalized: {}", sync_id);
+        }
 
         Ok(AggregationOutcome {
             report,
