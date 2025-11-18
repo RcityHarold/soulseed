@@ -15,6 +15,7 @@ pub mod recovery;
 pub mod runtime;
 pub mod scheduler;
 pub mod slo;
+pub mod tool_gateway;
 mod tw_gateway;
 pub mod types;
 
@@ -33,4 +34,5 @@ pub use recovery::*;
 pub use runtime::*;
 pub use scheduler::*;
 pub use slo::*;
+pub use tool_gateway::*;
 pub use types::*;

@@ -22,4 +22,6 @@ pub enum AceError {
     Ca(String),
     #[error("persistence error: {0}")]
     Persistence(String),
+    #[error("tool execution error: {0}")]
+    Tool(String),
 }

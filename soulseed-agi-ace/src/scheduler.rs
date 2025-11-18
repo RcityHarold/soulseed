@@ -46,9 +46,9 @@ struct SchedulerState {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ClarifyStats {
-    rounds: u32,
-    first_enqueued_at: OffsetDateTime,
+pub struct ClarifyStats {
+    pub rounds: u32,
+    pub first_enqueued_at: OffsetDateTime,
 }
 
 /// Clarify闸门降级评估结果
@@ -190,6 +190,7 @@ impl CycleScheduler {
                         reason: Some("clarify_lane_busy".into()),
                         cycle: None,
                         awareness_events: Vec::new(),
+                        fork_weights: None,
                     });
                 }
             }
@@ -205,6 +206,7 @@ impl CycleScheduler {
                         reason: Some("clarify_lane_busy".into()),
                         cycle: None,
                         awareness_events: Vec::new(),
+                        fork_weights: None,
                     });
                 }
             }
@@ -217,10 +219,12 @@ impl CycleScheduler {
                 reason: Some("pending_limit".into()),
                 cycle: None,
                 awareness_events: Vec::new(),
+                fork_weights: None,
             });
         }
 
         // Clarify闸门检查和降级评估
+        let mut degradation_strategy = None;
         if matches!(lane, CycleLane::Clarify) {
             let queue = guard.pending.entry(tenant).or_default();
             let predicted_queue = queue
@@ -250,10 +254,11 @@ impl CycleScheduler {
                     reason: gate_result.reason,
                     cycle: None,
                     awareness_events: vec![event],
+                    fork_weights: None,
                 });
             }
 
-            // 即使接受，也可能有降级建议
+            // 即使接受，也可能有降级建议 - 保存到CycleSchedule中供后续使用
             if let Some(strategy) = &gate_result.degradation_strategy {
                 tracing::warn!(
                     "Clarify gate degradation: tenant={}, strategy={:?}, metrics={:?}",
@@ -261,7 +266,7 @@ impl CycleScheduler {
                     strategy,
                     gate_result.metrics
                 );
-                // TODO: 可以在未来将降级建议传递给runtime或aggregator使用
+                degradation_strategy = Some(strategy.clone());
             }
 
             stats_entry.rounds = gate_result.metrics.rounds;
@@ -279,6 +284,9 @@ impl CycleScheduler {
             collab_scope_ref,
         );
         let explain_fingerprint = fingerprint_decision(&decision);
+
+        // 生成四分叉权重对比（在decision被move之前）
+        let fork_weights = Some(generate_fork_weights(&decision, &budget));
 
         let initial_status = if matches!(lane, CycleLane::SelfReason) {
             CycleStatus::Running
@@ -298,6 +306,7 @@ impl CycleScheduler {
             status: initial_status,
             parent_cycle_id,
             collab_scope_id: collab_scope_id.clone(),
+            degradation_strategy,
         };
 
         guard
@@ -307,11 +316,13 @@ impl CycleScheduler {
             .push_back(cycle.clone());
         guard.last_fork.insert(tenant, lane.as_fork());
         guard.status.insert(plan_cycle_id.as_u64(), initial_status);
+
         Ok(ScheduleOutcome {
             accepted: true,
             reason: None,
             cycle: Some(cycle),
             awareness_events: decision_events,
+            fork_weights,
         })
     }
 
@@ -355,6 +366,52 @@ impl CycleScheduler {
                 guard.clarify_stats.remove(&tenant);
             }
         }
+    }
+
+    /// 应用降级策略 - 根据degradation_strategy生成awareness事件
+    ///
+    /// 用于在HITL超时或其他降级场景时，记录降级决策和触发相应的降级行为
+    pub fn apply_degradation_strategy(
+        &self,
+        schedule: &CycleSchedule,
+        reason: &str,
+    ) -> Vec<soulseed_agi_core_models::awareness::AwarenessEvent> {
+        let Some(strategy) = &schedule.degradation_strategy else {
+            return Vec::new();
+        };
+
+        use uuid::Uuid;
+
+        let event = soulseed_agi_core_models::awareness::AwarenessEvent {
+            anchor: schedule.anchor.clone(),
+            event_id: soulseed_agi_core_models::EventId::new(Uuid::now_v7().as_u128() as u64),
+            event_type: soulseed_agi_core_models::awareness::AwarenessEventType::SyncPointReported,
+            occurred_at_ms: time::OffsetDateTime::now_utc().unix_timestamp() * 1000,
+            awareness_cycle_id: schedule.cycle_id,
+            parent_cycle_id: schedule.parent_cycle_id,
+            collab_scope_id: schedule.collab_scope_id.clone(),
+            barrier_id: None,
+            env_mode: None,
+            inference_cycle_sequence: 1,
+            degradation_reason: None,
+            payload: serde_json::json!({
+                "type": "degradation_applied",
+                "strategy": format!("{:?}", strategy),
+                "lane": format!("{:?}", schedule.lane),
+                "cycle_id": schedule.cycle_id.as_u64(),
+                "reason": reason,
+            }),
+        };
+
+        tracing::info!(
+            "Applying degradation strategy: cycle={}, lane={:?}, strategy={:?}, reason={}",
+            schedule.cycle_id.as_u64(),
+            schedule.lane,
+            strategy,
+            reason
+        );
+
+        vec![event]
     }
 
     pub fn mark_status(&self, cycle_id: AwarenessCycleId, status: CycleStatus) {
@@ -579,6 +636,7 @@ fn build_degradation_event_with_strategy(
 }
 
 // 保留旧函数用于向后兼容
+#[allow(dead_code)]
 fn build_degradation_event(
     anchor: &AwarenessAnchor,
     rounds: u32,
@@ -607,6 +665,66 @@ fn map_degradation(reason: Option<&str>) -> Option<AwarenessDegradationReason> {
         Some("budget_external_cost") => Some(AwarenessDegradationReason::BudgetExternalCost),
         Some("invalid_plan") => Some(AwarenessDegradationReason::InvalidPlan),
         _ => None,
+    }
+}
+
+/// 生成四分叉权重对比
+///
+/// 基于RouterDecision和BudgetSnapshot，使用启发式算法计算所有四个分叉的权重。
+/// 这为调试和解释路由决策提供了透明度。
+///
+/// # Arguments
+/// * `decision` - 路由决策
+/// * `budget` - 预算快照
+///
+/// # Returns
+/// 包含所有四个分叉权重和贡献度分解的ForkWeightsComparison
+fn generate_fork_weights(
+    decision: &RouterDecision,
+    budget: &BudgetSnapshot,
+) -> crate::types::ForkWeightsComparison {
+    use crate::types::{ForkWeightsComparison, WeightContribution};
+    use soulseed_agi_core_models::awareness::DecisionPlan;
+
+    // 计算预算使用率（0.0-1.0）
+    let token_ratio = if budget.tokens_allowed > 0 {
+        budget.tokens_spent as f32 / budget.tokens_allowed as f32
+    } else {
+        0.0
+    };
+
+    // 基于预算约束的权重贡献
+    let budget_factor = (1.0 - token_ratio).max(0.0);
+
+    // 基于当前选择的分叉，给它最高权重
+    let (clarify_base, tool_base, self_reason_base, collab_base) = match &decision.plan.decision_plan {
+        DecisionPlan::Clarify { .. } => (0.8, 0.4, 0.3, 0.2),
+        DecisionPlan::Tool { .. } => (0.3, 0.8, 0.4, 0.3),
+        DecisionPlan::SelfReason { .. } => (0.2, 0.3, 0.8, 0.4),
+        DecisionPlan::Collab { .. } => (0.2, 0.3, 0.4, 0.8),
+    };
+
+    // 应用预算因子调整权重
+    let clarify_weight = (clarify_base * 0.7 + budget_factor * 0.3).clamp(0.0, 1.0);
+    let tool_weight = (tool_base * 0.7 + budget_factor * 0.3).clamp(0.0, 1.0);
+    let self_reason_weight = (self_reason_base * 0.7 + budget_factor * 0.3).clamp(0.0, 1.0);
+    let collab_weight = (collab_base * 0.7 + budget_factor * 0.3).clamp(0.0, 1.0);
+
+    // 生成贡献度分解
+    let contribution = WeightContribution {
+        context_relevance: 0.6, // 简化：假设上下文相关性为0.6
+        budget_constraint: budget_factor,
+        tool_availability: 0.7, // 简化：假设工具可用性为0.7
+        collab_need: 0.4,       // 简化：假设协同需求为0.4
+        historical_success: 0.5, // 简化：假设历史成功率为0.5
+    };
+
+    ForkWeightsComparison {
+        clarify_weight,
+        tool_weight,
+        self_reason_weight,
+        collab_weight,
+        contribution_breakdown: Some(contribution),
     }
 }
 
@@ -914,5 +1032,34 @@ mod tests {
         assert!(result.should_accept);
         assert_eq!(result.metrics.wait_ms, 0);
         assert_eq!(result.metrics.wait_ratio, 0.0);
+    }
+
+    #[test]
+    fn test_fork_weights_comparison_struct() {
+        use crate::types::{ForkWeightsComparison, WeightContribution};
+
+        let weights = ForkWeightsComparison {
+            clarify_weight: 0.8,
+            tool_weight: 0.6,
+            self_reason_weight: 0.4,
+            collab_weight: 0.3,
+            contribution_breakdown: Some(WeightContribution {
+                context_relevance: 0.7,
+                budget_constraint: 0.5,
+                tool_availability: 0.8,
+                collab_need: 0.4,
+                historical_success: 0.6,
+            }),
+        };
+
+        // Verify structure
+        assert!(weights.clarify_weight > weights.tool_weight);
+        assert!(weights.tool_weight > weights.self_reason_weight);
+        assert!(weights.self_reason_weight > weights.collab_weight);
+        assert!(weights.contribution_breakdown.is_some());
+
+        let contribution = weights.contribution_breakdown.unwrap();
+        assert_eq!(contribution.context_relevance, 0.7);
+        assert_eq!(contribution.budget_constraint, 0.5);
     }
 }

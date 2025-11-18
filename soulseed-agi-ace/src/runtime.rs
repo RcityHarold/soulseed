@@ -88,11 +88,20 @@ impl CallbackRegistry {
     }
 }
 
-#[derive(Clone)]
 struct AutoSyncDriver {
     registry: CallbackRegistry,
     llm: Option<AceLlmClient>,
-    gateway: Option<SoulbaseGateway>,
+    gateway: Option<&'static SoulbaseGateway>, // 使用 'static 引用，永不 drop
+}
+
+impl Clone for AutoSyncDriver {
+    fn clone(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            llm: self.llm.clone(),
+            gateway: self.gateway,
+        }
+    }
 }
 
 impl AutoSyncDriver {
@@ -105,8 +114,9 @@ impl AutoSyncDriver {
             }
             None => None,
         };
+        // 使用 Box::leak 将 Gateway 泄漏为 'static，确保其在程序生命周期中存在
         let gateway = match SoulbaseGateway::from_env() {
-            Some(Ok(client)) => Some(client),
+            Some(Ok(client)) => Some(Box::leak(Box::new(client)) as &'static SoulbaseGateway),
             Some(Err(err)) => {
                 warn!("Soulbase Gateway 初始化失败，将回退合成 Tool/Collab：{err}");
                 None
@@ -903,14 +913,16 @@ impl<'a> AceService<'a> {
 
         let persistence_config = SurrealPersistenceConfig { datastore: config };
 
-        if let Ok(current) = tokio::runtime::Handle::try_current() {
-            let handle = current.clone();
-            let config_clone = persistence_config.clone();
+        if let Ok(_current) = tokio::runtime::Handle::try_current() {
+            // 已经在 tokio runtime 中，使用 async 初始化（不会创建 owned runtime）
             let persistence = tokio::task::block_in_place(|| {
-                SurrealPersistence::new_with_handle(handle, config_clone)
+                tokio::runtime::Handle::current().block_on(async {
+                    SurrealPersistence::new_async(persistence_config).await
+                })
             })?;
             Ok(Arc::new(persistence))
         } else {
+            // 不在 runtime 中，创建新的 owned runtime（会泄漏以避免 drop panic）
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

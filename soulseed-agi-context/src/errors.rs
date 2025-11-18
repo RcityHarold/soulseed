@@ -18,6 +18,8 @@ pub enum ContextError {
     DeltaMismatch(String),
     #[error("environment assembly failed: {0}")]
     EnvAssembly(String),
+    #[error("invalid data: {0}")]
+    InvalidData(String),
 }
 
 #[derive(Debug, Clone)]

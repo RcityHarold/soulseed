@@ -87,6 +87,9 @@ pub struct CycleSchedule {
     pub parent_cycle_id: Option<AwarenessCycleId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collab_scope_id: Option<String>,
+    /// 降级策略建议 - 用于HITL超时或资源限制时的优雅降级
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degradation_strategy: Option<crate::budget::DegradationStrategy>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,6 +217,42 @@ pub struct CycleEmission {
     pub context_manifest: Option<Value>,
 }
 
+/// 四分叉权重对比
+///
+/// 记录所有四个分叉（Clarify, Tool, SelfReason, Collab）的权重和贡献度分解。
+/// 即使最终只选择了一个分叉，也会返回所有分叉的权重信息，用于调试和解释。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ForkWeightsComparison {
+    /// Clarify分叉的权重
+    pub clarify_weight: f32,
+    /// Tool分叉的权重
+    pub tool_weight: f32,
+    /// SelfReason分叉的权重
+    pub self_reason_weight: f32,
+    /// Collab分叉的权重
+    pub collab_weight: f32,
+    /// 权重贡献度分解（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_breakdown: Option<WeightContribution>,
+}
+
+/// 权重贡献度分解
+///
+/// 详细记录每个维度对最终权重的贡献。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WeightContribution {
+    /// 上下文相关性贡献 (0.0-1.0)
+    pub context_relevance: f32,
+    /// 预算约束贡献 (0.0-1.0)
+    pub budget_constraint: f32,
+    /// 工具可用性贡献 (0.0-1.0)
+    pub tool_availability: f32,
+    /// 协同需求贡献 (0.0-1.0)
+    pub collab_need: f32,
+    /// 历史成功率贡献 (0.0-1.0)
+    pub historical_success: f32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduleOutcome {
     pub accepted: bool,
@@ -221,6 +260,9 @@ pub struct ScheduleOutcome {
     pub cycle: Option<CycleSchedule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub awareness_events: Vec<AwarenessEvent>,
+    /// 四分叉权重对比（可选）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_weights: Option<ForkWeightsComparison>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

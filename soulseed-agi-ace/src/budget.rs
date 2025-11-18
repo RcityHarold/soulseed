@@ -189,6 +189,18 @@ impl BudgetManager {
             });
         }
 
+        // 如果降级策略是Reject，则拒绝执行
+        if matches!(degradation_strategy, Some(DegradationStrategy::Reject)) {
+            return Ok(BudgetDecision {
+                cycle_id,
+                allowed: false,
+                reason: Some("budget_exhausted".into()),
+                snapshot,
+                degradation_reason: Some("budget_exhausted".into()),
+                degradation_strategy: Some(DegradationStrategy::Reject),
+            });
+        }
+
         // 如果有降级策略但预算未完全耗尽，仍允许执行但建议降级
         if let Some(strategy) = &degradation_strategy {
             tracing::info!(

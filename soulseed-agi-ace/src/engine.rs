@@ -15,9 +15,10 @@ use crate::types::{
     CycleStatus, ScheduleOutcome, SyncPointInput,
 };
 use serde_json::{Map, Value, json};
+use soulseed_agi_context::types::ContextBundle;
 use soulseed_agi_core_models::awareness::{AwarenessEventType, SyncPointKind};
 use soulseed_agi_core_models::common::EvidencePointer;
-use soulseed_agi_core_models::{AwarenessCycleId, DialogueEvent};
+use soulseed_agi_core_models::{AccessClass, AwarenessCycleId, DialogueEvent};
 use soulseed_agi_dfr::{DfrEngine, RoutePlanner, RouterService};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -169,19 +170,30 @@ impl<'a> AceEngine<'a> {
             );
         }
 
-        // 3. 构建子周期的CycleRequest
+        // 3. 应用隐私策略：过滤上下文，只保留Public内容
+        let mut filtered_input = child_input.clone();
+        filtered_input.context = filter_context_for_collab(&child_input.context);
+
+        tracing::info!(
+            "Privacy filter applied for child_cycle: parent={}, original_segments={}, filtered_segments={}",
+            parent_schedule.cycle_id.as_u64(),
+            child_input.context.segments.len(),
+            filtered_input.context.segments.len()
+        );
+
+        // 4. 构建子周期的CycleRequest
         let child_request = CycleRequest {
-            router_input: child_input.clone(),
+            router_input: filtered_input,
             candidates: vec![], // 子周期使用默认候选路径
             budget: child_budget,
             parent_cycle_id: Some(parent_schedule.cycle_id),
             collab_scope_id: Some(scope_id),
         };
 
-        // 4. 调用schedule_cycle创建子周期
+        // 5. 调用schedule_cycle创建子周期
         let outcome = self.schedule_cycle(child_request)?;
 
-        // 5. 注册子周期到Barrier群组
+        // 6. 注册子周期到Barrier群组
         if let Some(cycle) = &outcome.cycle {
             self.barrier_manager.register_child(
                 parent_schedule.cycle_id,
@@ -695,5 +707,255 @@ where
             outcomes.push(outcome);
         }
         Ok(outcomes)
+    }
+}
+
+/// 为Collab场景过滤上下文，只保留Public访问级别的内容
+///
+/// 在协同场景下，子Agent不应该看到父周期的私有上下文。
+/// 此函数会：
+/// 1. 将anchor的access_class设置为Public
+/// 2. 过滤掉所有非Public的BundleItem（通过检查evidence_ptrs的access_policy）
+///
+/// # Arguments
+/// * `context` - 原始的ContextBundle
+///
+/// # Returns
+/// 过滤后只包含公开内容的ContextBundle
+fn filter_context_for_collab(context: &ContextBundle) -> ContextBundle {
+    let mut filtered = context.clone();
+
+    // 1. 将anchor的access_class设置为Public，标记子周期只能访问公开内容
+    filtered.anchor.access_class = AccessClass::Public;
+
+    // 2. 过滤segments中的items，只保留公开内容
+    for segment in &mut filtered.segments {
+        segment.items.retain(|item| {
+            // 检查item的evidence_ptrs中的access_policy
+            // 如果所有evidence_ptr都是public，或者没有evidence_ptr，则保留
+            if item.evidence_ptrs.is_empty() {
+                // 没有evidence_ptr，默认为公开
+                return true;
+            }
+
+            // 只保留所有evidence_ptr的access_policy都是"public"的item
+            item.evidence_ptrs.iter().all(|ptr| {
+                ptr.access_policy.as_deref() == Some("public")
+            })
+        });
+    }
+
+    // 3. 移除空的segments
+    filtered.segments.retain(|segment| !segment.items.is_empty());
+
+    tracing::debug!(
+        "Filtered context for collab: {} segments, {} total items",
+        filtered.segments.len(),
+        filtered.segments.iter().map(|s| s.items.len()).sum::<usize>()
+    );
+
+    filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soulseed_agi_context::types::{Anchor, BundleItem, BundleSegment, BudgetSummary, ContextBundle, ExplainBundle, Partition, PromptBundle};
+    use soulseed_agi_core_models::{AccessClass, EnvelopeId, TenantId};
+
+    fn dummy_anchor(access_class: AccessClass) -> Anchor {
+        Anchor {
+            tenant_id: TenantId::new(1),
+            envelope_id: EnvelopeId::new_v4(),
+            config_snapshot_hash: "test".into(),
+            config_snapshot_version: 1,
+            session_id: None,
+            sequence_number: None,
+            access_class,
+            provenance: None,
+            schema_v: 1,
+            scenario: None,
+            supersedes: None,
+            superseded_by: None,
+        }
+    }
+
+    fn dummy_explain_bundle() -> ExplainBundle {
+        ExplainBundle {
+            reasons: vec![],
+            degradation_reason: None,
+            indices_used: vec![],
+            query_hash: None,
+        }
+    }
+
+    fn dummy_budget_summary() -> BudgetSummary {
+        BudgetSummary {
+            target_tokens: 1000,
+            projected_tokens: 800,
+        }
+    }
+
+    fn dummy_bundle_item(id: &str, access_policy: Option<&str>) -> BundleItem {
+        let evidence_ptrs = if let Some(policy) = access_policy {
+            vec![EvidencePointer {
+                uri: format!("soul://context/{}", id),
+                digest_sha256: Some("abc123".into()),
+                media_type: Some("text/plain".into()),
+                blob_ref: None,
+                span: None,
+                access_policy: Some(policy.into()),
+            }]
+        } else {
+            vec![]
+        };
+
+        BundleItem {
+            ci_id: id.into(),
+            partition: Partition::P4Dialogue,
+            summary_level: None,
+            tokens: 100,
+            score_scaled: 100,
+            ts_ms: 1000,
+            digests: Default::default(),
+            typ: Some("test".into()),
+            why_included: None,
+            score_stats: Default::default(),
+            supersedes: None,
+            evidence_ptrs,
+        }
+    }
+
+    #[test]
+    fn test_filter_context_for_collab_sets_access_class_to_public() {
+        let context = ContextBundle {
+            anchor: dummy_anchor(AccessClass::Restricted),
+            schema_v: 1,
+            version: 1,
+            segments: vec![],
+            explain: dummy_explain_bundle(),
+            budget: dummy_budget_summary(),
+            prompt: PromptBundle::default(),
+        };
+
+        let filtered = filter_context_for_collab(&context);
+
+        assert_eq!(filtered.anchor.access_class, AccessClass::Public);
+    }
+
+    #[test]
+    fn test_filter_context_for_collab_keeps_public_items() {
+        let context = ContextBundle {
+            anchor: dummy_anchor(AccessClass::Internal),
+            schema_v: 1,
+            version: 1,
+            segments: vec![
+                BundleSegment {
+                    partition: Partition::P4Dialogue,
+                    items: vec![
+                        dummy_bundle_item("1", Some("public")),
+                        dummy_bundle_item("2", Some("public")),
+                    ],
+                },
+            ],
+            explain: dummy_explain_bundle(),
+            budget: dummy_budget_summary(),
+            prompt: PromptBundle::default(),
+        };
+
+        let filtered = filter_context_for_collab(&context);
+
+        assert_eq!(filtered.segments.len(), 1);
+        assert_eq!(filtered.segments[0].items.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_context_for_collab_removes_restricted_items() {
+        let context = ContextBundle {
+            anchor: dummy_anchor(AccessClass::Internal),
+            schema_v: 1,
+            version: 1,
+            segments: vec![
+                BundleSegment {
+                    partition: Partition::P4Dialogue,
+                    items: vec![
+                        dummy_bundle_item("1", Some("public")),
+                        dummy_bundle_item("2", Some("restricted")),
+                        dummy_bundle_item("3", Some("internal")),
+                    ],
+                },
+            ],
+            explain: dummy_explain_bundle(),
+            budget: dummy_budget_summary(),
+            prompt: PromptBundle::default(),
+        };
+
+        let filtered = filter_context_for_collab(&context);
+
+        assert_eq!(filtered.segments.len(), 1);
+        assert_eq!(filtered.segments[0].items.len(), 1);
+        assert_eq!(filtered.segments[0].items[0].ci_id, "1");
+    }
+
+    #[test]
+    fn test_filter_context_for_collab_keeps_items_without_evidence_ptrs() {
+        let context = ContextBundle {
+            anchor: dummy_anchor(AccessClass::Internal),
+            schema_v: 1,
+            version: 1,
+            segments: vec![
+                BundleSegment {
+                    partition: Partition::P4Dialogue,
+                    items: vec![
+                        dummy_bundle_item("1", None), // No evidence_ptr
+                        dummy_bundle_item("2", Some("public")),
+                    ],
+                },
+            ],
+            explain: dummy_explain_bundle(),
+            budget: dummy_budget_summary(),
+            prompt: PromptBundle::default(),
+        };
+
+        let filtered = filter_context_for_collab(&context);
+
+        assert_eq!(filtered.segments.len(), 1);
+        assert_eq!(filtered.segments[0].items.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_context_for_collab_removes_empty_segments() {
+        let context = ContextBundle {
+            anchor: dummy_anchor(AccessClass::Internal),
+            schema_v: 1,
+            version: 1,
+            segments: vec![
+                BundleSegment {
+                    partition: Partition::P4Dialogue,
+                    items: vec![
+                        dummy_bundle_item("1", Some("restricted")),
+                        dummy_bundle_item("2", Some("internal")),
+                    ],
+                },
+                BundleSegment {
+                    partition: Partition::P3WorkingDelta,
+                    items: vec![
+                        dummy_bundle_item("3", Some("public")),
+                    ],
+                },
+            ],
+            explain: dummy_explain_bundle(),
+            budget: dummy_budget_summary(),
+            prompt: PromptBundle::default(),
+        };
+
+        let filtered = filter_context_for_collab(&context);
+
+        // First segment should be removed (all items filtered out)
+        // Second segment should remain (has public item)
+        assert_eq!(filtered.segments.len(), 1);
+        assert_eq!(filtered.segments[0].partition, Partition::P3WorkingDelta);
+        assert_eq!(filtered.segments[0].items.len(), 1);
+        assert_eq!(filtered.segments[0].items[0].ci_id, "3");
     }
 }

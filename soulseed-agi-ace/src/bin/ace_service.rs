@@ -147,8 +147,8 @@ impl AwarenessEventsQuery {
 #[derive(Deserialize, Default)]
 struct TimelineQuery {
     limit: Option<usize>,
-    session_id: Option<String>,
-    cursor: Option<String>,
+    _session_id: Option<String>,
+    _cursor: Option<String>,
 }
 
 impl TimelineQuery {

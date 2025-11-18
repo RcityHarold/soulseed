@@ -27,13 +27,8 @@ persistence-surreal = [
     "soulbase-types",
     "tokio"
 ]
-# outbox-redis = [
-#     "persistence-surreal",
-#     "sb-tx",
-#     "sb-tx/surreal",
-#     "sb-tx/transport-redis",
-#     "tokio"
-# ]
+# outbox-redis feature 已废弃（新版 soul-base 无 transport-redis）
+# outbox-redis = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

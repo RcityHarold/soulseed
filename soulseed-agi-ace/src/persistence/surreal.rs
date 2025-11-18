@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use soulbase_storage::model::{Entity, Sort, make_record_id, QueryParams};
+use soulbase_storage::model::{Entity, make_record_id, QueryParams};
 use soulbase_storage::prelude::Repository;
 use soulbase_storage::surreal::config::SurrealConfig;
 use soulbase_storage::surreal::datastore::SurrealDatastore;
@@ -156,12 +156,23 @@ impl Entity for OutboxMessageDoc {
 
 pub struct SurrealPersistence {
     handle: tokio::runtime::Handle,
-    owned_runtime: Option<tokio::runtime::Runtime>,
+    _owned_runtime: Option<std::mem::ManuallyDrop<tokio::runtime::Runtime>>,
     dialogue_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<DialogueEventDoc>>,
     awareness_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<AwarenessEventDoc>>,
     snapshot_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<CycleSnapshotDoc>>,
     outbox_repo: Arc<soulbase_storage::surreal::repo::SurrealRepository<OutboxMessageDoc>>,
     datastore: SurrealDatastore,
+}
+
+impl Drop for SurrealPersistence {
+    fn drop(&mut self) {
+        // 安全地处理 owned runtime：完全泄漏它以避免在异步上下文中 panic
+        // 这是可接受的，因为 runtime 通常在程序整个生命周期中存在
+        if let Some(runtime) = self._owned_runtime.take() {
+            let runtime = unsafe { std::mem::ManuallyDrop::into_inner(runtime) };
+            std::mem::forget(runtime); // 泄漏 runtime，避免 drop panic
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -217,7 +228,7 @@ impl SurrealPersistence {
 
         Ok(Self {
             handle,
-            owned_runtime: None,
+            _owned_runtime: None,
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
@@ -235,7 +246,7 @@ impl SurrealPersistence {
 
         Ok(Self {
             handle,
-            owned_runtime: None,
+            _owned_runtime: None,
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
@@ -254,7 +265,7 @@ impl SurrealPersistence {
 
         Ok(Self {
             handle,
-            owned_runtime: Some(runtime),
+            _owned_runtime: Some(std::mem::ManuallyDrop::new(runtime)),
             dialogue_repo,
             awareness_repo,
             snapshot_repo,
@@ -712,8 +723,6 @@ impl AcePersistence for SurrealPersistence {
         snapshot: &Value,
         outbox_messages: &[crate::types::OutboxMessage],
     ) -> Result<(), AceError> {
-        use crate::types::OutboxMessage;
-
         let sb_tenant = tenant_to_sb(tenant_id);
         let cycle_id_str = cycle_id.as_u64().to_string();
         let now = current_millis();

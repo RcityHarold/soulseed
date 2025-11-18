@@ -18,6 +18,7 @@ use soulseed_agi_core_models::{
     },
     common::EvidencePointer,
 };
+use std::collections::HashMap;
 use std::sync::Mutex;
 use time::{Duration, OffsetDateTime};
 
@@ -78,6 +79,134 @@ impl ContextVersion {
     pub fn is_compatible_with(&self, other: &ContextVersion) -> bool {
         // 主版本必须匹配
         self.major == other.major
+    }
+}
+
+/// 分区预算配置
+///
+/// 定义每个分区（Partition）在上下文压缩时的token预算上限。
+/// 这确保了每个分区都能获得合理的token分配，避免某个分区占用过多空间。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PartitionBudget {
+    /// 每个分区的token上限
+    pub budgets: HashMap<Partition, u32>,
+    /// 是否启用弹性预算（允许未使用的预算重分配）
+    pub flexible: bool,
+}
+
+impl Default for PartitionBudget {
+    fn default() -> Self {
+        let mut budgets = HashMap::new();
+        // P0 Policy: 策略和系统约束，最高优先级
+        budgets.insert(Partition::P0Policy, 200);
+        // P1 Task Facts: 任务关键信息
+        budgets.insert(Partition::P1TaskFacts, 300);
+        // P2 Evidence: 证据和引用
+        budgets.insert(Partition::P2Evidence, 250);
+        // P3 Working Delta: 工作区增量
+        budgets.insert(Partition::P3WorkingDelta, 400);
+        // P4 Dialogue: 对话历史
+        budgets.insert(Partition::P4Dialogue, 600);
+
+        Self {
+            budgets,
+            flexible: true, // 默认启用弹性预算
+        }
+    }
+}
+
+/// 驱逐优先级策略
+///
+/// 定义在上下文压缩时，如何选择要移除的context items。
+/// 基于多个维度的评分来决定保留或驱逐。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub enum EvictionStrategy {
+    /// 低相关性优先驱逐（relevance < threshold）
+    LowRelevance { threshold: f32 },
+    /// 低重要性优先驱逐（importance < threshold）
+    LowImportance { threshold: f32 },
+    /// 高可压缩性优先驱逐（compressibility > threshold）
+    HighCompressibility { threshold: f32 },
+    /// 综合评分驱逐（final_score < threshold）
+    LowScore { threshold: f32 },
+    /// 基于时间的LRU驱逐（最近最少使用）
+    LRU,
+    /// 基于分区的驱逐（优先驱逐低优先级分区）
+    PartitionBased,
+}
+
+impl Default for EvictionStrategy {
+    fn default() -> Self {
+        // 默认使用综合评分策略，threshold设置为0.5
+        Self::LowScore { threshold: 0.5 }
+    }
+}
+
+/// 六步法压缩配置
+///
+/// 完整的上下文压缩配置，包含版本管理、预算分配和驱逐策略。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// 分区预算配置
+    pub partition_budget: PartitionBudget,
+    /// 驱逐策略列表（按优先级应用）
+    pub eviction_strategies: Vec<EvictionStrategy>,
+    /// 是否在压缩后升级版本
+    pub upgrade_version: bool,
+    /// 压缩目标token数
+    pub target_tokens: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            partition_budget: PartitionBudget::default(),
+            eviction_strategies: vec![
+                // 1. 先驱逐高可压缩性的内容（可以被summarize的）
+                EvictionStrategy::HighCompressibility { threshold: 0.7 },
+                // 2. 再驱逐低相关性的内容
+                EvictionStrategy::LowRelevance { threshold: 0.4 },
+                // 3. 最后驱逐低评分的内容
+                EvictionStrategy::LowScore { threshold: 0.5 },
+            ],
+            upgrade_version: true,
+            target_tokens: 2000,
+        }
+    }
+}
+
+/// 压缩统计信息
+///
+/// 记录一次上下文压缩的详细统计数据。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CompactionStats {
+    /// 压缩前的总token数
+    pub tokens_before: u32,
+    /// 压缩后的总token数
+    pub tokens_after: u32,
+    /// 移除的item数量
+    pub items_removed: usize,
+    /// 保留的item数量
+    pub items_retained: usize,
+    /// 每个分区的token使用情况
+    pub partition_tokens: HashMap<Partition, u32>,
+    /// 应用的驱逐策略数量
+    pub strategies_applied: usize,
+    /// 是否升级了版本
+    pub version_upgraded: bool,
+}
+
+impl Default for CompactionStats {
+    fn default() -> Self {
+        Self {
+            tokens_before: 0,
+            tokens_after: 0,
+            items_removed: 0,
+            items_retained: 0,
+            partition_tokens: HashMap::new(),
+            strategies_applied: 0,
+            version_upgraded: false,
+        }
     }
 }
 
@@ -158,6 +287,27 @@ pub trait CaService: Send + Sync {
     fn request_compact(&self) -> Result<ContextVersion, AceError> {
         // 默认实现：返回新的主版本
         Ok(ContextVersion::default().increment_major())
+    }
+
+    /// 请求带配置的上下文压缩（六步法）
+    ///
+    /// 使用完整的CompactionConfig执行上下文压缩，包含：
+    /// 1. 分区预算分配 - 确保每个partition在预算内
+    /// 2. 驱逐优先级策略 - 按策略选择要移除的items
+    /// 3. 版本升级编排 - 根据配置决定是否升级版本
+    ///
+    /// # Arguments
+    /// * `config` - 压缩配置
+    ///
+    /// # Returns
+    /// 压缩后的新版本和压缩统计信息
+    fn request_compact_with_config(
+        &self,
+        _config: &CompactionConfig,
+    ) -> Result<(ContextVersion, CompactionStats), AceError> {
+        // 默认实现：调用简单压缩
+        let version = self.request_compact()?;
+        Ok((version, CompactionStats::default()))
     }
 
     /// 验证上下文版本一致性
@@ -262,6 +412,54 @@ pub trait CaService: Send + Sync {
             }
         }
 
+        Ok(())
+    }
+
+    /// 索引上下文条目（向量索引）
+    ///
+    /// 将context item添加到向量索引中，用于语义相似度检索
+    ///
+    /// # Arguments
+    /// * `item_id` - Context item ID
+    /// * `vector` - 向量表示
+    ///
+    /// # Returns
+    /// 成功返回Ok，失败返回Error
+    fn index_vector(&self, item_id: String, vector: Vec<f32>) -> Result<(), AceError> {
+        // 默认实现：不执行任何操作
+        let _ = (item_id, vector);
+        Ok(())
+    }
+
+    /// 索引上下文条目（稀疏索引）
+    ///
+    /// 将context item添加到稀疏索引中，用于关键词检索
+    ///
+    /// # Arguments
+    /// * `item_id` - Context item ID
+    /// * `tokens` - 分词后的tokens
+    ///
+    /// # Returns
+    /// 成功返回Ok，失败返回Error
+    fn index_sparse(&self, item_id: String, tokens: Vec<String>) -> Result<(), AceError> {
+        // 默认实现：不执行任何操作
+        let _ = (item_id, tokens);
+        Ok(())
+    }
+
+    /// 添加因果关系到索引
+    ///
+    /// 记录两个context item之间的因果关系
+    ///
+    /// # Arguments
+    /// * `cause_id` - 原因item的ID
+    /// * `effect_id` - 结果item的ID
+    ///
+    /// # Returns
+    /// 成功返回Ok，失败返回Error
+    fn index_causal_link(&self, cause_id: String, effect_id: String) -> Result<(), AceError> {
+        // 默认实现：不执行任何操作
+        let _ = (cause_id, effect_id);
         Ok(())
     }
 }
@@ -969,5 +1167,93 @@ mod tests {
         assert!(response.context_manifest.is_some());
         assert!(response.prompt_bundle.is_some());
         assert!(response.explain_bundle.is_some());
+    }
+
+    #[test]
+    fn test_partition_budget_default_values() {
+        let budget = PartitionBudget::default();
+
+        assert!(budget.flexible);
+        assert_eq!(budget.budgets.len(), 5);
+        assert_eq!(budget.budgets.get(&Partition::P0Policy), Some(&200));
+        assert_eq!(budget.budgets.get(&Partition::P1TaskFacts), Some(&300));
+        assert_eq!(budget.budgets.get(&Partition::P2Evidence), Some(&250));
+        assert_eq!(budget.budgets.get(&Partition::P3WorkingDelta), Some(&400));
+        assert_eq!(budget.budgets.get(&Partition::P4Dialogue), Some(&600));
+    }
+
+    #[test]
+    fn test_eviction_strategy_default() {
+        let strategy = EvictionStrategy::default();
+
+        match strategy {
+            EvictionStrategy::LowScore { threshold } => {
+                assert_eq!(threshold, 0.5);
+            }
+            _ => panic!("Default strategy should be LowScore"),
+        }
+    }
+
+    #[test]
+    fn test_compaction_config_default() {
+        let config = CompactionConfig::default();
+
+        assert_eq!(config.target_tokens, 2000);
+        assert!(config.upgrade_version);
+        assert_eq!(config.eviction_strategies.len(), 3);
+        assert!(config.partition_budget.flexible);
+
+        // Verify the three-step eviction strategy
+        assert!(matches!(
+            config.eviction_strategies[0],
+            EvictionStrategy::HighCompressibility { threshold: 0.7 }
+        ));
+        assert!(matches!(
+            config.eviction_strategies[1],
+            EvictionStrategy::LowRelevance { threshold: 0.4 }
+        ));
+        assert!(matches!(
+            config.eviction_strategies[2],
+            EvictionStrategy::LowScore { threshold: 0.5 }
+        ));
+    }
+
+    #[test]
+    fn test_compaction_stats_default() {
+        let stats = CompactionStats::default();
+
+        assert_eq!(stats.tokens_before, 0);
+        assert_eq!(stats.tokens_after, 0);
+        assert_eq!(stats.items_removed, 0);
+        assert_eq!(stats.items_retained, 0);
+        assert_eq!(stats.strategies_applied, 0);
+        assert!(!stats.version_upgraded);
+        assert!(stats.partition_tokens.is_empty());
+    }
+
+    #[test]
+    fn test_request_compact_with_config_default_implementation() {
+        let service = CaServiceDefault::default();
+        let config = CompactionConfig::default();
+
+        let result = service.request_compact_with_config(&config);
+        assert!(result.is_ok());
+
+        let (version, stats) = result.unwrap();
+        assert_eq!(version.major, 2); // Should increment from default 1
+        assert_eq!(version.minor, 0);
+
+        // Default stats should be empty
+        assert_eq!(stats.tokens_before, 0);
+        assert_eq!(stats.tokens_after, 0);
+    }
+
+    #[test]
+    fn test_partition_budget_total_allocation() {
+        let budget = PartitionBudget::default();
+
+        let total: u32 = budget.budgets.values().sum();
+        // Total should be 200 + 300 + 250 + 400 + 600 = 1750
+        assert_eq!(total, 1750);
     }
 }

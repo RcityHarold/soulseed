@@ -2,14 +2,11 @@ use soulbase_llm::{
     chat::{ChatRequest, ResponseFormat, ResponseKind},
     jsonsafe::StructOutPolicy,
     model::{ContentSegment, Message, Role},
-    provider::{Registry, ProviderFactory},
+    provider::Registry,
 };
 
-#[cfg(feature = "provider-openai")]
 use soulbase_llm::provider::OpenAiProviderFactory;
-#[cfg(feature = "provider-claude")]
 use soulbase_llm::provider::ClaudeProviderFactory;
-#[cfg(feature = "provider-gemini")]
 use soulbase_llm::provider::GeminiProviderFactory;
 
 use crate::errors::AceError;
@@ -42,29 +39,29 @@ impl AceLlmClient {
             .unwrap_or_else(|_| clarify_model.clone());
 
         // 初始化 registry 并注册 providers
-        let registry = Registry::new();
+        let mut registry = Registry::new();
 
-        #[cfg(feature = "provider-openai")]
-        {
-            if let Some(api_key) = std::env::var("OPENAI_API_KEY").ok() {
-                let config = soulbase_llm::provider::OpenAiConfig::new(&api_key);
-                registry.register(Box::new(OpenAiProviderFactory::new(config)));
+        if let Some(api_key) = std::env::var("OPENAI_API_KEY").ok() {
+            if let Ok(config) = soulbase_llm::provider::OpenAiConfig::new(&api_key) {
+                if let Ok(factory) = OpenAiProviderFactory::new(config) {
+                    registry.register(Box::new(factory));
+                }
             }
         }
 
-        #[cfg(feature = "provider-claude")]
-        {
-            if let Some(api_key) = std::env::var("ANTHROPIC_API_KEY").ok() {
-                let config = soulbase_llm::provider::ClaudeConfig::new(&api_key);
-                registry.register(Box::new(ClaudeProviderFactory::new(config)));
+        if let Some(api_key) = std::env::var("ANTHROPIC_API_KEY").ok() {
+            if let Ok(config) = soulbase_llm::provider::ClaudeConfig::new(&api_key) {
+                if let Ok(factory) = ClaudeProviderFactory::new(config) {
+                    registry.register(Box::new(factory));
+                }
             }
         }
 
-        #[cfg(feature = "provider-gemini")]
-        {
-            if let Some(api_key) = std::env::var("GEMINI_API_KEY").ok() {
-                let config = soulbase_llm::provider::GeminiConfig::new(&api_key);
-                registry.register(Box::new(GeminiProviderFactory::new(config)));
+        if let Some(api_key) = std::env::var("GEMINI_API_KEY").ok() {
+            if let Ok(config) = soulbase_llm::provider::GeminiConfig::new(&api_key) {
+                if let Ok(factory) = GeminiProviderFactory::new(config) {
+                    registry.register(Box::new(factory));
+                }
             }
         }
 

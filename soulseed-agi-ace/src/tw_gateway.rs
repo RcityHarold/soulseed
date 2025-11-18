@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
@@ -65,8 +65,12 @@ impl SoulbaseGateway {
             "budget": schedule.budget,
         });
 
-        let envelope: GatewayEnvelope<ToolExecuteData> =
-            self.post(&url, tenant, body, "tools.execute")?;
+        // 使用 tokio runtime 执行 async 调用
+        let envelope: GatewayEnvelope<ToolExecuteData> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.post(&url, tenant, body, "tools.execute").await
+            })
+        })?;
 
         let data = envelope.data.ok_or_else(|| {
             AceError::ThinWaist("soulbase gateway tools.execute missing data".into())
@@ -94,8 +98,12 @@ impl SoulbaseGateway {
             "budget": schedule.budget,
         });
 
-        let envelope: GatewayEnvelope<CollabExecuteData> =
-            self.post(&url, tenant, body, "collab.execute")?;
+        // 使用 tokio runtime 执行 async 调用
+        let envelope: GatewayEnvelope<CollabExecuteData> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.post(&url, tenant, body, "collab.execute").await
+            })
+        })?;
 
         let data = envelope.data.ok_or_else(|| {
             AceError::ThinWaist("soulbase gateway collab.execute missing data".into())
@@ -104,7 +112,7 @@ impl SoulbaseGateway {
         CollabSynthesis::from_gateway(schedule, plan, data)
     }
 
-    fn post<T>(
+    async fn post<T>(
         &self,
         url: &str,
         tenant: TenantId,
@@ -134,12 +142,13 @@ impl SoulbaseGateway {
             .headers(headers)
             .json(&body)
             .send()
+            .await
             .map_err(|err| {
                 AceError::ThinWaist(format!("soulbase gateway request failed: {err}"))
             })?;
 
         let status = response.status();
-        let envelope: GatewayEnvelope<T> = response.json().map_err(|err| {
+        let envelope: GatewayEnvelope<T> = response.json().await.map_err(|err| {
             AceError::ThinWaist(format!(
                 "soulbase gateway parse response failed ({endpoint}): {err}"
             ))
