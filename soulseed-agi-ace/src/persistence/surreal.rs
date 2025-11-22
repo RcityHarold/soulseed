@@ -566,7 +566,7 @@ impl AcePersistence for SurrealPersistence {
             }
             let patch_for_log = patch.clone();
             snapshot_repo
-                .upsert_returning_none(&sb_tenant, &cycle_id_str, patch)
+                .upsert_or_create(&sb_tenant, &cycle_id_str, patch)
                 .await
                 .map_err(|err| {
                     let err_obj = err.into_inner();

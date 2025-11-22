@@ -102,6 +102,8 @@ impl<'a> AceEngine<'a> {
             request.budget.clone(),
             request.parent_cycle_id,
             request.collab_scope_id.clone(),
+            request.router_input.user_prompt.clone(),
+            request.router_input.context.clone(),
         )?;
 
         if let Some(cycle) = &outcome.cycle {

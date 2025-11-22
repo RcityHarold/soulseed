@@ -90,6 +90,12 @@ pub struct CycleSchedule {
     /// 降级策略建议 - 用于HITL超时或资源限制时的优雅降级
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degradation_strategy: Option<crate::budget::DegradationStrategy>,
+    /// 用户原始问题 - 用于传递给LLM的工作记忆上下文
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_prompt: Option<String>,
+    /// 完整的上下文数据（包括历史对话、工作记忆等）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_bundle: Option<soulseed_agi_context::types::ContextBundle>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

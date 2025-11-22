@@ -78,7 +78,8 @@ impl RoutePlanner {
         let bytes = hasher.finalize().as_bytes().to_owned();
         let mut arr = [0u8; 8];
         arr.copy_from_slice(&bytes[..8]);
-        u64::from_le_bytes(arr)
+        // 确保不超过 i64::MAX，防止 SurrealDB JSON 序列化时变成负数
+        u64::from_le_bytes(arr) & (i64::MAX as u64)
     }
 
     fn build_explain(

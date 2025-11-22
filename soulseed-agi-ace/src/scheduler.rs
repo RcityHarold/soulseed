@@ -170,6 +170,8 @@ impl CycleScheduler {
         budget: BudgetSnapshot,
         parent_cycle_id: Option<AwarenessCycleId>,
         collab_scope_id: Option<String>,
+        user_prompt: String,
+        context_bundle: soulseed_agi_context::types::ContextBundle,
     ) -> Result<ScheduleOutcome, AceError> {
         let plan = &decision.plan;
         let plan_cycle_id = plan.cycle_id;
@@ -307,6 +309,8 @@ impl CycleScheduler {
             parent_cycle_id,
             collab_scope_id: collab_scope_id.clone(),
             degradation_strategy,
+            user_prompt: Some(user_prompt),
+            context_bundle: Some(context_bundle),
         };
 
         guard

@@ -148,9 +148,11 @@ impl AutoSyncDriver {
             DecisionPlan::Clarify { plan } => {
                 if let Some(client) = &self.llm {
                     let context = schedule_context(schedule);
-                    // 使用 tokio runtime 执行 async 调用
-                    let result = tokio::runtime::Handle::current().block_on(async {
-                        client.clarify_answer(plan, &context).await
+                    // 使用 block_in_place + block_on 安全地在 async 上下文中执行同步调用
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            client.clarify_answer(plan, &context).await
+                        })
                     });
                     match result {
                         Ok(answer) => synthesis.clarify_answer = Some(answer),
@@ -161,9 +163,11 @@ impl AutoSyncDriver {
             DecisionPlan::SelfReason { plan } => {
                 if let Some(client) = &self.llm {
                     let context = schedule_context(schedule);
-                    // 使用 tokio runtime 执行 async 调用
-                    let result = tokio::runtime::Handle::current().block_on(async {
-                        client.self_reflection(plan, &context).await
+                    // 使用 block_in_place + block_on 安全地在 async 上下文中执行同步调用
+                    let result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            client.self_reflection(plan, &context).await
+                        })
                     });
                     match result {
                         Ok(text) => synthesis.self_reflection = Some(text),
@@ -667,14 +671,57 @@ struct LaneSynthesis {
 }
 
 fn schedule_context(schedule: &CycleSchedule) -> String {
-    let fork = schedule.router_decision.plan.fork;
-    format!(
-        "cycle_id: {}\ntenant_id: {}\nfork: {:?}\nrouter_digest: {}",
-        schedule.cycle_id.as_u64(),
-        schedule.anchor.tenant_id.as_u64(),
-        fork,
-        schedule.router_decision.plan.explain.router_digest
-    )
+    // 根据文档要求，Context应该包含：
+    // 1. 用户原始问题 (user_prompt)
+    // 2. Session的历史上下文 (dialogue)
+    // 3. 工作记忆数据 (working memory)
+
+    if let Some(context_bundle) = &schedule.context_bundle {
+        let prompt = &context_bundle.prompt;
+        let mut parts = Vec::new();
+
+        // 1. 用户当前问题（最重要）
+        if let Some(user_prompt) = &schedule.user_prompt {
+            parts.push(format!("## 用户问题\n{}", user_prompt));
+        }
+
+        // 2. 工作记忆（短期任务相关信息）
+        if !prompt.working.is_empty() {
+            parts.push(format!("## 工作记忆\n{}", prompt.working.join("\n")));
+        }
+
+        // 3. 历史对话（上下文连续性）
+        if !prompt.dialogue.is_empty() {
+            parts.push(format!("## 对话历史\n{}", prompt.dialogue.join("\n")));
+        }
+
+        // 4. 相关事实（可选，如果有的话）
+        if !prompt.facts.is_empty() {
+            parts.push(format!("## 相关事实\n{}", prompt.facts.join("\n")));
+        }
+
+        if parts.is_empty() {
+            // 如果 ContextBundle 存在但为空，至少返回用户问题
+            schedule.user_prompt.clone().unwrap_or_else(|| "无上下文信息".to_string())
+        } else {
+            parts.join("\n\n")
+        }
+    } else {
+        // 降级场景：如果没有 ContextBundle，使用 user_prompt
+        if let Some(user_prompt) = &schedule.user_prompt {
+            user_prompt.clone()
+        } else {
+            // 最终降级：使用系统元数据（用于调试）
+            let fork = schedule.router_decision.plan.fork;
+            format!(
+                "cycle_id: {}\ntenant_id: {}\nfork: {:?}\nrouter_digest: {}",
+                schedule.cycle_id.as_u64(),
+                schedule.anchor.tenant_id.as_u64(),
+                fork,
+                schedule.router_decision.plan.explain.router_digest
+            )
+        }
+    }
 }
 
 fn lane_to_sync_kind(lane: &CycleLane) -> SyncPointKind {
@@ -1099,12 +1146,12 @@ fn build_default_catalog() -> CatalogSnapshot {
                 id: "tool_web_search".into(),
                 fork: AwarenessFork::ToolPath,
                 label: Some("网络搜索".into()),
-                score_hint: Some(0.8),
+                score_hint: Some(0.9),
                 risk: Some(0.1),
                 estimate: None,
                 metadata: json!({
-                    "description": "搜索互联网上的信息",
-                    "capabilities": ["搜索", "查询", "信息检索"]
+                    "description": "搜索互联网上的实时信息、最新数据、天气、新闻等",
+                    "capabilities": ["搜索", "查询", "信息检索", "实时数据", "天气查询", "新闻查询"]
                 }),
             },
             // 工具类：文件操作
@@ -1142,8 +1189,8 @@ fn build_default_catalog() -> CatalogSnapshot {
                 risk: Some(0.1),
                 estimate: None,
                 metadata: json!({
-                    "description": "进行深度逻辑推理和分析",
-                    "capabilities": ["逻辑推理", "问题分析", "方案规划"]
+                    "description": "基于已有知识进行深度逻辑推理和分析,回答历史事实、常识、概念解释等问题",
+                    "capabilities": ["逻辑推理", "问题分析", "方案规划", "历史知识", "常识问答", "概念解释"]
                 }),
             },
             // 协作类
@@ -1151,12 +1198,12 @@ fn build_default_catalog() -> CatalogSnapshot {
                 id: "collab_expert".into(),
                 fork: AwarenessFork::Collab,
                 label: Some("专家协作".into()),
-                score_hint: Some(0.75),
+                score_hint: Some(0.4),
                 risk: Some(0.2),
                 estimate: None,
                 metadata: json!({
-                    "description": "与领域专家协作解决问题",
-                    "capabilities": ["专家咨询", "协作讨论", "知识共享"]
+                    "description": "与其他AI专家协作解决复杂的跨领域问题",
+                    "capabilities": ["多AI协作", "专家咨询", "复杂问题分解"]
                 }),
             },
         ],
@@ -1168,6 +1215,16 @@ fn build_default_catalog() -> CatalogSnapshot {
 }
 
 fn extract_prompt(message: &DialogueEvent) -> String {
+    // 优先从 metadata["text"] 中提取用户的实际问题
+    if let Some(text) = message.metadata.get("text") {
+        if let Some(text_str) = text.as_str() {
+            if !text_str.is_empty() {
+                return text_str.to_string();
+            }
+        }
+    }
+
+    // 降级：尝试从 payload.channel 提取（旧数据）
     use soulseed_agi_core_models::dialogue_event::DialogueEventPayload;
     match &message.payload {
         DialogueEventPayload::MessagePrimary(payload)
