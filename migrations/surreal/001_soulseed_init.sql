@@ -200,6 +200,106 @@ DEFINE INDEX idx_ace_cycle_snapshot_created
     ON TABLE ace_cycle_snapshot FIELDS tenant, created_at;
 
 -- =====================
+-- Session Table (场景五自主延续执行模式)
+-- =====================
+DEFINE TABLE session SCHEMALESS;
+DEFINE FIELD tenant_id            ON session TYPE string ASSERT $value != "";
+DEFINE FIELD session_id           ON session TYPE string ASSERT $value != "";
+DEFINE FIELD trace_id             ON session TYPE string;
+DEFINE FIELD correlation_id       ON session TYPE string;
+DEFINE FIELD subject              ON session TYPE object;
+DEFINE FIELD participants         ON session TYPE array;
+DEFINE FIELD head                 ON session TYPE object;
+DEFINE FIELD snapshot             ON session TYPE object;
+DEFINE FIELD created_at           ON session TYPE number;
+DEFINE FIELD scenario             ON session TYPE option<string>;
+DEFINE FIELD access_class         ON session TYPE string;
+DEFINE FIELD provenance           ON session TYPE option<object>;
+DEFINE FIELD supersedes           ON session TYPE option<string>;
+DEFINE FIELD superseded_by        ON session TYPE option<string>;
+DEFINE FIELD evidence_pointer     ON session TYPE option<object>;
+DEFINE FIELD blob_ref             ON session TYPE option<string>;
+DEFINE FIELD content_digest_sha256 ON session TYPE option<string>;
+DEFINE FIELD metadata             ON session TYPE option<object>;
+-- 场景五自主延续执行模式字段
+DEFINE FIELD mode                 ON session TYPE string DEFAULT 'interactive';
+DEFINE FIELD orchestration_id     ON session TYPE option<string>;
+DEFINE FIELD agenda_queue         ON session TYPE array DEFAULT [];
+DEFINE FIELD continuation_config  ON session TYPE option<object>;
+DEFINE FIELD consecutive_ac_count ON session TYPE number DEFAULT 0;
+DEFINE FIELD consecutive_idle_count ON session TYPE number DEFAULT 0;
+DEFINE FIELD total_cost_spent     ON session TYPE number DEFAULT 0;
+DEFINE FIELD last_activity_at_ms  ON session TYPE option<number>;
+DEFINE FIELD scenario_stack       ON session TYPE array DEFAULT [];
+
+DEFINE INDEX idx_session_tenant_id
+    ON TABLE session FIELDS tenant_id, session_id UNIQUE;
+
+DEFINE INDEX idx_session_orchestration
+    ON TABLE session FIELDS tenant_id, orchestration_id;
+
+DEFINE INDEX idx_session_mode
+    ON TABLE session FIELDS tenant_id, mode;
+
+-- =====================
+-- Agenda Item Table (议程项)
+-- =====================
+DEFINE TABLE agenda_item SCHEMAFULL;
+DEFINE FIELD tenant_id            ON agenda_item TYPE string ASSERT $value != "";
+DEFINE FIELD session_id           ON agenda_item TYPE string ASSERT $value != "";
+DEFINE FIELD item_id              ON agenda_item TYPE string ASSERT $value != "";
+DEFINE FIELD description          ON agenda_item TYPE string;
+DEFINE FIELD priority             ON agenda_item TYPE number DEFAULT 100;
+DEFINE FIELD status               ON agenda_item TYPE string DEFAULT 'pending';
+DEFINE FIELD created_at           ON agenda_item TYPE datetime;
+DEFINE FIELD estimated_completion ON agenda_item TYPE option<datetime>;
+DEFINE FIELD completed_at         ON agenda_item TYPE option<datetime>;
+DEFINE FIELD assigned_ac_id       ON agenda_item TYPE option<number>;
+DEFINE FIELD metadata             ON agenda_item TYPE option<object>;
+
+DEFINE INDEX idx_agenda_item_lookup
+    ON TABLE agenda_item FIELDS tenant_id, session_id, item_id UNIQUE;
+
+DEFINE INDEX idx_agenda_item_status
+    ON TABLE agenda_item FIELDS tenant_id, session_id, status;
+
+DEFINE INDEX idx_agenda_item_priority
+    ON TABLE agenda_item FIELDS tenant_id, session_id, priority;
+
+-- =====================
+-- Version Chain Table (版本链管理)
+-- =====================
+DEFINE TABLE version_chain_entry SCHEMAFULL;
+DEFINE FIELD tenant_id        ON version_chain_entry TYPE string ASSERT $value != "";
+DEFINE FIELD entity_id        ON version_chain_entry TYPE string ASSERT $value != "";
+DEFINE FIELD entity_type      ON version_chain_entry TYPE string;  -- dialogue_event, session, message, artifact
+DEFINE FIELD supersedes       ON version_chain_entry TYPE option<string>;
+DEFINE FIELD superseded_by    ON version_chain_entry TYPE option<string>;
+DEFINE FIELD version          ON version_chain_entry TYPE number DEFAULT 1;
+DEFINE FIELD created_at_ms    ON version_chain_entry TYPE number;
+DEFINE FIELD chain_id         ON version_chain_entry TYPE string;
+DEFINE FIELD is_current       ON version_chain_entry TYPE bool DEFAULT true;
+DEFINE FIELD description      ON version_chain_entry TYPE option<string>;
+
+DEFINE INDEX idx_version_chain_lookup
+    ON TABLE version_chain_entry FIELDS tenant_id, entity_id UNIQUE;
+
+DEFINE INDEX idx_version_chain_chain
+    ON TABLE version_chain_entry FIELDS tenant_id, chain_id;
+
+DEFINE INDEX idx_version_chain_supersedes
+    ON TABLE version_chain_entry FIELDS tenant_id, supersedes;
+
+DEFINE INDEX idx_version_chain_current
+    ON TABLE version_chain_entry FIELDS tenant_id, entity_type, is_current;
+
+-- 版本链关系边（用于图遍历）
+DEFINE TABLE supersedes SCHEMAFULL;
+DEFINE FIELD in           ON supersedes TYPE record<version_chain_entry>;
+DEFINE FIELD out          ON supersedes TYPE record<version_chain_entry>;
+DEFINE FIELD created_at_ms ON supersedes TYPE number;
+
+-- =====================
 -- Outbox & Replay (ACE → Soulbase)
 -- =====================
 DEFINE TABLE outbox_envelope SCHEMAFULL;

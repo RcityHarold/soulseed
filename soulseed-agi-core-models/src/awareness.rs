@@ -434,6 +434,262 @@ pub struct SyncPointReport {
     pub report_digest: String,
 }
 
+// ============================================================================
+// 场景五自主延续执行模式 - Finalized Payload 扩展
+// 依据文档: 03-场景论-02-《场景五·分论》.md
+// ============================================================================
+
+/// 下一步动作类型
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NextActionType {
+    /// 继续执行议程
+    ContinueAgenda,
+    /// 延伸话语
+    ExtendDiscourse,
+    /// 终止执行
+    Terminate,
+    /// 等待用户输入
+    WaitForInput,
+}
+
+/// 下一步动作
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NextAction {
+    /// 动作类型
+    pub action_type: NextActionType,
+    /// 原因说明
+    pub reason: String,
+    /// 建议的关注点
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_focus: Option<String>,
+    /// 关联的议程项 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agenda_item_id: Option<String>,
+    /// 延伸话题
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_topic: Option<String>,
+}
+
+/// 延续信号
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationSignal {
+    /// 停止
+    #[default]
+    Stop,
+    /// 议程驱动继续
+    ContinueWithAgenda,
+    /// 话语延伸继续
+    ContinueWithExtension,
+}
+
+/// 延续驱动来源
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationDriver {
+    /// 议程驱动
+    AgendaDriven,
+    /// 话语延伸
+    DiscourseExtension,
+    /// 混合驱动
+    Hybrid,
+}
+
+/// Finalized 事件的详细 Payload
+/// 依据文档: 07-功能论.md - FinalizedPayload
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct FinalizedPayload {
+    /// AC 完成原因
+    pub finalize_reason: String,
+    /// 总 IC 数量
+    pub total_ic_count: u32,
+    /// 总成本
+    pub total_cost: f64,
+    /// 总耗时（毫秒）
+    pub total_duration_ms: u64,
+    /// 决策路径摘要
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_path_summary: Option<String>,
+    /// 输出摘要
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_summary: Option<String>,
+    /// 质量自评分
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_self_assessment: Option<f32>,
+
+    // 场景五自主延续字段
+    /// 下一步动作
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<NextAction>,
+    /// 延续信号
+    #[serde(default)]
+    pub continuation_signal: ContinuationSignal,
+    /// 延续驱动来源
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_driver: Option<ContinuationDriver>,
+    /// 是否产生了有效输出（用于空转检测）
+    #[serde(default)]
+    pub produced_meaningful_output: bool,
+    /// 话语延伸点检测结果
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discourse_extension_points: Vec<DiscourseExtensionPoint>,
+}
+
+impl Default for FinalizedPayload {
+    fn default() -> Self {
+        Self {
+            finalize_reason: "completed".to_string(),
+            total_ic_count: 1,
+            total_cost: 0.0,
+            total_duration_ms: 0,
+            decision_path_summary: None,
+            output_summary: None,
+            quality_self_assessment: None,
+            next_action: None,
+            continuation_signal: ContinuationSignal::Stop,
+            continuation_driver: None,
+            produced_meaningful_output: true,
+            discourse_extension_points: Vec::new(),
+        }
+    }
+}
+
+impl FinalizedPayload {
+    /// 创建一个继续议程的 Finalized Payload
+    pub fn continue_with_agenda(
+        finalize_reason: impl Into<String>,
+        agenda_item_id: impl Into<String>,
+        suggested_focus: impl Into<String>,
+    ) -> Self {
+        Self {
+            finalize_reason: finalize_reason.into(),
+            continuation_signal: ContinuationSignal::ContinueWithAgenda,
+            continuation_driver: Some(ContinuationDriver::AgendaDriven),
+            next_action: Some(NextAction {
+                action_type: NextActionType::ContinueAgenda,
+                reason: "Agenda item pending".to_string(),
+                suggested_focus: Some(suggested_focus.into()),
+                agenda_item_id: Some(agenda_item_id.into()),
+                extension_topic: None,
+            }),
+            produced_meaningful_output: true,
+            ..Default::default()
+        }
+    }
+
+    /// 创建一个话语延伸的 Finalized Payload
+    pub fn continue_with_extension(
+        finalize_reason: impl Into<String>,
+        extension_topic: impl Into<String>,
+    ) -> Self {
+        Self {
+            finalize_reason: finalize_reason.into(),
+            continuation_signal: ContinuationSignal::ContinueWithExtension,
+            continuation_driver: Some(ContinuationDriver::DiscourseExtension),
+            next_action: Some(NextAction {
+                action_type: NextActionType::ExtendDiscourse,
+                reason: "Discourse extension detected".to_string(),
+                suggested_focus: None,
+                agenda_item_id: None,
+                extension_topic: Some(extension_topic.into()),
+            }),
+            produced_meaningful_output: true,
+            ..Default::default()
+        }
+    }
+
+    /// 创建一个终止的 Finalized Payload
+    pub fn terminate(finalize_reason: impl Into<String>) -> Self {
+        Self {
+            finalize_reason: finalize_reason.into(),
+            continuation_signal: ContinuationSignal::Stop,
+            next_action: Some(NextAction {
+                action_type: NextActionType::Terminate,
+                reason: "Task completed".to_string(),
+                suggested_focus: None,
+                agenda_item_id: None,
+                extension_topic: None,
+            }),
+            produced_meaningful_output: true,
+            ..Default::default()
+        }
+    }
+
+    /// 检查是否应该继续执行
+    pub fn should_continue(&self) -> bool {
+        !matches!(self.continuation_signal, ContinuationSignal::Stop)
+    }
+}
+
+/// 话语延伸点
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DiscourseExtensionPoint {
+    /// 延伸点 ID
+    pub point_id: String,
+    /// 延伸主题
+    pub topic: String,
+    /// 延伸类型
+    pub extension_type: DiscourseExtensionType,
+    /// 相关性分数
+    pub relevance_score: f32,
+    /// 来源事件 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_event_id: Option<String>,
+}
+
+/// 话语延伸类型
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscourseExtensionType {
+    /// 未回答的问题
+    UnansweredQuestion,
+    /// 未展开的话题
+    UnexploredTopic,
+    /// 隐含的需求
+    ImpliedNeed,
+    /// 后续建议
+    FollowUpSuggestion,
+    /// 关联话题
+    RelatedTopic,
+}
+
+/// Rejected 事件的详细 Payload
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RejectedPayload {
+    /// 拒绝原因
+    pub reject_reason: String,
+    /// 拒绝类型
+    pub reject_type: RejectType,
+    /// 总 IC 数量
+    pub total_ic_count: u32,
+    /// 总成本
+    pub total_cost: f64,
+    /// 是否可重试
+    pub retryable: bool,
+    /// 建议的重试时间（毫秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+}
+
+/// 拒绝类型
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectType {
+    /// 预算耗尽
+    BudgetExhausted,
+    /// 策略违规
+    PolicyViolation,
+    /// 内容过滤
+    ContentFiltered,
+    /// 系统错误
+    SystemError,
+    /// 超时
+    Timeout,
+    /// 取消
+    Cancelled,
+}
+
 /// Historical awareness cycle record. Retained for compatibility with existing contracts.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AwarenessCycleRecord {

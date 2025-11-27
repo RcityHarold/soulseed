@@ -247,7 +247,7 @@ cargo run --bin ace_service
 启动 SurrealDB（建议 v2.3+），并执行迁移脚本：
 ```bash
 # 启动SurrealDB
-surreal start --user root --pass 123456 --bind 127.0.0.1:8000 file://./data/rainbow.db
+surreal start --user root --pass 123456 --bind 127.0.0.1:8686 file://./data/rainbow.db
 
 # 执行迁移
 surreal sql --conn ws://127.0.0.1:8000 -f migrations/surreal/001_soulseed_init.sql

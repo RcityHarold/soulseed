@@ -1,19 +1,23 @@
 pub mod api;
 pub mod errors;
 pub mod maintenance;
+pub mod metacognition;
 pub mod mock;
 pub mod plan;
 pub mod planner;
 pub mod scenario;
 pub mod types;
 pub mod validate;
+pub mod version_chain;
 
 pub use api::*;
 pub use errors::*;
 pub use maintenance::*;
+pub use metacognition::*;
 pub use mock::*;
 pub use plan::*;
 pub use planner::*;
 pub use scenario::*;
 pub use types::*;
 pub use validate::*;
+pub use version_chain::*;
