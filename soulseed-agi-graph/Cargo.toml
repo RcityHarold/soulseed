@@ -25,3 +25,4 @@ thiserror = "1"
 soulseed-agi-core-models = { path = "../soulseed-agi-core-models", default-features = false }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

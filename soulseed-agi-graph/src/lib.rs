@@ -1,5 +1,7 @@
 pub mod api;
 pub mod errors;
+pub mod graph_edges;
+pub mod graph_nodes;
 pub mod maintenance;
 pub mod metacognition;
 pub mod mock;
@@ -12,6 +14,8 @@ pub mod version_chain;
 
 pub use api::*;
 pub use errors::*;
+pub use graph_edges::*;
+pub use graph_nodes::*;
 pub use maintenance::*;
 pub use metacognition::*;
 pub use mock::*;

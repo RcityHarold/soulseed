@@ -24,6 +24,10 @@ pub enum DialoguePayloadDomain {
     System,
     Environment,
     SelfReflection,
+    // P2: 演化事件域
+    GroupEvolution,
+    AiEvolution,
+    RelationshipEvolution,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,6 +211,121 @@ pub struct EnvironmentPayload {
     pub metrics_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anomaly_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub attributes: Value,
+}
+
+// ============================================================================
+// P2: 演化事件 Payload 类型
+// ============================================================================
+
+/// 群组演化事件 Payload
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct GroupEvolutionPayload {
+    /// 群组 ID
+    pub group_id: String,
+    /// 群组名称
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    /// 相关成员
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<SubjectRef>,
+    /// 权限变更详情
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_change: Option<PermissionChange>,
+    /// 创建者
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<SubjectRef>,
+    /// 操作原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 额外属性
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub attributes: Value,
+}
+
+/// 权限变更详情
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PermissionChange {
+    /// 变更类型 (grant, revoke, modify)
+    pub change_type: String,
+    /// 权限名称
+    pub permission: String,
+    /// 受影响的主体
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SubjectRef>,
+    /// 变更前的值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<String>,
+    /// 变更后的值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<String>,
+}
+
+/// AI 自我演化事件 Payload
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct AiEvolutionPayload {
+    /// AI 主体引用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_subject: Option<SubjectRef>,
+    /// 演化类型 (personality_adjustment, self_reflection, skill_update)
+    pub evolution_type: String,
+    /// 演化维度 (如 personality 的具体维度)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<String>,
+    /// 变更前的值/状态
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub before_state: Value,
+    /// 变更后的值/状态
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub after_state: Value,
+    /// 变更幅度 (0.0 - 1.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magnitude: Option<f32>,
+    /// 触发原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_reason: Option<String>,
+    /// 自我反思报告摘要
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection_summary: Option<String>,
+    /// 关联的证据/事件 ID
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_event_ids: Vec<EventId>,
+    /// 额外属性
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub attributes: Value,
+}
+
+/// 关系演化事件 Payload
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct RelationshipEvolutionPayload {
+    /// 关系 ID
+    pub relationship_id: String,
+    /// 主体 A（关系的发起方或 AI 方）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_a: Option<SubjectRef>,
+    /// 主体 B（关系的另一方）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_b: Option<SubjectRef>,
+    /// 关系类型 (human_ai, ai_ai, human_human)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_type: Option<String>,
+    /// 变更的维度 (trust, intimacy, collaboration_level)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<String>,
+    /// 变更前的值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_value: Option<f32>,
+    /// 变更后的值
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_value: Option<f32>,
+    /// 变更原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// 触发事件 ID
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_event_id: Option<EventId>,
+    /// 额外属性
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub attributes: Value,
 }
@@ -461,6 +580,29 @@ define_payload_enum! {
     SelfReflectionActionCommitted => { name: "self_reflection_action_committed", domain: SelfReflection, data: SelfReflectionPayload },
     SelfReflectionScoreAdjusted => { name: "self_reflection_score_adjusted", domain: SelfReflection, data: SelfReflectionPayload },
     SelfReflectionArchived => { name: "self_reflection_archived", domain: SelfReflection, data: SelfReflectionPayload },
+
+    // P2: Group evolution domain - 群组演化事件
+    GroupCreated => { name: "group_created", domain: GroupEvolution, data: GroupEvolutionPayload },
+    GroupMemberJoined => { name: "group_member_joined", domain: GroupEvolution, data: GroupEvolutionPayload },
+    GroupMemberLeft => { name: "group_member_left", domain: GroupEvolution, data: GroupEvolutionPayload },
+    GroupPermissionChanged => { name: "group_permission_changed", domain: GroupEvolution, data: GroupEvolutionPayload },
+    GroupDisbanded => { name: "group_disbanded", domain: GroupEvolution, data: GroupEvolutionPayload },
+    GroupRenamed => { name: "group_renamed", domain: GroupEvolution, data: GroupEvolutionPayload },
+
+    // P2: AI evolution domain - AI 自我演化事件
+    AiPersonalityAdjusted => { name: "ai_personality_adjusted", domain: AiEvolution, data: AiEvolutionPayload },
+    AiSelfReflectionReportGenerated => { name: "ai_self_reflection_report_generated", domain: AiEvolution, data: AiEvolutionPayload },
+    AiSkillUpdated => { name: "ai_skill_updated", domain: AiEvolution, data: AiEvolutionPayload },
+    AiPreferenceUpdated => { name: "ai_preference_updated", domain: AiEvolution, data: AiEvolutionPayload },
+    AiGrowthMilestoneReached => { name: "ai_growth_milestone_reached", domain: AiEvolution, data: AiEvolutionPayload },
+
+    // P2: Relationship evolution domain - 关系演化事件
+    RelationshipEstablished => { name: "relationship_established", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
+    RelationshipChanged => { name: "relationship_changed", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
+    RelationshipStrengthened => { name: "relationship_strengthened", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
+    RelationshipWeakened => { name: "relationship_weakened", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
+    RelationshipTerminated => { name: "relationship_terminated", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
+    AiRelationshipAdjusted => { name: "ai_relationship_adjusted", domain: RelationshipEvolution, data: RelationshipEvolutionPayload },
 }
 
 impl DialogueEventPayload {
@@ -506,6 +648,19 @@ fn ensure_type_alignment(
         DialoguePayloadDomain::SelfReflection => {
             matches!(event_type, DialogueEventType::SelfReflection)
         }
+        // P2: 演化事件域的类型对齐
+        DialoguePayloadDomain::GroupEvolution => matches!(
+            event_type,
+            DialogueEventType::Lifecycle | DialogueEventType::System
+        ),
+        DialoguePayloadDomain::AiEvolution => matches!(
+            event_type,
+            DialogueEventType::SelfReflection | DialogueEventType::Lifecycle
+        ),
+        DialoguePayloadDomain::RelationshipEvolution => matches!(
+            event_type,
+            DialogueEventType::Lifecycle | DialogueEventType::System
+        ),
     };
 
     if ok {
@@ -920,6 +1075,82 @@ impl DialoguePayloadData for SelfReflectionPayload {
             | DialogueEventPayloadKind::SelfReflectionArchived => {
                 if self.related_event_id.is_none() {
                     return Err(ModelError::Missing("payload.related_event_id"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// P2: 演化事件 Payload 验证实现
+
+impl DialoguePayloadData for GroupEvolutionPayload {
+    fn validate_with_kind(&self, kind: DialogueEventPayloadKind) -> Result<(), ModelError> {
+        ensure_not_blank(&self.group_id, "payload.group_id")?;
+        match kind {
+            DialogueEventPayloadKind::GroupCreated => {
+                if self.creator.is_none() {
+                    return Err(ModelError::Missing("payload.creator"));
+                }
+            }
+            DialogueEventPayloadKind::GroupMemberJoined
+            | DialogueEventPayloadKind::GroupMemberLeft => {
+                if self.members.is_empty() {
+                    return Err(ModelError::Missing("payload.members"));
+                }
+            }
+            DialogueEventPayloadKind::GroupPermissionChanged => {
+                if self.permission_change.is_none() {
+                    return Err(ModelError::Missing("payload.permission_change"));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl DialoguePayloadData for AiEvolutionPayload {
+    fn validate_with_kind(&self, kind: DialogueEventPayloadKind) -> Result<(), ModelError> {
+        ensure_not_blank(&self.evolution_type, "payload.evolution_type")?;
+        match kind {
+            DialogueEventPayloadKind::AiPersonalityAdjusted
+            | DialogueEventPayloadKind::AiPreferenceUpdated => {
+                if self.dimension.is_none() {
+                    return Err(ModelError::Missing("payload.dimension"));
+                }
+            }
+            DialogueEventPayloadKind::AiSelfReflectionReportGenerated => {
+                if self.reflection_summary.is_none() {
+                    return Err(ModelError::Missing("payload.reflection_summary"));
+                }
+            }
+            _ => {}
+        }
+        if let Some(mag) = self.magnitude {
+            if !(0.0..=1.0).contains(&mag) {
+                return Err(ModelError::Invariant("payload.magnitude"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DialoguePayloadData for RelationshipEvolutionPayload {
+    fn validate_with_kind(&self, kind: DialogueEventPayloadKind) -> Result<(), ModelError> {
+        ensure_not_blank(&self.relationship_id, "payload.relationship_id")?;
+        match kind {
+            DialogueEventPayloadKind::RelationshipEstablished => {
+                if self.subject_a.is_none() || self.subject_b.is_none() {
+                    return Err(ModelError::Missing("payload.subject_a or subject_b"));
+                }
+            }
+            DialogueEventPayloadKind::RelationshipStrengthened
+            | DialogueEventPayloadKind::RelationshipWeakened
+            | DialogueEventPayloadKind::RelationshipChanged => {
+                if self.before_value.is_none() || self.after_value.is_none() {
+                    return Err(ModelError::Missing("payload.before_value or after_value"));
                 }
             }
             _ => {}

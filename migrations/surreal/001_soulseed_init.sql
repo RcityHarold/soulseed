@@ -325,4 +325,407 @@ DEFINE FIELD updated_at_ms ON replay_cursor TYPE number;
 DEFINE INDEX idx_replay_cursor_unique
     ON TABLE replay_cursor FIELDS tenant_id, stream_kind UNIQUE;
 
+-- =====================
+-- Graph Nodes Schema (六大核心节点)
+-- 用于 SurrealDB 图谱存储
+-- =====================
+
+-- Actor 节点表
+DEFINE TABLE graph_actor SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_actor TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_actor TYPE string ASSERT $value != "";
+DEFINE FIELD kind ON graph_actor TYPE string;
+DEFINE FIELD internal_id ON graph_actor TYPE number;
+DEFINE FIELD display_name ON graph_actor TYPE option<string>;
+DEFINE FIELD role ON graph_actor TYPE option<string>;
+DEFINE FIELD capabilities ON graph_actor TYPE array DEFAULT [];
+DEFINE FIELD status ON graph_actor TYPE string DEFAULT 'active';
+DEFINE FIELD created_at_ms ON graph_actor TYPE number;
+DEFINE FIELD last_active_at_ms ON graph_actor TYPE option<number>;
+DEFINE FIELD metadata ON graph_actor FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_actor_lookup ON TABLE graph_actor FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_actor_kind ON TABLE graph_actor FIELDS tenant_id, kind;
+
+-- Event 节点表
+DEFINE TABLE graph_event SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_event TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_event TYPE string ASSERT $value != "";
+DEFINE FIELD event_type ON graph_event TYPE string;
+DEFINE FIELD session_id ON graph_event TYPE string;
+DEFINE FIELD ac_id ON graph_event TYPE option<number>;
+DEFINE FIELD actor_id ON graph_event TYPE string;
+DEFINE FIELD occurred_at_ms ON graph_event TYPE number;
+DEFINE FIELD sequence_number ON graph_event TYPE number DEFAULT 0;
+DEFINE FIELD scenario ON graph_event TYPE option<string>;
+DEFINE FIELD trigger_event_id ON graph_event TYPE option<string>;
+DEFINE FIELD access_class ON graph_event TYPE string DEFAULT 'internal';
+DEFINE FIELD payload_digest ON graph_event TYPE option<string>;
+DEFINE FIELD metadata ON graph_event FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_event_lookup ON TABLE graph_event FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_event_session ON TABLE graph_event FIELDS tenant_id, session_id, occurred_at_ms;
+DEFINE INDEX idx_graph_event_type ON TABLE graph_event FIELDS tenant_id, event_type;
+DEFINE INDEX idx_graph_event_actor ON TABLE graph_event FIELDS tenant_id, actor_id;
+
+-- Message 节点表
+DEFINE TABLE graph_message SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_message TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_message TYPE string ASSERT $value != "";
+DEFINE FIELD event_id ON graph_message TYPE string;
+DEFINE FIELD session_id ON graph_message TYPE string;
+DEFINE FIELD sender_id ON graph_message TYPE string;
+DEFINE FIELD content_type ON graph_message TYPE string DEFAULT 'text';
+DEFINE FIELD content_summary ON graph_message TYPE option<string>;
+DEFINE FIELD content_digest ON graph_message TYPE option<string>;
+DEFINE FIELD token_count ON graph_message TYPE option<number>;
+DEFINE FIELD language ON graph_message TYPE option<string>;
+DEFINE FIELD sentiment ON graph_message TYPE option<string>;
+DEFINE FIELD is_final ON graph_message TYPE bool DEFAULT true;
+DEFINE FIELD reply_to ON graph_message TYPE option<string>;
+DEFINE FIELD created_at_ms ON graph_message TYPE number;
+DEFINE FIELD edited_at_ms ON graph_message TYPE option<number>;
+DEFINE FIELD metadata ON graph_message FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_message_lookup ON TABLE graph_message FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_message_session ON TABLE graph_message FIELDS tenant_id, session_id, created_at_ms;
+DEFINE INDEX idx_graph_message_sender ON TABLE graph_message FIELDS tenant_id, sender_id;
+
+-- Session 节点表
+DEFINE TABLE graph_session SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_session TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_session TYPE string ASSERT $value != "";
+DEFINE FIELD mode ON graph_session TYPE string DEFAULT 'interactive';
+DEFINE FIELD scenario ON graph_session TYPE option<string>;
+DEFINE FIELD creator_id ON graph_session TYPE string;
+DEFINE FIELD participant_ids ON graph_session TYPE array DEFAULT [];
+DEFINE FIELD status ON graph_session TYPE string DEFAULT 'active';
+DEFINE FIELD created_at_ms ON graph_session TYPE number;
+DEFINE FIELD last_activity_at_ms ON graph_session TYPE option<number>;
+DEFINE FIELD ended_at_ms ON graph_session TYPE option<number>;
+DEFINE FIELD event_count ON graph_session TYPE number DEFAULT 0;
+DEFINE FIELD message_count ON graph_session TYPE number DEFAULT 0;
+DEFINE FIELD ac_count ON graph_session TYPE number DEFAULT 0;
+DEFINE FIELD scenario_stack_depth ON graph_session TYPE number DEFAULT 0;
+DEFINE FIELD metadata ON graph_session FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_session_lookup ON TABLE graph_session FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_session_status ON TABLE graph_session FIELDS tenant_id, status;
+DEFINE INDEX idx_graph_session_creator ON TABLE graph_session FIELDS tenant_id, creator_id;
+
+-- AC 节点表
+DEFINE TABLE graph_ac SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_ac TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_ac TYPE string ASSERT $value != "";
+DEFINE FIELD session_id ON graph_ac TYPE string;
+DEFINE FIELD parent_ac_id ON graph_ac TYPE option<string>;
+DEFINE FIELD lane ON graph_ac TYPE string;
+DEFINE FIELD ic_count ON graph_ac TYPE number DEFAULT 0;
+DEFINE FIELD status ON graph_ac TYPE string DEFAULT 'pending';
+DEFINE FIELD started_at_ms ON graph_ac TYPE number;
+DEFINE FIELD ended_at_ms ON graph_ac TYPE option<number>;
+DEFINE FIELD duration_ms ON graph_ac TYPE option<number>;
+DEFINE FIELD tokens_spent ON graph_ac TYPE number DEFAULT 0;
+DEFINE FIELD external_cost ON graph_ac TYPE number DEFAULT 0;
+DEFINE FIELD decision_confidence ON graph_ac TYPE option<number>;
+DEFINE FIELD collab_scope_id ON graph_ac TYPE option<string>;
+DEFINE FIELD trigger_event_id ON graph_ac TYPE option<string>;
+DEFINE FIELD final_event_id ON graph_ac TYPE option<string>;
+DEFINE FIELD metadata ON graph_ac FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_ac_lookup ON TABLE graph_ac FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_ac_session ON TABLE graph_ac FIELDS tenant_id, session_id;
+DEFINE INDEX idx_graph_ac_lane ON TABLE graph_ac FIELDS tenant_id, lane;
+DEFINE INDEX idx_graph_ac_status ON TABLE graph_ac FIELDS tenant_id, status;
+DEFINE INDEX idx_graph_ac_parent ON TABLE graph_ac FIELDS tenant_id, parent_ac_id;
+
+-- Artifact 节点表
+DEFINE TABLE graph_artifact SCHEMAFULL;
+DEFINE FIELD tenant_id ON graph_artifact TYPE number ASSERT $value > 0;
+DEFINE FIELD node_id ON graph_artifact TYPE string ASSERT $value != "";
+DEFINE FIELD kind ON graph_artifact TYPE string;
+DEFINE FIELD title ON graph_artifact TYPE string;
+DEFINE FIELD description ON graph_artifact TYPE option<string>;
+DEFINE FIELD source_event_id ON graph_artifact TYPE string;
+DEFINE FIELD session_id ON graph_artifact TYPE string;
+DEFINE FIELD creator_id ON graph_artifact TYPE string;
+DEFINE FIELD content_digest ON graph_artifact TYPE option<string>;
+DEFINE FIELD blob_ref ON graph_artifact TYPE option<string>;
+DEFINE FIELD size_bytes ON graph_artifact TYPE option<number>;
+DEFINE FIELD mime_type ON graph_artifact TYPE option<string>;
+DEFINE FIELD version ON graph_artifact TYPE number DEFAULT 1;
+DEFINE FIELD supersedes_id ON graph_artifact TYPE option<string>;
+DEFINE FIELD created_at_ms ON graph_artifact TYPE number;
+DEFINE FIELD updated_at_ms ON graph_artifact TYPE option<number>;
+DEFINE FIELD tags ON graph_artifact TYPE array DEFAULT [];
+DEFINE FIELD metadata ON graph_artifact FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_graph_artifact_lookup ON TABLE graph_artifact FIELDS tenant_id, node_id UNIQUE;
+DEFINE INDEX idx_graph_artifact_session ON TABLE graph_artifact FIELDS tenant_id, session_id;
+DEFINE INDEX idx_graph_artifact_kind ON TABLE graph_artifact FIELDS tenant_id, kind;
+DEFINE INDEX idx_graph_artifact_creator ON TABLE graph_artifact FIELDS tenant_id, creator_id;
+
+-- =====================
+-- Graph Edges Schema (七大关系边族群)
+-- =====================
+
+-- 1. 因果边族群
+
+-- triggered_by 边 (event -> event)
+DEFINE TABLE triggered_by SCHEMAFULL TYPE RELATION FROM graph_event TO graph_event;
+DEFINE FIELD tenant_id ON triggered_by TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON triggered_by TYPE number DEFAULT 1.0;
+DEFINE FIELD depth ON triggered_by TYPE number DEFAULT 1;
+DEFINE FIELD delay_ms ON triggered_by TYPE option<number>;
+DEFINE FIELD confidence ON triggered_by TYPE number DEFAULT 1.0;
+DEFINE FIELD created_at_ms ON triggered_by TYPE number;
+DEFINE FIELD metadata ON triggered_by FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_triggered_by_tenant ON TABLE triggered_by FIELDS tenant_id;
+
+-- caused_by 边 (event -> event)
+DEFINE TABLE caused_by SCHEMAFULL TYPE RELATION FROM graph_event TO graph_event;
+DEFINE FIELD tenant_id ON caused_by TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON caused_by TYPE number DEFAULT 1.0;
+DEFINE FIELD depth ON caused_by TYPE number DEFAULT 1;
+DEFINE FIELD delay_ms ON caused_by TYPE option<number>;
+DEFINE FIELD confidence ON caused_by TYPE number DEFAULT 1.0;
+DEFINE FIELD created_at_ms ON caused_by TYPE number;
+DEFINE FIELD metadata ON caused_by FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_caused_by_tenant ON TABLE caused_by FIELDS tenant_id;
+
+-- enabled 边 (event -> event)
+DEFINE TABLE enabled SCHEMAFULL TYPE RELATION FROM graph_event TO graph_event;
+DEFINE FIELD tenant_id ON enabled TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON enabled TYPE number DEFAULT 1.0;
+DEFINE FIELD depth ON enabled TYPE number DEFAULT 1;
+DEFINE FIELD created_at_ms ON enabled TYPE number;
+DEFINE FIELD metadata ON enabled FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_enabled_tenant ON TABLE enabled FIELDS tenant_id;
+
+-- led_to 边 (event -> event)
+DEFINE TABLE led_to SCHEMAFULL TYPE RELATION FROM graph_event TO graph_event;
+DEFINE FIELD tenant_id ON led_to TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON led_to TYPE number DEFAULT 1.0;
+DEFINE FIELD depth ON led_to TYPE number DEFAULT 1;
+DEFINE FIELD delay_ms ON led_to TYPE option<number>;
+DEFINE FIELD confidence ON led_to TYPE number DEFAULT 1.0;
+DEFINE FIELD created_at_ms ON led_to TYPE number;
+DEFINE FIELD metadata ON led_to FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_led_to_tenant ON TABLE led_to FIELDS tenant_id;
+
+-- 2. 归属边族群
+
+-- belongs_to 边 (通用归属)
+DEFINE TABLE belongs_to SCHEMAFULL TYPE RELATION;
+DEFINE FIELD tenant_id ON belongs_to TYPE number ASSERT $value > 0;
+DEFINE FIELD role ON belongs_to TYPE option<string>;
+DEFINE FIELD order_index ON belongs_to TYPE option<number>;
+DEFINE FIELD is_primary ON belongs_to TYPE bool DEFAULT true;
+DEFINE FIELD created_at_ms ON belongs_to TYPE number;
+DEFINE FIELD metadata ON belongs_to FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_belongs_to_tenant ON TABLE belongs_to FIELDS tenant_id;
+
+-- part_of 边 (部分-整体)
+DEFINE TABLE part_of SCHEMAFULL TYPE RELATION;
+DEFINE FIELD tenant_id ON part_of TYPE number ASSERT $value > 0;
+DEFINE FIELD role ON part_of TYPE option<string>;
+DEFINE FIELD order_index ON part_of TYPE option<number>;
+DEFINE FIELD is_primary ON part_of TYPE bool DEFAULT true;
+DEFINE FIELD created_at_ms ON part_of TYPE number;
+DEFINE FIELD metadata ON part_of FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_part_of_tenant ON TABLE part_of FIELDS tenant_id;
+
+-- member_of 边 (成员-组)
+DEFINE TABLE member_of SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_actor;
+DEFINE FIELD tenant_id ON member_of TYPE number ASSERT $value > 0;
+DEFINE FIELD role ON member_of TYPE option<string>;
+DEFINE FIELD joined_at_ms ON member_of TYPE number;
+DEFINE FIELD created_at_ms ON member_of TYPE number;
+DEFINE FIELD metadata ON member_of FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_member_of_tenant ON TABLE member_of FIELDS tenant_id;
+
+-- 3. 引用边族群
+
+-- references_edge 边 (通用引用) - 避免与 SQL 关键字冲突
+DEFINE TABLE references_edge SCHEMAFULL TYPE RELATION;
+DEFINE FIELD tenant_id ON references_edge TYPE number ASSERT $value > 0;
+DEFINE FIELD context ON references_edge TYPE option<string>;
+DEFINE FIELD offset ON references_edge TYPE option<number>;
+DEFINE FIELD length ON references_edge TYPE option<number>;
+DEFINE FIELD reason ON references_edge TYPE option<string>;
+DEFINE FIELD created_at_ms ON references_edge TYPE number;
+DEFINE FIELD metadata ON references_edge FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_references_edge_tenant ON TABLE references_edge FIELDS tenant_id;
+
+-- mentions 边 (message -> entity)
+DEFINE TABLE mentions SCHEMAFULL TYPE RELATION FROM graph_message;
+DEFINE FIELD tenant_id ON mentions TYPE number ASSERT $value > 0;
+DEFINE FIELD context ON mentions TYPE option<string>;
+DEFINE FIELD offset ON mentions TYPE option<number>;
+DEFINE FIELD length ON mentions TYPE option<number>;
+DEFINE FIELD created_at_ms ON mentions TYPE number;
+DEFINE FIELD metadata ON mentions FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_mentions_tenant ON TABLE mentions FIELDS tenant_id;
+
+-- responds_to 边 (message -> message)
+DEFINE TABLE responds_to SCHEMAFULL TYPE RELATION FROM graph_message TO graph_message;
+DEFINE FIELD tenant_id ON responds_to TYPE number ASSERT $value > 0;
+DEFINE FIELD reason ON responds_to TYPE option<string>;
+DEFINE FIELD created_at_ms ON responds_to TYPE number;
+DEFINE FIELD metadata ON responds_to FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_responds_to_tenant ON TABLE responds_to FIELDS tenant_id;
+
+-- 4. 协作边族群
+
+-- collaborates_with 边 (actor <-> actor)
+DEFINE TABLE collaborates_with SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_actor;
+DEFINE FIELD tenant_id ON collaborates_with TYPE number ASSERT $value > 0;
+DEFINE FIELD scope_id ON collaborates_with TYPE option<string>;
+DEFINE FIELD session_id ON collaborates_with TYPE option<string>;
+DEFINE FIELD started_at_ms ON collaborates_with TYPE number;
+DEFINE FIELD ended_at_ms ON collaborates_with TYPE option<number>;
+DEFINE FIELD status ON collaborates_with TYPE string DEFAULT 'active';
+DEFINE FIELD collaboration_type ON collaborates_with TYPE option<string>;
+DEFINE FIELD created_at_ms ON collaborates_with TYPE number;
+DEFINE FIELD metadata ON collaborates_with FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_collaborates_tenant ON TABLE collaborates_with FIELDS tenant_id;
+DEFINE INDEX idx_collaborates_status ON TABLE collaborates_with FIELDS tenant_id, status;
+
+-- requests_help_from 边 (actor -> actor)
+DEFINE TABLE requests_help_from SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_actor;
+DEFINE FIELD tenant_id ON requests_help_from TYPE number ASSERT $value > 0;
+DEFINE FIELD scope_id ON requests_help_from TYPE option<string>;
+DEFINE FIELD session_id ON requests_help_from TYPE option<string>;
+DEFINE FIELD started_at_ms ON requests_help_from TYPE number;
+DEFINE FIELD ended_at_ms ON requests_help_from TYPE option<number>;
+DEFINE FIELD status ON requests_help_from TYPE string DEFAULT 'active';
+DEFINE FIELD created_at_ms ON requests_help_from TYPE number;
+DEFINE FIELD metadata ON requests_help_from FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_requests_help_tenant ON TABLE requests_help_from FIELDS tenant_id;
+
+-- assists 边 (actor -> actor)
+DEFINE TABLE assists SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_actor;
+DEFINE FIELD tenant_id ON assists TYPE number ASSERT $value > 0;
+DEFINE FIELD scope_id ON assists TYPE option<string>;
+DEFINE FIELD session_id ON assists TYPE option<string>;
+DEFINE FIELD started_at_ms ON assists TYPE number;
+DEFINE FIELD ended_at_ms ON assists TYPE option<number>;
+DEFINE FIELD status ON assists TYPE string DEFAULT 'active';
+DEFINE FIELD created_at_ms ON assists TYPE number;
+DEFINE FIELD metadata ON assists FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_assists_tenant ON TABLE assists FIELDS tenant_id;
+
+-- 5. 版本边族群 (supersedes 已在上面定义为 version_chain 的关系边)
+
+-- derived_from 边 (artifact -> artifact)
+DEFINE TABLE derived_from SCHEMAFULL TYPE RELATION FROM graph_artifact TO graph_artifact;
+DEFINE FIELD tenant_id ON derived_from TYPE number ASSERT $value > 0;
+DEFINE FIELD from_version ON derived_from TYPE option<number>;
+DEFINE FIELD to_version ON derived_from TYPE option<number>;
+DEFINE FIELD change_description ON derived_from TYPE option<string>;
+DEFINE FIELD is_main_line ON derived_from TYPE bool DEFAULT false;
+DEFINE FIELD created_at_ms ON derived_from TYPE number;
+DEFINE FIELD metadata ON derived_from FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_derived_from_tenant ON TABLE derived_from FIELDS tenant_id;
+
+-- evolved_into 边 (artifact -> artifact)
+DEFINE TABLE evolved_into SCHEMAFULL TYPE RELATION FROM graph_artifact TO graph_artifact;
+DEFINE FIELD tenant_id ON evolved_into TYPE number ASSERT $value > 0;
+DEFINE FIELD from_version ON evolved_into TYPE option<number>;
+DEFINE FIELD to_version ON evolved_into TYPE option<number>;
+DEFINE FIELD change_description ON evolved_into TYPE option<string>;
+DEFINE FIELD is_main_line ON evolved_into TYPE bool DEFAULT true;
+DEFINE FIELD created_at_ms ON evolved_into TYPE number;
+DEFINE FIELD metadata ON evolved_into FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_evolved_into_tenant ON TABLE evolved_into FIELDS tenant_id;
+
+-- 6. 影响边族群
+
+-- influences 边 (entity -> entity)
+DEFINE TABLE influences SCHEMAFULL TYPE RELATION;
+DEFINE FIELD tenant_id ON influences TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON influences TYPE number DEFAULT 0.5;
+DEFINE FIELD polarity ON influences TYPE string DEFAULT 'neutral';
+DEFINE FIELD scope ON influences TYPE option<string>;
+DEFINE FIELD is_persistent ON influences TYPE bool DEFAULT false;
+DEFINE FIELD created_at_ms ON influences TYPE number;
+DEFINE FIELD metadata ON influences FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_influences_tenant ON TABLE influences FIELDS tenant_id;
+
+-- impacts 边 (event -> state)
+DEFINE TABLE impacts SCHEMAFULL TYPE RELATION FROM graph_event;
+DEFINE FIELD tenant_id ON impacts TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON impacts TYPE number DEFAULT 0.5;
+DEFINE FIELD polarity ON impacts TYPE string DEFAULT 'neutral';
+DEFINE FIELD scope ON impacts TYPE option<string>;
+DEFINE FIELD is_persistent ON impacts TYPE bool DEFAULT false;
+DEFINE FIELD created_at_ms ON impacts TYPE number;
+DEFINE FIELD metadata ON impacts FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_impacts_tenant ON TABLE impacts FIELDS tenant_id;
+
+-- affects 边 (action -> entity)
+DEFINE TABLE affects SCHEMAFULL TYPE RELATION;
+DEFINE FIELD tenant_id ON affects TYPE number ASSERT $value > 0;
+DEFINE FIELD strength ON affects TYPE number DEFAULT 0.5;
+DEFINE FIELD polarity ON affects TYPE string DEFAULT 'neutral';
+DEFINE FIELD is_persistent ON affects TYPE bool DEFAULT false;
+DEFINE FIELD created_at_ms ON affects TYPE number;
+DEFINE FIELD metadata ON affects FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_affects_tenant ON TABLE affects FIELDS tenant_id;
+
+-- 7. 评价边族群
+
+-- evaluates 边 (actor -> entity)
+DEFINE TABLE evaluates SCHEMAFULL TYPE RELATION FROM graph_actor;
+DEFINE FIELD tenant_id ON evaluates TYPE number ASSERT $value > 0;
+DEFINE FIELD score ON evaluates TYPE option<number>;
+DEFINE FIELD category ON evaluates TYPE option<string>;
+DEFINE FIELD rationale ON evaluates TYPE option<string>;
+DEFINE FIELD dimensions ON evaluates TYPE array DEFAULT [];
+DEFINE FIELD is_formal ON evaluates TYPE bool DEFAULT false;
+DEFINE FIELD created_at_ms ON evaluates TYPE number;
+DEFINE FIELD metadata ON evaluates FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_evaluates_tenant ON TABLE evaluates FIELDS tenant_id;
+
+-- rates 边 (actor -> artifact)
+DEFINE TABLE rates SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_artifact;
+DEFINE FIELD tenant_id ON rates TYPE number ASSERT $value > 0;
+DEFINE FIELD score ON rates TYPE number ASSERT $value >= 0 AND $value <= 100;
+DEFINE FIELD category ON rates TYPE option<string>;
+DEFINE FIELD created_at_ms ON rates TYPE number;
+DEFINE FIELD metadata ON rates FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_rates_tenant ON TABLE rates FIELDS tenant_id;
+
+-- critiques 边 (actor -> artifact)
+DEFINE TABLE critiques SCHEMAFULL TYPE RELATION FROM graph_actor TO graph_artifact;
+DEFINE FIELD tenant_id ON critiques TYPE number ASSERT $value > 0;
+DEFINE FIELD score ON critiques TYPE option<number>;
+DEFINE FIELD rationale ON critiques TYPE option<string>;
+DEFINE FIELD dimensions ON critiques TYPE array DEFAULT [];
+DEFINE FIELD is_formal ON critiques TYPE bool DEFAULT true;
+DEFINE FIELD created_at_ms ON critiques TYPE number;
+DEFINE FIELD metadata ON critiques FLEXIBLE TYPE option<object>;
+
+DEFINE INDEX idx_critiques_tenant ON TABLE critiques FIELDS tenant_id;
+
 COMMIT TRANSACTION;
